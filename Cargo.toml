@@ -1,0 +1,74 @@
+[package]
+name = "moonshine"
+version = "0.1.0"
+description = "Moonshine: A lightweight, private CLI wallet for DarkFi utilizing OMR/OMD"
+authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
+edition = "2021"
+build = "build.rs"
+
+
+[dependencies]
+# DarkFi Dependencies (relative path to darkfi repository)
+darkfi = { path = "../darkfi", features = ["async-daemonize", "bs58", "rpc", "tx"] }
+darkfi_money_contract = { path = "../darkfi/src/contract/money", features = ["no-entrypoint", "client"] }
+darkfi-sdk = { path = "../darkfi/src/sdk", features = ["async"] }
+darkfi-serial = { path = "../darkfi/src/serial" }
+chacha20poly1305 = "0.10.1"
+
+# gRPC / Proto (+ TLS pin via rustls custom verifier)
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+tokio-rustls = "0.26"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
+
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3.32"
+
+# Argument Parsing / Formatting
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8"
+prettytable-rs = "0.10.0"
+
+# Database Storage (S14: SQLCipher full-DB encryption; vendored OpenSSL builds on macOS)
+rusqlite = { version = "0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# Cryptography & Utils
+argon2 = "0.5"
+blake3 = "1.8.5"
+hex = "0.4.3"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
+tracing-appender = "0.2.5"
+regex-lite = "0.1"
+
+# DarkFi-compatible mnemonic (22-word Electrum-style)
+hmac = "0.12"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+unicode-normalization = "0.1"
+bs58 = "0.5"
+rand = "0.9.4"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+# Shared UnifOMR crypto (paper ePrint 2026/910) from lightwalletd
+darkfi-lightwalletd = { path = "../darkfi-lightwalletd", default-features = true }
+
+# Embedded Tor (arti) — lightwalletd gRPC routed through Tor by default
+arti-client = { version = "0.42.0", default-features = false, features = ["tokio", "rustls", "compression", "error_detail"] }
+tor-rtcompat = { version = "0.42.0", features = ["tokio", "rustls"] }
+
+[patch.crates-io]
+halo2_proofs = { git = "https://github.com/parazyd/halo2", branch = "v050" }
+halo2_gadgets = { git = "https://github.com/parazyd/halo2", branch = "v050" }
+url = { git = "https://github.com/darkrenaissance/rust-url", branch = "v258" }
+
+[build-dependencies]
+tonic-build = "0.12"
+

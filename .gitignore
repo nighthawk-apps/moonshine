@@ -1,0 +1,35 @@
+# Build artifacts
+/target/
+# Cargo.lock is committed for reproducible application builds
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets — NEVER commit wallet keys or seeds
+seed.txt
+*.seed
+*.mnemonic
+*.privkey
+*.secret
+*.key
+
+# TLS certificates
+/certs/
+*.pem
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local one-off patch helpers
+patch_*.py
