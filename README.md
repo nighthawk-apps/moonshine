@@ -23,7 +23,7 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 |-------------|--------|
 | **Rust** stable | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` |
-| **Sibling `darkfi`** | `../darkfi` |
+| **Sibling `darkfi`** | `../darkfi` at the SHA in `../darkfi-lightwalletd/scripts/darkfi.rev` |
 | **Sibling `darkfi-lightwalletd`** | Proto from `../darkfi-lightwalletd/proto/lightwallet.proto` |
 | **Running lightwalletd** | Local or remote before `moonshine sync` |
 
@@ -40,6 +40,16 @@ parent/
   nighthawk-ios-wallet/
   nighthawk-desktop/
 ```
+
+Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
+
+```bash
+# from darkfi-lightwalletd/
+FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
+```
+
+Moonshine’s own pruned wallet remains **SQLCipher** (`PRAGMA key`) by design — it does
+**not** use upstream `bin/drk` / turso. Mobile/desktop UniFFI clients track tip `drk`.
 
 ```bash
 brew install protobuf   # or: sudo apt install protobuf-compiler
