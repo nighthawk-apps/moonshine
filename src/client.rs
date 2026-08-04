@@ -26,8 +26,14 @@ pub mod proto {
 
 use proto::dark_fi_light_wallet_client::DarkFiLightWalletClient;
 
-/// UnifOMR GenDetKey wire size (~19MB for n=512); raise tonic's 4MB default.
-const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Param2 UnifOMR detection keys are ~120 MiB on the wire (D=4096, n=1024,
+/// 3×40-bit moduli).  Keep headroom for digest responses.
+const MAX_GRPC_MESSAGE_BYTES: usize = 160 * 1024 * 1024;
+
+/// gRPC request timeout.  Param2 det-key upload (~120 MiB) + server-side FHE
+/// detection + Tor latency easily exceed the tonic default (no timeout).
+/// Must be ≥ lightwalletd `request_timeout_s` (300).
+const GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn with_large_messages(
     client: DarkFiLightWalletClient<Channel>,
@@ -199,11 +205,12 @@ impl LightwalletClient {
             let pin_hash = parse_tls_pin_hex(pin_hex)?;
             self.connect_with_pin(pin_hash).await?
         } else {
-            let endpoint = tonic::transport::Endpoint::from_shared(self.server_url.clone())?;
+            let endpoint = tonic::transport::Endpoint::from_shared(self.server_url.clone())?
+                .timeout(GRPC_TIMEOUT);
             let channel = endpoint.connect().await?;
             DarkFiLightWalletClient::new(channel)
-                .max_decoding_message_size(64 * 1024 * 1024)
-                .max_encoding_message_size(64 * 1024 * 1024)
+                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         };
 
         self.client = Some(client);
@@ -269,6 +276,7 @@ impl LightwalletClient {
         });
 
         let channel = tonic::transport::Endpoint::from_shared(uri)?
+            .timeout(GRPC_TIMEOUT)
             .connect_with_connector(connector)
             .await?;
         Ok(with_large_messages(DarkFiLightWalletClient::new(channel)))
@@ -477,14 +485,49 @@ impl LightwalletClient {
     ) -> Result<proto::OmrDigestResponse, Box<dyn Error>> {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
-        let detection_key = detection_keys.first().cloned().unwrap_or_default();
-        let req = proto::OmrDigestRequest {
-            detection_key,
-            start_height: start,
-            end_height: end,
-            detection_keys,
+        
+        let chunk_size = 1024 * 1024; // 1 MiB chunks
+        let num_keys = detection_keys.len() as u32;
+
+        let stream = async_stream::stream! {
+            // First chunk MUST have header info
+            yield proto::DetectionKeyChunk {
+                start_height: start,
+                end_height: end,
+                num_keys,
+                data: vec![],
+                key_done: false,
+            };
+
+            for key in detection_keys {
+                let mut offset = 0;
+                while offset < key.len() {
+                    let end_offset = std::cmp::min(offset + chunk_size, key.len());
+                    let chunk_data = key[offset..end_offset].to_vec();
+                    offset = end_offset;
+                    let is_last = offset == key.len();
+
+                    yield proto::DetectionKeyChunk {
+                        start_height: 0,
+                        end_height: 0,
+                        num_keys: 0,
+                        data: chunk_data,
+                        key_done: is_last,
+                    };
+                }
+                if key.is_empty() {
+                     yield proto::DetectionKeyChunk {
+                        start_height: 0,
+                        end_height: 0,
+                        num_keys: 0,
+                        data: vec![],
+                        key_done: true,
+                    };
+                }
+            }
         };
-        let response = client.get_unif_omr_digest(req).await?;
+
+        let response = client.get_unif_omr_digest(tonic::Request::new(stream)).await?;
         Ok(response.into_inner())
     }
 

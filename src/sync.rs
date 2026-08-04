@@ -706,10 +706,12 @@ impl SyncEngine {
         let net = self.network_byte;
         const MAX_DETECTION_KEYS: usize = 16;
         // Server cap on the sum of detection_keys lengths per request
-        // (lightwalletd MAX_DETECTION_KEYS_TOTAL_BYTES). One Param2 det-key is
-        // ~38MB, so multi-address wallets must chunk requests and union the
-        // per-chunk results; a single oversized request is rejected outright.
-        const SERVER_DETECTION_KEYS_TOTAL_BUDGET: usize = 64 * 1024 * 1024;
+        // (lightwalletd MAX_DETECTION_KEYS_TOTAL_BYTES = 160 MiB).  One Param2
+        // det-key is ~120 MiB (D=4096, n=1024, 3×40-bit moduli), so
+        // multi-address wallets are effectively limited to 1 key per RPC;
+        // additional keys must be chunked into separate requests and the
+        // per-chunk results unioned.
+        const SERVER_DETECTION_KEYS_TOTAL_BUDGET: usize = 160 * 1024 * 1024;
 
         let mut clients = Vec::new();
         let mut detection_keys = Vec::new();
@@ -721,8 +723,8 @@ impl SyncEngine {
             secret_arr.copy_from_slice(bytes);
             let client_crypto =
                 darkfi_lightwalletd::unifomr::UnifOmrClient::from_wallet(&secret_arr, net)?;
-            // Detection keys are ~38MB and take seconds of BFV encryption to
-            // build, but any previously built key stays valid (randomness is
+            // Detection keys are ~120 MiB (Param2) and take seconds of BFV
+            // encryption to build, but any previously built key stays valid (randomness is
             // per-build; the decryption key is derived from the wallet
             // secret). Cache built keys in the local block cache DB, keyed by
             // a domain-separated hash of the wallet secret + network + param
