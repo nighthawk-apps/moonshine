@@ -47,10 +47,14 @@ fn default_use_tor() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server_url: "http://127.0.0.1:9067".to_string(),
+            // Studio testnet LWD via ngrok (see ~/.local/share/darkfi/studio-lwd-endpoint.env).
+            server_url: "https://epidermis-sandbox-marshland.ngrok-free.dev".to_string(),
             network: "testnet".to_string(),
-            tls_pin_sha256: None,
-            use_tor: true,
+            tls_pin_sha256: Some(
+                "9f8f3877f312cb48e4d8d050b5c7b70f6144f1c31812d7ec299c32793a274985".to_string(),
+            ),
+            // Direct path to ngrok; Tor can be re-enabled in config.toml.
+            use_tor: false,
         }
     }
 }
