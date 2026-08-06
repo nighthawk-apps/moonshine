@@ -34,19 +34,22 @@
 //! Fail-closed: if the bootstrap or the Tor dial fails, the connection
 //! errors out — traffic is never silently downgraded to a direct connection.
 
+use std::sync::Arc;
+
 use arti_client::{TorClient, TorClientConfig};
 use tokio::sync::OnceCell;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
-static TOR: OnceCell<TorClient<TokioRustlsRuntime>> = OnceCell::const_new();
+static TOR: OnceCell<Arc<TorClient<TokioRustlsRuntime>>> = OnceCell::const_new();
 
 /// Get the shared, bootstrapped Tor client, bootstrapping on first call.
-pub async fn tor_client() -> Result<TorClient<TokioRustlsRuntime>, String> {
+pub async fn tor_client() -> Result<Arc<TorClient<TokioRustlsRuntime>>, String> {
     let client = TOR
         .get_or_try_init(|| async {
             eprintln!("Bootstrapping embedded Tor (arti) — first run can take up to 30s...");
             let runtime = TokioRustlsRuntime::current()
                 .map_err(|e| format!("Tor runtime init failed: {e}"))?;
+            // Arti ≥0.45 returns Arc<TorClient<_>> from create_bootstrapped.
             let client = TorClient::with_runtime(runtime)
                 .config(TorClientConfig::default())
                 .create_bootstrapped()
@@ -56,7 +59,7 @@ pub async fn tor_client() -> Result<TorClient<TokioRustlsRuntime>, String> {
             Ok::<_, String>(client)
         })
         .await?;
-    Ok(client.clone())
+    Ok(Arc::clone(client))
 }
 
 /// Dial `host:port` through Tor. Returns an [`arti_client::DataStream`],
