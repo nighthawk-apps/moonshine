@@ -207,23 +207,22 @@ impl SyncEngine {
         //    so that discovered coins are in the DB when the tree is built (allowing
         //    inline marking of owned positions).
         let mut notes_found = 0u32;
-        let mut heights_to_fetch: Vec<u32> = matching_heights.clone();
-
+        // Moonshine is UnifOMR-strict by design: empty digests and inter-match
+        // gaps do NOT trigger supplemental trial decrypt. Only txs with UnifOMR
+        // clues (Moonshine ↔ Moonshine, or Nighthawk → Moonshine) are discovered
+        // unless the operator explicitly passes `--force-trial`.
+        let heights_to_fetch: Vec<u32> = matching_heights.clone();
         if matching_heights.is_empty() && !self.force_trial {
-            println!("Falling back to trial decrypt — funds will be visible shortly.");
-            tracing::warn!(
-                "OMR returned 0 matches in [{scan_start}, {scan_end}] — running supplemental trial decrypt"
+            tracing::info!(
+                "OMR returned 0 matches in [{scan_start}, {scan_end}] — \
+                 skipping supplemental trial decrypt (Moonshine strict UnifOMR). \
+                 Use --force-trial to opt in to full-window trial decrypt."
             );
-            heights_to_fetch = (scan_start..=scan_end).collect();
         } else if !matching_heights.is_empty() && !self.force_trial {
-            let extra =
-                compute_supplemental_heights(scan_start, scan_end, tip_height, &matching_heights);
-            if !extra.is_empty() {
-                tracing::debug!("OMR gap trial-decrypt: {} additional heights", extra.len());
-                heights_to_fetch.extend(extra);
-                heights_to_fetch.sort_unstable();
-                heights_to_fetch.dedup();
-            }
+            tracing::debug!(
+                "OMR matched {} block(s); gap trial-decrypt disabled (Moonshine strict UnifOMR)",
+                matching_heights.len()
+            );
         }
 
         if !heights_to_fetch.is_empty() {
