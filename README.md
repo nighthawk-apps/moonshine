@@ -79,11 +79,13 @@ cargo test
 `~/.config/moonshine/config.toml` (created on first run):
 
 ```toml
-server_url = "http://127.0.0.1:9067"
+server_url = "https://epidermis-sandbox-marshland.ngrok-free.dev"
 network = "testnet"
+use_tor = true
 ```
 
 ```bash
+# Local LWD (Tor auto-skipped for loopback):
 moonshine --server http://127.0.0.1:9067 sync
 ```
 
@@ -157,7 +159,7 @@ moonshine
 | **Multi detection_keys** | ✅ | Up to 16 wallet secrets in `GetUnifOmrDigest` |
 | **Local BlockCache** | ✅ | Sparse/PIR compact blocks cached beside wallet DB |
 | **OMR Err → no silent trial (S15)** | ✅ | Tip not advanced on OMR **error** |
-| **Empty OMR → supplemental trial** | ✅ | Privacy-degrading miss-safety (documented) |
+| **Empty OMR → supplemental trial** | ❌ (strict) | Use `sync --force-trial` for miss-safety |
 | **Tip regression rewind** | ✅ | Rewinds sync height when tip < last synced |
 | **`chain_name` network guard** | ✅ | Must match config `network` |
 | **TLS pin remote HTTPS** | ✅ | `tls_pin_sha256` + `PinnedVerifier` (leaf DER SHA-256); remote cleartext refused |
@@ -186,8 +188,9 @@ moonshine
 - Requires **darkfi-lightwalletd** with `fhe-omr`
 - Cross-client crypto parity: RLWE `n=1024`, signed AHE, `CLUE_ERROR_BOUND=2`, length-prefixed SealPIR limbs
 - Flow: RegisterCluePublicKey → GetClue → SendTransaction(omr_clue) → GetUnifOmrDigest → FetchPirBatch
-- Empty OMR → supplemental trial decrypt (decoy directory ≠ unregistered failure)
-- Default local: `http://127.0.0.1:9067`
+- Empty OMR → **no** supplemental trial (strict UnifOMR); use `sync --force-trial` for miss-safety
+- Send fails closed unless GetClue **ownership proof** verifies (rejects directory decoys)
+- First-run default LWD: nighthawk ngrok HTTPS with **Tor on**; override with `--server` / config for localhost
 - Limits: [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md) (Param2 active)
 - MVP fork archive: [`docs/unifomr_mvp_archive.md`](docs/unifomr_mvp_archive.md)
 - Checklist: [`docs/verification-checklist.md`](docs/verification-checklist.md)

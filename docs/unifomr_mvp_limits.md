@@ -67,7 +67,7 @@ These are independent of Table-1 parameters:
 
 1. **Any-match multi-clue** — per-clue BFV layers + client OR (not homomorphic product). Semantically equivalent; avoids CT×CT noise blow-up.
 2. **SealPIR-style striped PIR** — BFV stripes, length-prefixed limbs; windows up to `8 × D` (`D=4096` under Param2). Not a full SealPIR Galois expander.
-3. **Clue PK directory** — always `found=true` + decoy PK + timing pad; unregistered receivers use supplemental trial decrypt.
+3. **Clue PK directory** — always `found=true` + decoy PK + timing pad; clients **must** verify ownership. Moonshine rejects decoys (strict UnifOMR); Nighthawk can supplemental trial-decrypt when `strict_omr_only` is off.
 4. **Digest mod-switch is BFV-level** — the paper sketches switching the clue modulus `Q→Q′=q`; here the digest is a BFV ciphertext whose *plaintext* already lives mod `q`, so the equivalent size/noise reduction is realized by switching the BFV ciphertext to its last RNS level.
 
 ## Active Param2 structural parameters

@@ -54,7 +54,7 @@ impl Default for Config {
                 "9f8f3877f312cb48e4d8d050b5c7b70f6144f1c31812d7ec299c32793a274985".to_string(),
             ),
             // Direct path to ngrok; Tor can be re-enabled in config.toml.
-            use_tor: false,
+            use_tor: true,
         }
     }
 }

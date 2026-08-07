@@ -13,7 +13,7 @@ cd ../darkfi-lightwalletd
 FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
 ```
 
-Current shared tip (pre-release): `a76639f020a55473ee786deb584d603d968d4db6`.
+Current shared tip (pre-release): `064030ffdbf4d80e5400cef6fe57fcfeb5d07deb`.
 
 ## Wallet crypto note
 

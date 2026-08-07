@@ -415,6 +415,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let mut recipient_pk = [0u8; 32];
                 recipient_pk.copy_from_slice(&to_bytes);
 
+                // Strict UnifOMR: fail closed unless GetClue ownership verifies
+                // (decoys look like valid PKs without this check).
+                let network_byte = wallet::Wallet::network_byte(&config.network);
                 let omr_clue = {
                     let cfg_lookup = crate::config::Config::load();
                     let mut lookup = crate::client::LightwalletClient::new(
@@ -426,31 +429,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .get_clue_public_key(recipient_pk.to_vec())
                         .await
                     {
-                        Ok(resp) => {
-                            match darkfi_lightwalletd::unifomr::deserialize_public_key(
-                                &resp.clue_public_key,
-                            ) {
-                                Ok(pk) => {
-                                    darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk)
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "⚠ UnifOMR clue unavailable ({}). \
-                                         Proceeding without OMR hint — recipient \
-                                         must trial-decrypt.",
-                                        e
-                                    );
-                                    vec![]
-                                }
+                        Ok(resp) => match verified_unifomr_clue(
+                            network_byte,
+                            &recipient_pk,
+                            &resp,
+                        ) {
+                            Ok(clue) => clue,
+                            Err(e) => {
+                                eprintln!(
+                                    "Error: UnifOMR clue rejected ({e}). \
+                                     Recipient may be unregistered — moonshine \
+                                     is strict UnifOMR (no trial-decrypt send). \
+                                     Ask the recipient to register, or they can \
+                                     `moonshine sync --force-trial` after a \
+                                     clearnet send from another wallet."
+                                );
+                                return Ok(());
                             }
-                        }
+                        },
                         Err(e) => {
                             eprintln!(
-                                "⚠ UnifOMR clue PK lookup failed ({}). \
-                                 Proceeding without OMR hint.",
+                                "Error: UnifOMR clue PK lookup failed: {}",
                                 sync::redact_sync_error(&e.to_string())
                             );
-                            vec![]
+                            return Ok(());
                         }
                     }
                 };
@@ -813,20 +815,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             Some(recipient_pk) => {
                                 match client.get_clue_public_key(recipient_pk.to_vec()).await {
                                     Ok(resp) => {
-                                        match darkfi_lightwalletd::unifomr::deserialize_public_key(
-                                            &resp.clue_public_key,
+                                        let network_byte =
+                                            wallet::Wallet::network_byte(&config.network);
+                                        match verified_unifomr_clue(
+                                            network_byte,
+                                            &recipient_pk,
+                                            &resp,
                                         ) {
-                                            Ok(pk) => {
-                                                let clue = darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk);
+                                            Ok(clue) => {
                                                 println!(
-                                                    "UnifOMR clue from directory PK ({} bytes)",
+                                                    "UnifOMR clue from verified directory PK ({} bytes)",
                                                     clue.len()
                                                 );
                                                 clue
                                             }
                                             Err(e) => {
                                                 eprintln!(
-                                                    "Error: UnifOMR clue unavailable ({e}). \
+                                                    "Error: UnifOMR clue rejected ({e}). \
                                                      No PerfOMR fallback."
                                                 );
                                                 return Ok(());
@@ -1133,6 +1138,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// Verify GetCluePublicKey ownership proof, then build a UnifOMR clue.
+/// Rejects directory decoys (unregistered recipients) that deserialize as PKs.
+fn verified_unifomr_clue(
+    network_byte: u8,
+    recipient_pk: &[u8; 32],
+    resp: &client::proto::CluePublicKey,
+) -> Result<Vec<u8>, String> {
+    if resp.clue_public_key.is_empty() {
+        return Err("empty clue public key".into());
+    }
+    darkfi_lightwalletd::unifomr::verify_clue_pk_ownership(
+        network_byte,
+        resp.key_version,
+        recipient_pk,
+        &resp.clue_public_key,
+        &resp.ownership_proof,
+    )?;
+    let pk = darkfi_lightwalletd::unifomr::deserialize_public_key(&resp.clue_public_key)
+        .map_err(|e| format!("invalid UnifOMR clue public key: {e}"))?;
+    Ok(darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk))
 }
 
 /// Parse recipient pubkey from the moonshine Create stub wire format:
