@@ -314,12 +314,13 @@ impl LightwalletClient {
     }
 
     /// Fetch the Merkle tree state snapshot at a given block height.
-    pub async fn get_tree_state(&mut self, height: u32) -> Result<proto::TreeState, Box<dyn Error>> {
+    pub async fn get_tree_state(
+        &mut self,
+        height: u32,
+    ) -> Result<proto::TreeState, Box<dyn Error>> {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
-        let response = client
-            .get_tree_state(proto::BlockHeight { height })
-            .await?;
+        let response = client.get_tree_state(proto::BlockHeight { height }).await?;
         Ok(response.into_inner())
     }
 
@@ -485,7 +486,7 @@ impl LightwalletClient {
     ) -> Result<proto::OmrDigestResponse, Box<dyn Error>> {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
-        
+
         let chunk_size = 1024 * 1024; // 1 MiB chunks
         let num_keys = detection_keys.len() as u32;
 
@@ -527,7 +528,9 @@ impl LightwalletClient {
             }
         };
 
-        let response = client.get_unif_omr_digest(tonic::Request::new(stream)).await?;
+        let response = client
+            .get_unif_omr_digest(tonic::Request::new(stream))
+            .await?;
         Ok(response.into_inner())
     }
 

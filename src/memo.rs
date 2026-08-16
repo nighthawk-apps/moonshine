@@ -117,9 +117,9 @@ mod tests {
 // Encrypted OMR metadata — off-chain channel via LWD
 // ---------------------------------------------------------------------------
 
-use darkfi_sdk::crypto::{note::AeadEncryptedNote, PublicKey};
 #[cfg(test)]
 use darkfi_sdk::crypto::SecretKey;
+use darkfi_sdk::crypto::{note::AeadEncryptedNote, PublicKey};
 use darkfi_serial::{serialize, Decodable, Encodable};
 
 #[derive(Clone, Debug)]

@@ -68,6 +68,8 @@ pub struct SyncEngine {
     pub network_byte: u8,
     /// S18: skip OMR and trial-decrypt the full scan window.
     pub force_trial: bool,
+    /// When true, never supplemental-trial-decrypt empty OMR / inter-match gaps.
+    pub strict_omr: bool,
     /// Local compact-block cache (beside wallet DB). Optional for tests.
     pub block_cache: Option<BlockCache>,
     /// Route remote lightwalletd traffic through embedded Tor (config `use_tor`).
@@ -84,6 +86,7 @@ impl SyncEngine {
         tls_pin_sha256: Option<String>,
         network_byte: u8,
         force_trial: bool,
+        strict_omr: bool,
         block_cache: Option<BlockCache>,
         use_tor: bool,
     ) -> Self {
@@ -94,6 +97,7 @@ impl SyncEngine {
             tls_pin_sha256,
             network_byte,
             force_trial,
+            strict_omr,
             block_cache,
             use_tor,
         }
@@ -193,12 +197,19 @@ impl SyncEngine {
                 }
                 Err(e) => {
                     let redacted = redact_sync_error(&e.to_string());
-                    return Err(format!(
-                        "OMR detection failed ({}); refusing silent trial-decrypt fallback \
-                         (tip not advanced). Use --force-trial to opt in.",
+                    if self.strict_omr {
+                        return Err(format!(
+                            "OMR detection failed ({}); --strict-omr refuses trial-decrypt \
+                             fallback (tip not advanced).",
+                            redacted
+                        )
+                        .into());
+                    }
+                    tracing::warn!(
+                        "OMR detection failed ({}); falling back to full-window trial decrypt",
                         redacted
-                    )
-                    .into());
+                    );
+                    (scan_start..=scan_end).collect()
                 }
             }
         };
@@ -207,25 +218,33 @@ impl SyncEngine {
         //    so that discovered coins are in the DB when the tree is built (allowing
         //    inline marking of owned positions).
         let mut notes_found = 0u32;
-        // Moonshine is UnifOMR-strict by design: empty digests and inter-match
-        // gaps do NOT trigger supplemental trial decrypt. Only txs with UnifOMR
-        // clues (Moonshine ↔ Moonshine, or Nighthawk → Moonshine) are discovered
-        // unless the operator explicitly passes `--force-trial`.
-        let heights_to_fetch: Vec<u32> = matching_heights.clone();
-        if matching_heights.is_empty() && !self.force_trial {
+        // Default: trial-decrypt the scan window so non-UnifOMR counterparties
+        // (`drk`) are received. `--strict-omr` keeps UnifOMR-only sparse PIR.
+        let use_full_window_trial = self.force_trial || !self.strict_omr;
+        let heights_to_fetch: Vec<u32> = if use_full_window_trial {
+            (scan_start..=scan_end).collect()
+        } else {
+            matching_heights.clone()
+        };
+        if matching_heights.is_empty() && self.strict_omr && !self.force_trial {
             tracing::info!(
                 "OMR returned 0 matches in [{scan_start}, {scan_end}] — \
-                 skipping supplemental trial decrypt (Moonshine strict UnifOMR). \
-                 Use --force-trial to opt in to full-window trial decrypt."
-            );
-        } else if !matching_heights.is_empty() && !self.force_trial {
-            tracing::debug!(
-                "OMR matched {} block(s); gap trial-decrypt disabled (Moonshine strict UnifOMR)",
-                matching_heights.len()
+                 skipping trial decrypt (--strict-omr)"
             );
         }
 
-        if !heights_to_fetch.is_empty() {
+        if use_full_window_trial {
+            tracing::info!(
+                "Trial-decrypting compact blocks [{scan_start}, {scan_end}] \
+                 (UnifOMR fallback / --force-trial)"
+            );
+            let blocks = self
+                .fetch_window_range(&mut client, scan_start, scan_end)
+                .await?;
+            for block in &blocks {
+                notes_found += self.trial_decrypt_block(block)?;
+            }
+        } else if !heights_to_fetch.is_empty() {
             // PIR only for pure OMR match set (privacy); supplements use sparse height RPC.
             let use_pir_only = heights_to_fetch == matching_heights && !matching_heights.is_empty();
             let blocks = if use_pir_only {
@@ -353,7 +372,10 @@ impl SyncEngine {
         }
 
         if total_marked > 0 {
-            eprintln!("[DEBUG] Marked {} owned positions in Merkle tree", total_marked);
+            eprintln!(
+                "[DEBUG] Marked {} owned positions in Merkle tree",
+                total_marked
+            );
         }
 
         let mut out = Vec::new();
@@ -1015,7 +1037,10 @@ pub fn trial_decrypt_note(encrypted_note: &[u8], wallet_key: &[u8]) -> Option<De
         } else if memo_region[0] < 0xfd {
             (memo_region[0] as usize, 1)
         } else if memo_region[0] == 0xfd && memo_region.len() >= 3 {
-            (u16::from_le_bytes([memo_region[1], memo_region[2]]) as usize, 3)
+            (
+                u16::from_le_bytes([memo_region[1], memo_region[2]]) as usize,
+                3,
+            )
         } else {
             (0, 0)
         };

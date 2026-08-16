@@ -87,6 +87,11 @@ enum Command {
     Sync {
         #[arg(long, help = "Force trial decryption, skip OMR")]
         force_trial: bool,
+        #[arg(
+            long,
+            help = "UnifOMR-only: do not trial-decrypt empty digests or inter-match gaps"
+        )]
+        strict_omr: bool,
     },
 
     /// Rescan chain from birthday height
@@ -204,11 +209,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // Interactive paste: require a TTY so mnemonics are not slurped
                     // from pipes/redirects into process history unintentionally.
                     if !std::io::stdin().is_terminal() {
-                        return Err(
-                            "Refusing non-interactive mnemonic import from stdin. \
+                        return Err("Refusing non-interactive mnemonic import from stdin. \
                              Pass the 22 words as arguments, or run in a TTY."
-                                .into(),
-                        );
+                            .into());
                     }
                     println!(
                         "Import wallet '{}' — enter your 22-word DarkFi mnemonic:",
@@ -217,10 +220,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("(Paste all words on one line, separated by spaces)");
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input)?;
-                    input
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect()
+                    input.split_whitespace().map(|s| s.to_string()).collect()
                 };
                 if words.len() != 22 {
                     eprintln!(
@@ -425,14 +425,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         cfg_lookup.tls_pin_sha256.clone(),
                     )
                     .with_tor(cfg_lookup.use_tor);
-                    match lookup
-                        .get_clue_public_key(recipient_pk.to_vec())
-                        .await
-                    {
+                    let info = match lookup.get_light_info().await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            eprintln!(
+                                "Error: GetLightInfo failed: {}",
+                                sync::redact_sync_error(&e.to_string())
+                            );
+                            return Ok(());
+                        }
+                    };
+                    match lookup.get_clue_public_key(recipient_pk.to_vec()).await {
                         Ok(resp) => match verified_unifomr_clue(
                             network_byte,
                             &recipient_pk,
                             &resp,
+                            &info.directory_attest_pubkey,
                         ) {
                             Ok(clue) => clue,
                             Err(e) => {
@@ -813,6 +821,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Ok(raw_tx) => {
                         let omr_clue = match parse_stub_recipient_pubkey(&raw_tx) {
                             Some(recipient_pk) => {
+                                let info = match client.get_light_info().await {
+                                    Ok(info) => info,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "Error: GetLightInfo failed: {}",
+                                            sync::redact_sync_error(&e.to_string())
+                                        );
+                                        return Ok(());
+                                    }
+                                };
                                 match client.get_clue_public_key(recipient_pk.to_vec()).await {
                                     Ok(resp) => {
                                         let network_byte =
@@ -821,6 +839,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             network_byte,
                                             &recipient_pk,
                                             &resp,
+                                            &info.directory_attest_pubkey,
                                         ) {
                                             Ok(clue) => {
                                                 println!(
@@ -875,13 +894,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         },
-        Command::Sync { force_trial } => {
+        Command::Sync {
+            force_trial,
+            strict_omr,
+        } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
             let secret_keys = w.db.get_all_secrets()?;
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
             if force_trial {
                 println!("Syncing with --force-trial (OMR skipped)...");
+            } else if strict_omr {
+                println!("Syncing UnifOMR-strict (no trial-decrypt fallback)...");
+            } else {
+                println!("Syncing UnifOMR with trial-decrypt fallback for non-OMR txs...");
             }
             println!("Syncing with lightwalletd at {}...", config.server_url);
 
@@ -974,6 +1000,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 config.tls_pin_sha256.clone(),
                 network_byte,
                 force_trial,
+                strict_omr,
                 block_cache,
                 config.use_tor,
             );
@@ -1109,9 +1136,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 if let Some(s) = server_url {
                     // Fail-closed: refuse remote cleartext (match mobile / client connect).
-                    let loopback = s.contains("localhost")
-                        || s.contains("127.0.0.1")
-                        || s.contains("[::1]");
+                    let loopback =
+                        s.contains("localhost") || s.contains("127.0.0.1") || s.contains("[::1]");
                     if !s.starts_with("https://") && !loopback {
                         eprintln!(
                             "Error: remote cleartext server URL refused. \
@@ -1140,17 +1166,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Verify GetCluePublicKey ownership proof, then build a UnifOMR clue.
-/// Rejects directory decoys (unregistered recipients) that deserialize as PKs.
+/// Verify GetCluePublicKey directory attestation, then build a UnifOMR clue.
 fn verified_unifomr_clue(
     network_byte: u8,
     recipient_pk: &[u8; 32],
     resp: &client::proto::CluePublicKey,
+    attest_pk: &[u8],
 ) -> Result<Vec<u8>, String> {
     if resp.clue_public_key.is_empty() {
         return Err("empty clue public key".into());
     }
-    darkfi_lightwalletd::unifomr::verify_clue_pk_ownership(
+    if attest_pk.len() != 32 {
+        return Err("GetLightInfo missing directory_attest_pubkey; upgrade lightwalletd".into());
+    }
+    darkfi_lightwalletd::unifomr::verify_directory_attestation(
+        attest_pk,
         network_byte,
         resp.key_version,
         recipient_pk,

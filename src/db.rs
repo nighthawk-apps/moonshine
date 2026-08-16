@@ -887,9 +887,24 @@ mod tests {
         let db = WalletDb::in_memory().unwrap();
         for (h, ser) in [(100u32, &[10u8][..]), (200, &[20u8]), (300, &[30u8])] {
             db.insert_note(
-                &format!("tx_{h}"), 0, 1000, "DRK", ser, h, None, None, None, None,
-                None, None, None, None, Some(ser), Some(&[9u8; 32]),
-            ).unwrap();
+                &format!("tx_{h}"),
+                0,
+                1000,
+                "DRK",
+                ser,
+                h,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(ser),
+                Some(&[9u8; 32]),
+            )
+            .unwrap();
         }
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 3000);
 
@@ -904,13 +919,43 @@ mod tests {
     fn test_invalidate_above_height_unspends_coins() {
         let db = WalletDb::in_memory().unwrap();
         db.insert_note(
-            "tx_lo", 0, 500, "DRK", &[1], 100, None, None, None, None,
-            None, None, None, None, Some(&[1]), Some(&[9u8; 32]),
-        ).unwrap();
+            "tx_lo",
+            0,
+            500,
+            "DRK",
+            &[1],
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
         db.insert_note(
-            "tx_hi", 0, 300, "DRK", &[2], 200, None, None, None, None,
-            None, None, None, None, Some(&[2]), Some(&[9u8; 32]),
-        ).unwrap();
+            "tx_hi",
+            0,
+            300,
+            "DRK",
+            &[2],
+            200,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[2]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
         db.mark_note_spent(&[1]).unwrap();
         db.mark_note_spent(&[2]).unwrap();
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
@@ -922,9 +967,12 @@ mod tests {
     #[test]
     fn test_invalidate_above_height_removes_transactions() {
         let db = WalletDb::in_memory().unwrap();
-        db.insert_transaction("hash_100", 100, "incoming", 1000, "DRK", None, None).unwrap();
-        db.insert_transaction("hash_200", 200, "outgoing", 500, "DRK", None, None).unwrap();
-        db.insert_transaction("hash_300", 300, "incoming", 200, "DRK", None, None).unwrap();
+        db.insert_transaction("hash_100", 100, "incoming", 1000, "DRK", None, None)
+            .unwrap();
+        db.insert_transaction("hash_200", 200, "outgoing", 500, "DRK", None, None)
+            .unwrap();
+        db.insert_transaction("hash_300", 300, "incoming", 200, "DRK", None, None)
+            .unwrap();
 
         let (_, txs_del) = db.invalidate_above_height(150).unwrap();
         assert_eq!(txs_del, 2);
@@ -938,10 +986,26 @@ mod tests {
     fn test_reset_for_rescan_wipes_everything() {
         let db = WalletDb::in_memory().unwrap();
         db.insert_note(
-            "tx1", 0, 1000, "DRK", &[1], 100, None, None, None, None,
-            None, None, None, None, Some(&[1]), Some(&[9u8; 32]),
-        ).unwrap();
-        db.insert_transaction("hash1", 100, "incoming", 1000, "DRK", None, None).unwrap();
+            "tx1",
+            0,
+            1000,
+            "DRK",
+            &[1],
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.insert_transaction("hash1", 100, "incoming", 1000, "DRK", None, None)
+            .unwrap();
         db.set_meta("tree_state", &[0xFF; 64]).unwrap();
         db.set_sync_height(100).unwrap();
 

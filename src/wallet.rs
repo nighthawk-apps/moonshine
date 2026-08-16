@@ -132,11 +132,9 @@ impl Wallet {
 
         // Mnemonic must never hit stdout (pipes/logs). Only print to an interactive stderr TTY.
         if !std::io::stderr().is_terminal() {
-            return Err(
-                "Refusing to print mnemonic: stderr is not a TTY. \
+            return Err("Refusing to print mnemonic: stderr is not a TTY. \
                  Run `moonshine wallet create` in an interactive terminal to back up the seed."
-                    .into(),
-            );
+                .into());
         }
         eprintln!();
         eprintln!("╔════════════════════════════════════════════════╗");

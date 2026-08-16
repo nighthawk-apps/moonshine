@@ -193,7 +193,6 @@ impl BlockCache {
         Ok(actual == expected)
     }
 
-
     /// Get a cached UnifOMR detection key by opaque id (BLAKE3 of
     /// wallet-secret + network, computed by the caller).
     ///
@@ -222,7 +221,6 @@ impl BlockCache {
         )?;
         Ok(())
     }
-
 }
 
 #[cfg(test)]
