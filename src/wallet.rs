@@ -67,6 +67,37 @@ pub fn clue_key_version_now() -> u64 {
         .unwrap_or(1)
 }
 
+static CLUE_PK_REGISTERED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+> = std::sync::OnceLock::new();
+
+fn clue_registration_id(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("moonshine clue-reg v1");
+    h.update(&[network]);
+    h.update(pay_pk);
+    h.update(clue_pk);
+    *h.finalize().as_bytes()
+}
+
+pub fn clue_already_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> bool {
+    let id = clue_registration_id(network, pay_pk, clue_pk);
+    CLUE_PK_REGISTERED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .map(|s| s.contains(&id))
+        .unwrap_or(false)
+}
+
+pub fn mark_clue_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) {
+    let id = clue_registration_id(network, pay_pk, clue_pk);
+    if let Ok(mut s) = CLUE_PK_REGISTERED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+    {
+        s.insert(id);
+    }
+}
+
 /// The main wallet handle.
 pub struct Wallet {
     pub name: String,
@@ -423,8 +454,24 @@ impl Wallet {
     /// Delete a wallet database.
     pub fn delete(name: &str) -> Result<(), Box<dyn Error>> {
         let db_path = Self::db_path(name);
-        if Path::new(&db_path).exists() {
-            std::fs::remove_file(&db_path)?;
+        let mut removed = false;
+        let extras = [
+            db_path.clone(),
+            format!("{db_path}-wal"),
+            format!("{db_path}-shm"),
+            format!("{db_path}.pass"),
+            format!("{db_path}.wrapkey"),
+            format!("{db_path}.blocks.db"),
+            format!("{db_path}.blocks.db-wal"),
+            format!("{db_path}.blocks.db-shm"),
+        ];
+        for path in extras {
+            if Path::new(&path).exists() {
+                std::fs::remove_file(&path)?;
+                removed = true;
+            }
+        }
+        if removed {
             println!("Wallet '{}' deleted.", name);
         } else {
             println!("Wallet '{}' not found.", name);
@@ -542,6 +589,19 @@ mod tests {
             db,
         };
         assert!(wallet.master_secret().is_err());
+    }
+
+    #[test]
+    fn test_clue_registration_session_cache() {
+        let pk = [0x11u8; 32];
+        let clue = vec![0x22u8; 8];
+        assert!(!clue_already_registered(1, &pk, &clue));
+        mark_clue_registered(1, &pk, &clue);
+        assert!(clue_already_registered(1, &pk, &clue));
+        assert!(
+            !clue_already_registered(0, &pk, &clue),
+            "different network must not collide"
+        );
     }
 
     #[test]

@@ -32,8 +32,23 @@ const MAX_GRPC_MESSAGE_BYTES: usize = 160 * 1024 * 1024;
 
 /// gRPC request timeout.  Param2 det-key upload (~120 MiB) + server-side FHE
 /// detection + Tor latency easily exceed the tonic default (no timeout).
-/// Must be ≥ lightwalletd `request_timeout_s` (300).
-const GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Must be ≥ lightwalletd `request_timeout_s` (1800). Per-message SIMD encode
+/// of one Param2 chunk (D=4096, ℓ=2) can exceed 5 minutes.
+const GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Exact-host loopback check. `https://localhost.evil.com` is remote.
+fn host_is_loopback(server_url: &str) -> bool {
+    let rest = server_url.split("://").nth(1).unwrap_or(server_url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if let Some(inside) = hostport.strip_prefix('[') {
+        inside.split(']').next().unwrap_or(inside)
+    } else {
+        hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport)
+    };
+    matches!(host, "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1")
+        || host.eq_ignore_ascii_case("localhost")
+}
 
 fn with_large_messages(
     client: DarkFiLightWalletClient<Channel>,
@@ -158,10 +173,9 @@ impl LightwalletClient {
         self
     }
 
-    /// True if the server URL points to localhost.
+    /// True if the server URL host is loopback (exact host, not a substring).
     fn is_localhost(&self) -> bool {
-        let url = &self.server_url;
-        url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
+        host_is_loopback(&self.server_url)
     }
 
     /// Establish gRPC connection if not already connected.
@@ -592,5 +606,19 @@ impl LightwalletClient {
             .get_clue_public_key(proto::PaymentPubkey { payment_pubkey })
             .await?;
         Ok(response.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localhost_is_exact_host_not_substring() {
+        assert!(host_is_loopback("http://127.0.0.1:9067"));
+        assert!(host_is_loopback("http://localhost:9067"));
+        assert!(host_is_loopback("http://[::1]:9067"));
+        assert!(!host_is_loopback("https://localhost.evil.com:443"));
+        assert!(!host_is_loopback("https://lwd.example:9067"));
     }
 }

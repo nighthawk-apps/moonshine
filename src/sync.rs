@@ -41,7 +41,8 @@
 use crate::block_cache::BlockCache;
 use crate::client::LightwalletClient;
 use crate::db::WalletDb;
-use darkfi_sdk::crypto::MerkleTree;
+use darkfi_sdk::crypto::{MerkleNode, MerkleTree};
+use darkfi_sdk::pasta::pallas;
 
 use futures::StreamExt;
 use tokio::time::Duration;
@@ -167,7 +168,9 @@ impl SyncEngine {
         }
 
         let scan_start = (last_synced + 1).max(birthday);
-        let scan_end = tip_height.min(scan_start + MAX_BLOCKS_PER_REQUEST - 1);
+        // May be clamped down below if the server truncates the OMR digest at its
+        // DoS cap; the dropped tail is then re-scanned on the next cycle.
+        let mut scan_end = tip_height.min(scan_start + MAX_BLOCKS_PER_REQUEST - 1);
 
         let (padded_start, padded_end) = pad_block_range(scan_start, scan_end, tip_height);
 
@@ -182,7 +185,16 @@ impl SyncEngine {
                 .try_omr_detect(&mut client, padded_start, padded_end)
                 .await
             {
-                Ok(heights) => {
+                Ok((heights, covered_end)) => {
+                    // Server truncated at its DoS cap: clamp the scan cursor to the
+                    // covered end so the dropped tail heights are re-requested next
+                    // cycle instead of being skipped. Never regress below scan_start
+                    // (guarantees forward progress and avoids a u32 underflow).
+                    if let Some(c) = covered_end {
+                        if c < scan_end {
+                            scan_end = c.max(scan_start);
+                        }
+                    }
                     let filtered: Vec<u32> = heights
                         .into_iter()
                         .filter(|h| *h >= scan_start && *h <= scan_end)
@@ -199,8 +211,8 @@ impl SyncEngine {
                     let redacted = redact_sync_error(&e.to_string());
                     if self.strict_omr {
                         return Err(format!(
-                            "OMR detection failed ({}); --strict-omr refuses trial-decrypt \
-                             fallback (tip not advanced).",
+                            "OMR detection failed ({}); strict UnifOMR refuses trial-decrypt \
+                             fallback (tip not advanced). Pass --allow-trial to override.",
                             redacted
                         )
                         .into());
@@ -318,10 +330,9 @@ impl SyncEngine {
             // Match darkfid's genesis initialization: the on-chain Merkle tree
             // starts with a fake zero coin at position 0 (used for dummy inputs).
             // See darkfi/src/contract/money/src/entrypoint.rs line 195-196.
-            let mut genesis_tree = MerkleTree::new(1);
-            genesis_tree.append(darkfi_sdk::crypto::MerkleNode::from(
-                darkfi_sdk::pasta::pallas::Base::from(0u64),
-            ));
+            let mut genesis_tree = MerkleTree::new(u32::MAX as usize);
+            genesis_tree.append(MerkleNode::from(pallas::Base::from(0u64)));
+            let _ = genesis_tree.mark();
             let mut out = Vec::new();
             darkfi_serial::Encodable::encode(&genesis_tree, &mut out).unwrap_or(0);
             out
@@ -356,17 +367,17 @@ impl SyncEngine {
                 if coin.len() == 32 {
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&coin);
-                    let node: darkfi_sdk::crypto::MerkleNode =
-                        darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(&arr)).unwrap();
+                    let Some(node) = MerkleNode::from_bytes(arr) else {
+                        continue;
+                    };
                     tree.append(node);
-                    // Get position AFTER append (current_position returns the last appended)
-                    let pos: u64 = tree.current_position().map(|p| p.into()).unwrap_or(0);
-                    // Mark this leaf if it belongs to an owned coin
                     if owned_commitments.contains(&arr) {
-                        tree.mark();
-                        total_marked += 1;
+                        if let Some(pos) = tree.mark() {
+                            let pos_u64: u64 = pos.into();
+                            self.db.update_leaf_position(&arr, pos_u64 as u32).ok();
+                            total_marked += 1;
+                        }
                     }
-                    self.db.update_leaf_position(&arr, pos as u32).ok();
                 }
             }
         }
@@ -383,6 +394,147 @@ impl SyncEngine {
             .map_err(|e| format!("Failed to encode MerkleTree: {}", e))?;
         self.db.set_meta("tree_state", &out)?;
         Ok(())
+    }
+
+    /// Rebuild the Money Merkle tree from height 0 through the LWD tip.
+    ///
+    /// Birthday-skipped wallets only append post-birthday commitments, so spend
+    /// proofs use a root that does not match the chain (`-32110` simulate fail).
+    /// This walks `GetNoteCommitments` in height order, matching LWD's tip tree
+    /// (dummy ZERO leaf, then every coin).
+    pub async fn rebuild_money_tree_from_genesis(
+        &self,
+    ) -> Result<(u64, u32, u32), Box<dyn std::error::Error>> {
+        let mut client = LightwalletClient::new(&self.server_url, self.tls_pin_sha256.clone())
+            .with_tor(self.use_tor);
+
+        let tip = client.get_chain_tip().await?.height;
+        let owned_commitments: std::collections::HashSet<[u8; 32]> = self
+            .db
+            .list_owned_commitments()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| {
+                if c.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(c);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut tree = MerkleTree::new(u32::MAX as usize);
+        tree.append(MerkleNode::from(pallas::Base::from(0u64)));
+        let _ = tree.mark();
+
+        let mut appended = 0u64;
+        let mut marked = 0u32;
+        const CHUNK: u32 = 4096;
+        let mut start = 0u32;
+        while start <= tip {
+            let end = start.saturating_add(CHUNK - 1).min(tip);
+            let mut stream = client.get_note_commitments(start, end).await?;
+            let mut by_h: std::collections::BTreeMap<u32, Vec<Vec<u8>>> =
+                std::collections::BTreeMap::new();
+            while let Some(nc_result) = stream.next().await {
+                let nc = nc_result?;
+                by_h.entry(nc.height).or_default().extend(nc.coins);
+            }
+            for (_h, coins) in by_h {
+                for coin in coins {
+                    if coin.len() != 32 {
+                        continue;
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&coin);
+                    let Some(node) = MerkleNode::from_bytes(arr) else {
+                        continue;
+                    };
+                    tree.append(node);
+                    appended += 1;
+                    if owned_commitments.contains(&arr) {
+                        let pos = tree
+                            .mark()
+                            .ok_or_else(|| "merkle mark failed for owned coin".to_string())?;
+                        let pos_u64: u64 = pos.into();
+                        self.db.update_leaf_position(&arr, pos_u64 as u32)?;
+                        marked += 1;
+                    }
+                }
+            }
+            eprintln!(
+                "  merkle rebuild {end}/{tip} (appended {appended}, marked {marked})"
+            );
+            start = end.saturating_add(1);
+            if start == 0 {
+                break;
+            }
+        }
+
+        match client.get_tree_state(tip).await {
+            Ok(st) => {
+                let server_tree: MerkleTree = darkfi_serial::Decodable::decode(
+                    &mut std::io::Cursor::new(st.tree_data),
+                )
+                .map_err(|e| format!("Failed to decode LWD GetTreeState: {e}"))?;
+                let local_root = tree.root(0);
+                let server_root = server_tree.root(0);
+                if local_root != server_root {
+                    return Err(format!(
+                        "rebuilt Merkle root does not match LWD GetTreeState at tip {tip}"
+                    )
+                    .into());
+                }
+            }
+            Err(e) => {
+                // Tip can advance during the rebuild; retry against current tip.
+                match client.get_chain_tip().await {
+                    Ok(now) if now.height == tip => {
+                        eprintln!(
+                            "  warning: could not verify against GetTreeState: {}",
+                            redact_sync_error(&e.to_string())
+                        );
+                    }
+                    Ok(now) => {
+                        eprintln!(
+                            "  warning: tip moved {tip} → {} during rebuild; skip GetTreeState check ({})",
+                            now.height,
+                            redact_sync_error(&e.to_string())
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "  warning: could not verify against GetTreeState: {}",
+                            redact_sync_error(&e.to_string())
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        darkfi_serial::Encodable::encode(&tree, &mut out)
+            .map_err(|e| format!("Failed to encode MerkleTree: {e}"))?;
+        self.db.set_meta("tree_state", &out)?;
+
+        let now = client.get_chain_tip().await?.height;
+        let final_tip = if now > tip {
+            eprintln!(
+                "  catching up Merkle {}..={now} (blocks mined during rebuild)",
+                tip + 1
+            );
+            self.apply_note_commitments(&mut client, tip + 1, now)
+                .await?;
+            now
+        } else {
+            tip
+        };
+        // Prevent the following `sync_once` from re-appending heights already
+        // included in this rebuild (that would duplicate leaves and break spends).
+        self.db.set_sync_height(final_tip)?;
+        Ok((appended, marked, final_tip))
     }
 
     /// Mark positions of all unspent owned coins in the Merkle tree so that
@@ -685,12 +837,17 @@ impl SyncEngine {
     }
 
     /// Attempt UnifOMR detection via the server (scheme 0x05 only).
+    ///
+    /// Returns `(matching_heights, covered_end)`. `covered_end` is `Some(h)` when
+    /// the server truncated the digest at its DoS cap (`complete == false`) and
+    /// only covered heights up to `h`; the caller must clamp its scan window to
+    /// `h` so the dropped tail is re-requested next cycle. `None` ⇒ full coverage.
     async fn try_omr_detect(
         &self,
         client: &mut LightwalletClient,
         start: u32,
         end: u32,
-    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<u32>, Option<u32>), Box<dyn std::error::Error>> {
         let caps = client.get_omr_capabilities().await?;
         if !caps.enabled {
             return Err(format!(
@@ -781,6 +938,9 @@ impl SyncEngine {
 
         let total_keys = clients.len();
         let mut heights: Vec<u32> = Vec::new();
+        // Lowest covered-end across chunks whose digest was truncated at the DoS
+        // cap (all chunks share the same block range, so their coverage agrees).
+        let mut covered_end: Option<u32> = None;
         let mut chunk_keys: Vec<Vec<u8>> = Vec::new();
         let mut chunk_clients = Vec::new();
         let mut chunk_bytes = 0usize;
@@ -799,8 +959,23 @@ impl SyncEngine {
                 let digest = client
                     .get_unif_omr_digest(std::mem::take(&mut chunk_keys), start, end)
                     .await?;
+                let slot_heights =
+                    darkfi_lightwalletd::unifomr::unpack_slot_heights(&digest.slot_heights)?;
+                if !digest.complete {
+                    // Truncated at a whole-height boundary: the covered end is the
+                    // highest mapped height. Track the minimum across chunks.
+                    if let Some(&end_h) = slot_heights.iter().max() {
+                        covered_end = Some(covered_end.map_or(end_h, |c: u32| c.min(end_h)));
+                    } else {
+                        return Err(
+                            "UnifOMR digest truncated with empty slot_heights; \
+                             refusing to skip the uncovered tail"
+                                .into(),
+                        );
+                    }
+                }
                 let chunk_heights =
-                    decrypt_unif_omr_heights(&chunk_clients, &digest.encrypted_digest, start, end)?;
+                    decrypt_unif_omr_heights(&chunk_clients, &digest.encrypted_digest, &slot_heights)?;
                 heights.extend(chunk_heights);
                 chunk_clients.clear();
                 chunk_bytes = 0;
@@ -808,24 +983,31 @@ impl SyncEngine {
         }
         heights.sort_unstable();
         heights.dedup();
+        if let Some(c) = covered_end {
+            tracing::warn!(
+                "UnifOMR digest truncated at DoS cap: covered up to height {c} \
+                 (requested [{start}, {end}]); scan window will be clamped"
+            );
+        }
         tracing::debug!(
             "UnifOMR Round 1: {} matching heights in [{start}, {end}] ({} detection keys)",
             heights.len(),
             total_keys
         );
-        Ok(heights)
+        Ok((heights, covered_end))
     }
 }
 
 /// Decrypt UnifOMR Round-1 digest(s) and collect matching heights.
 ///
-/// Single-key responses are unframed. Multi-key responses are length-prefixed
-/// frames (one digest per detection key), matching lightwalletd.
+/// `slot_heights` is the response's packed slot → height map (same for every
+/// key); slot `i` decrypts to a match iff its clue is pertinent, mapping to
+/// `slot_heights[i]`. Single-key responses are unframed; multi-key responses are
+/// length-prefixed frames (one digest per detection key), matching lightwalletd.
 fn decrypt_unif_omr_heights(
     clients: &[darkfi_lightwalletd::unifomr::UnifOmrClient],
     encrypted_digest: &[u8],
-    start: u32,
-    end: u32,
+    slot_heights: &[u32],
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
@@ -837,7 +1019,7 @@ fn decrypt_unif_omr_heights(
             .decrypt_digest_slots(encrypted_digest)
             .map_err(|e| format!("UnifOMR digest decrypt failed: {e}"))?;
         return Ok(
-            darkfi_lightwalletd::unifomr::UnifOmrClient::range_check_matches(&slots, start, end),
+            darkfi_lightwalletd::unifomr::UnifOmrClient::range_check_matches(&slots, slot_heights),
         );
     }
 
@@ -858,7 +1040,7 @@ fn decrypt_unif_omr_heights(
             .decrypt_digest_slots(frame)
             .map_err(|e| format!("UnifOMR digest decrypt failed for key[{i}]: {e}"))?;
         for h in
-            darkfi_lightwalletd::unifomr::UnifOmrClient::range_check_matches(&slots, start, end)
+            darkfi_lightwalletd::unifomr::UnifOmrClient::range_check_matches(&slots, slot_heights)
         {
             heights.insert(h);
         }

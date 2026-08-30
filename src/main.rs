@@ -89,9 +89,20 @@ enum Command {
         force_trial: bool,
         #[arg(
             long,
-            help = "UnifOMR-only: do not trial-decrypt empty digests or inter-match gaps"
+            help = "Permit trial-decrypt fallback (leaks the scan window to LWD). \
+                    Default is UnifOMR-strict: OMR failure does not advance the tip."
+        )]
+        allow_trial: bool,
+        #[arg(
+            long,
+            hide = true,
+            help = "Deprecated: strict UnifOMR is now the default"
         )]
         strict_omr: bool,
+        /// Rebuild the Money Merkle tree from LWD `GetNoteCommitments` (height 0..=tip).
+        /// Required before spend if the wallet birthday skipped earlier commitments.
+        #[arg(long)]
+        rebuild_merkle: bool,
     },
 
     /// Rescan chain from birthday height
@@ -170,8 +181,9 @@ enum TxSubcommand {
         token: String,
         #[arg(long)]
         memo: Option<String>,
-        /// Fee in atomic units (1 DRK = 1e8). Default matches typical FeeV1 floor.
-        #[arg(long, default_value_t = 10_000)]
+        /// Fee in atomic units (1 DRK = 1e8). Must cover gas (`compute_fee`);
+        /// overpay is accepted. Default is a conservative testnet overpay.
+        #[arg(long, default_value_t = 5_000_000)]
         fee: u64,
     },
     List,
@@ -419,12 +431,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // (decoys look like valid PKs without this check).
                 let network_byte = wallet::Wallet::network_byte(&config.network);
                 let omr_clue = {
-                    let cfg_lookup = crate::config::Config::load();
                     let mut lookup = crate::client::LightwalletClient::new(
-                        &cfg_lookup.server_url,
-                        cfg_lookup.tls_pin_sha256.clone(),
+                        &config.server_url,
+                        config.tls_pin_sha256.clone(),
                     )
-                    .with_tor(cfg_lookup.use_tor);
+                    .with_tor(config.use_tor);
                     let info = match lookup.get_light_info().await {
                         Ok(info) => info,
                         Err(e) => {
@@ -500,12 +511,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("This may take up to 60 seconds on mobile devices.");
 
                 // 1. Fetch ZK circuits from lightwalletd
-                let cfg = crate::config::Config::load();
                 let mut client = crate::client::LightwalletClient::new(
-                    &cfg.server_url,
-                    cfg.tls_pin_sha256.clone(),
+                    &config.server_url,
+                    config.tls_pin_sha256.clone(),
                 )
-                .with_tor(cfg.use_tor);
+                .with_tor(config.use_tor);
                 let zkas_bins = client
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
                     .await?
@@ -676,12 +686,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
 
-                let cfg = crate::config::Config::load();
                 let mut broadcast_client = crate::client::LightwalletClient::new(
-                    &cfg.server_url,
-                    cfg.tls_pin_sha256.clone(),
+                    &config.server_url,
+                    config.tls_pin_sha256.clone(),
                 )
-                .with_tor(cfg.use_tor);
+                .with_tor(config.use_tor);
                 match broadcast_client
                     .send_transaction(tx_data.clone(), omr_clue.clone(), omr_metadata_enc)
                     .await
@@ -733,7 +742,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     eprintln!("Warning: failed to record transaction locally: {}", e);
                 }
 
-                println!("TX hash: {}", &tx_hash[..tx_hash.len().min(24)]);
+                println!("TX hash: {}", tx_hash);
+                let explorer_base = if config.network.eq_ignore_ascii_case("mainnet") {
+                    "https://explorer.dark.fi"
+                } else {
+                    "https://explorer.testnet.dark.fi"
+                };
+                println!("Explorer: {}/tx/{}", explorer_base, tx_hash);
             }
             TxSubcommand::List => {
                 let w = wallet::Wallet::open(&args.wallet_name)?;
@@ -896,18 +911,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         },
         Command::Sync {
             force_trial,
-            strict_omr,
+            allow_trial,
+            strict_omr: _deprecated_strict,
+            rebuild_merkle,
         } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
             let secret_keys = w.db.get_all_secrets()?;
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
+            let strict_omr = !allow_trial && !force_trial;
             if force_trial {
                 println!("Syncing with --force-trial (OMR skipped)...");
             } else if strict_omr {
                 println!("Syncing UnifOMR-strict (no trial-decrypt fallback)...");
             } else {
-                println!("Syncing UnifOMR with trial-decrypt fallback for non-OMR txs...");
+                println!("Syncing UnifOMR with --allow-trial fallback for non-OMR txs...");
             }
             println!("Syncing with lightwalletd at {}...", config.server_url);
 
@@ -944,6 +962,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut last_err: Option<String> = None;
             let key_version = wallet::clue_key_version_now();
             for pk_pay in pay_pks {
+                if wallet::clue_already_registered(network_byte, &pk_pay, &clue_pk) {
+                    ok += 1;
+                    continue;
+                }
                 let Some(sk) = sk_by_pk.get(&pk_pay) else {
                     last_err = Some("missing payment SecretKey for ownership proof".into());
                     continue;
@@ -964,7 +986,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     )
                     .await
                 {
-                    Ok(()) => ok += 1,
+                    Ok(()) => {
+                        wallet::mark_clue_registered(network_byte, &pk_pay, &clue_pk);
+                        ok += 1;
+                    }
                     Err(e) => {
                         last_err = Some(sync::redact_sync_error(&e.to_string()));
                     }
@@ -1004,6 +1029,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 block_cache,
                 config.use_tor,
             );
+
+            if rebuild_merkle {
+                println!(
+                    "Rebuilding Money Merkle tree from LWD GetNoteCommitments (0..=tip)..."
+                );
+                match engine.rebuild_money_tree_from_genesis().await {
+                    Ok((appended, marked, tip)) => {
+                        println!(
+                            "  Merkle rebuild complete: appended={appended} marked={marked} tip={tip}"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "Merkle rebuild failed: {}",
+                            sync::redact_sync_error(&e.to_string())
+                        )
+                        .into());
+                    }
+                }
+            }
 
             // Multi-pass: each cycle covers ≤4096 blocks (padded OMR window);
             // loop until the wallet reaches the chain tip so a wallet far

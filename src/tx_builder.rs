@@ -232,6 +232,8 @@ pub async fn build_transaction(
         };
 
         let mut data = vec![MoneyFunction::FeeV1 as u8];
+        // Wire format matches `drk` / money contract: [FeeV1][u64 paid_fee][MoneyFeeParamsV1].
+        fee.encode_async(&mut data).await?;
         fee_params.encode_async(&mut data).await?;
         let fee_call = ContractCall {
             contract_id: *MONEY_CONTRACT_ID,
