@@ -69,6 +69,7 @@ pub async fn build_transaction(
     tree: MerkleTree,
     zkas_bins: Vec<(String, Vec<u8>)>,
     payment_memo: Option<Vec<u8>>,
+    half_split: bool,
 ) -> Result<Transaction, Box<dyn Error>> {
     let keypair = Keypair::new(wallet_secret);
 
@@ -125,7 +126,7 @@ pub async fn build_transaction(
         mint_pk,
         burn_zkbin,
         burn_pk,
-        false, // half_split
+        half_split,
     )?;
     let _ = payment_memo; // retained in local tx history by caller when present
 

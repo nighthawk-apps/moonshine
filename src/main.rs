@@ -185,6 +185,9 @@ enum TxSubcommand {
         /// overpay is accepted. Default is a conservative testnet overpay.
         #[arg(long, default_value_t = 5_000_000)]
         fee: u64,
+        /// Split the recipient output into two equal coins (value + fee reserve).
+        #[arg(long)]
+        half_split: bool,
     },
     List,
     Show {
@@ -361,6 +364,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 token,
                 memo,
                 fee,
+                half_split,
             } => {
                 let w = wallet::Wallet::open(&args.wallet_name)?;
 
@@ -585,11 +589,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         memo: Vec::new(),
                     };
 
-                    // OwnCoin.coin must be the note commitment (compact output.coin), not serial.
-                    let mut commit_arr = [0u8; 32];
-                    commit_arr.copy_from_slice(&commitment);
-                    let coin = darkfi_money_contract::model::Coin::from_bytes(commit_arr)
-                        .map_err(|e| format!("Invalid coin commitment: {e:?}"))?;
+                    // OwnCoin.coin must equal CoinAttributes::to_coin() (same as the
+                    // burn circuit). Compact-block output.coin should match; if the DB
+                    // commitment was rewritten to a different leaf, spends fail 0x5.
+                    let derived = darkfi_money_contract::model::CoinAttributes {
+                        public_key: darkfi_sdk::crypto::PublicKey::from_secret({
+                            let mut sk_arr = [0u8; 32];
+                            if owner_secret.len() < 32 {
+                                return Err("Stored owner secret too short".into());
+                            }
+                            sk_arr.copy_from_slice(&owner_secret[..32]);
+                            darkfi_sdk::crypto::SecretKey::from_bytes(sk_arr)
+                                .map_err(|e| format!("Invalid note owner secret: {e:?}"))?
+                        }),
+                        value: val as u64,
+                        token_id: darkfi_money_contract::model::TokenId::from_bytes(
+                            hex::decode(&tok_id).unwrap().try_into().unwrap(),
+                        )
+                        .unwrap(),
+                        spend_hook: darkfi_sdk::crypto::FuncId::from_bytes({
+                            let mut hook_bytes = [0u8; 32];
+                            hook_bytes[0] = hook;
+                            hook_bytes
+                        })
+                        .unwrap(),
+                        user_data,
+                        blind: darkfi_sdk::crypto::Blind(coin_blind),
+                    }
+                    .to_coin();
+                    let coin = derived;
+                    let _ = commitment;
                     let mut sk_arr = [0u8; 32];
                     if owner_secret.len() < 32 {
                         return Err("Stored owner secret too short".into());
@@ -665,6 +694,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .map(|kv| (kv.namespace, kv.bincode))
                         .collect(),
                     payment_memo,
+                    half_split,
                 )
                 .await?;
 
@@ -1017,6 +1047,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             };
+
+            if rebuild_merkle {
+                match w.db.recompute_note_commitments() {
+                    Ok((checked, updated)) => {
+                        println!(
+                            "Recomputed note commitments from attributes ({checked} notes, {updated} updated)."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: could not recompute note commitments: {e}");
+                    }
+                }
+            }
 
             let engine = sync::SyncEngine::new(
                 w.db,

@@ -143,6 +143,108 @@ impl WalletDb {
         Ok(())
     }
 
+    /// Recompute each unspent note's commitment from note attributes + owner
+    /// key (`CoinAttributes::to_coin`). Compact-block `output.coin` must match
+    /// this; overwriting commitments with unrelated coins in the same block
+    /// makes spend proofs use a Merkle root that is not on chain (Money 0x5).
+    ///
+    /// Returns `(checked, updated)`.
+    pub fn recompute_note_commitments(&self) -> SqlResult<(u32, u32)> {
+        use darkfi_money_contract::model::{CoinAttributes, TokenId};
+        use darkfi_sdk::crypto::{FuncId, PublicKey, SecretKey};
+        use darkfi_sdk::pasta::pallas;
+        use darkfi_serial::Decodable;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, value_raw, token_id, coin_blind, spend_hook, user_data, \
+             commitment, owner_secret FROM notes \
+             WHERE spent = 0 AND owner_secret IS NOT NULL AND coin_blind IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+            ))
+        })?;
+
+        let mut checked = 0u32;
+        let mut updated = 0u32;
+        let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
+        for row in rows {
+            let (id, value_raw, tok_hex, coin_blind, hook_i, user_data, old_commit, owner_stored) =
+                row?;
+            let hook = hook_i.unwrap_or(0) as u8;
+            let Ok(owner) = crate::secret_wrap::unwrap_secret(&owner_stored, &self.wrap_key) else {
+                continue;
+            };
+            if owner.len() < 32 || coin_blind.len() != 32 {
+                continue;
+            }
+            let tok_bytes = match hex::decode(&tok_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => continue,
+            };
+            let mut tok_arr = [0u8; 32];
+            tok_arr.copy_from_slice(&tok_bytes);
+            let Ok(token_id) = TokenId::from_bytes(tok_arr) else {
+                continue;
+            };
+            let mut sk_arr = [0u8; 32];
+            sk_arr.copy_from_slice(&owner[..32]);
+            let Ok(sk) = SecretKey::from_bytes(sk_arr) else {
+                continue;
+            };
+            let mut cb_arr = [0u8; 32];
+            cb_arr.copy_from_slice(&coin_blind);
+            let Ok(coin_blind_f) = pallas::Base::decode(&mut std::io::Cursor::new(cb_arr)) else {
+                continue;
+            };
+            let ud = user_data.unwrap_or_else(|| vec![0u8; 32]);
+            if ud.len() != 32 {
+                continue;
+            }
+            let mut ud_arr = [0u8; 32];
+            ud_arr.copy_from_slice(&ud);
+            let Ok(user_data_f) = pallas::Base::decode(&mut std::io::Cursor::new(ud_arr)) else {
+                continue;
+            };
+            let mut hook_bytes = [0u8; 32];
+            hook_bytes[0] = hook;
+            let Ok(spend_hook) = FuncId::from_bytes(hook_bytes) else {
+                continue;
+            };
+            let derived = CoinAttributes {
+                public_key: PublicKey::from_secret(sk),
+                value: value_raw as u64,
+                token_id,
+                spend_hook,
+                user_data: user_data_f,
+                blind: darkfi_sdk::crypto::Blind(coin_blind_f),
+            }
+            .to_coin();
+            let derived_bytes = derived.to_bytes().to_vec();
+            checked += 1;
+            if old_commit.as_deref() != Some(derived_bytes.as_slice()) {
+                updates.push((id, derived_bytes));
+                updated += 1;
+            }
+        }
+        drop(stmt);
+        for (id, bytes) in updates {
+            self.conn.execute(
+                "UPDATE notes SET commitment = ?1, leaf_position = NULL WHERE id = ?2",
+                params![bytes, id],
+            )?;
+        }
+        Ok((checked, updated))
+    }
+
     pub fn update_leaf_position(&self, commitment: &[u8], leaf_position: u32) -> SqlResult<usize> {
         self.conn.execute(
             "UPDATE notes SET leaf_position = ?1 WHERE commitment = ?2 AND spent = 0",
