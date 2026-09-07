@@ -25,7 +25,7 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 |-------------|--------|
 | **Rust** stable | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` |
-| **Sibling `darkfi`** | `../darkfi` at the SHA in `../darkfi-lightwalletd/scripts/darkfi.rev` |
+| **Sibling `darkfi-nighthawk-testnet`** | nighthawk24 `nighthawk-testnet` (Arti 0.45 + kvdb), not upstream master |
 | **Sibling `darkfi-lightwalletd`** | Proto from `../darkfi-lightwalletd/proto/lightwallet.proto` |
 | **Running lightwalletd** | Local or remote before `moonshine sync` |
 
@@ -33,7 +33,7 @@ Clone the path dependencies as **sibling directories** (names matter — see `Ca
 
 ```text
 parent/
-  darkfi/                 # upstream DarkFi (https://github.com/darkrenaissance/darkfi)
+  darkfi-nighthawk-testnet/ # nighthawk24/darkfi branch nighthawk-testnet
   darkfi-lightwalletd/    # gRPC server + proto + UnifOMR crate
   moonshine/              # this repo
   # optional client siblings (not required to build moonshine):
@@ -63,7 +63,7 @@ brew install protobuf   # or: sudo apt install protobuf-compiler
 
 ## Build
 
-From the `moonshine/` directory (with `../darkfi` and `../darkfi-lightwalletd` present):
+From the `moonshine/` directory (with `../darkfi-nighthawk-testnet` and `../darkfi-lightwalletd` present):
 
 ```bash
 cargo build --release
@@ -201,7 +201,7 @@ moonshine
 
 | Sibling directory | Role |
 |-------------------|------|
-| `../darkfi` | DarkFi node / SDK |
+| `../darkfi-nighthawk-testnet` | DarkFi node / SDK (nighthawk24 pin) |
 | `../darkfi-lightwalletd` | gRPC lightwalletd + shared UnifOMR |
 | `../darkfi-mobile-ffi` | Shared UniFFI crate (Android / iOS / desktop) |
 | `../nighthawk-android-wallet` | Android wallet |

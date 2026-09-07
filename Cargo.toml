@@ -1,6 +1,6 @@
 [package]
 name = "moonshine"
-version = "0.1.0"
+version = "3.00.03"
 description = "Moonshine: A lightweight, private CLI wallet for DarkFi utilizing OMR/OMD"
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 edition = "2021"
@@ -9,10 +9,11 @@ build = "build.rs"
 
 [dependencies]
 # DarkFi Dependencies (relative path to darkfi repository)
-darkfi = { path = "../darkfi", features = ["async-daemonize", "bs58", "rpc", "tx"] }
-darkfi_money_contract = { path = "../darkfi/src/contract/money", features = ["no-entrypoint", "client"] }
-darkfi-sdk = { path = "../darkfi/src/sdk", features = ["async"] }
-darkfi-serial = { path = "../darkfi/src/serial" }
+# Pin the nighthawk24 `nighthawk-testnet` tree (Arti 0.45 + keccak + kvdb), not upstream master.
+darkfi = { path = "../darkfi-nighthawk-testnet", features = ["async-daemonize", "bs58", "rpc", "tx"] }
+darkfi_money_contract = { path = "../darkfi-nighthawk-testnet/src/contract/money", features = ["no-entrypoint", "client"] }
+darkfi-sdk = { path = "../darkfi-nighthawk-testnet/src/sdk", features = ["async"] }
+darkfi-serial = { path = "../darkfi-nighthawk-testnet/src/serial" }
 chacha20poly1305 = "0.10.1"
 
 # gRPC / Proto (+ TLS pin via rustls custom verifier)

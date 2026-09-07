@@ -14,7 +14,7 @@
 #
 # Prerequisites:
 #   - Rust toolchain installed
-#   - darkfi repo at ../darkfi (relative to moonshine)
+#   - darkfi repo at ../darkfi-nighthawk-testnet (relative to moonshine)
 #   - new-nighthawk-android-wallet at ../new-nighthawk-android-wallet
 #
 # Usage:
@@ -26,7 +26,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOONSHINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DARKFI_DIR="$(cd "$MOONSHINE_DIR/../darkfi" && pwd)"
+DARKFI_DIR="$(cd "$MOONSHINE_DIR/../darkfi-nighthawk-testnet" && pwd)"
 LIGHTWALLETD_DIR="$(cd "$MOONSHINE_DIR/../darkfi-lightwalletd" && pwd)"
 ANDROID_DIR="$(cd "$MOONSHINE_DIR/../new-nighthawk-android-wallet" && pwd)"
 IOS_FFI_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-ios-wallet/rust/darkfi-mobile-ffi" && pwd)"

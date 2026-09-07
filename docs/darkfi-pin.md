@@ -1,19 +1,10 @@
 # DarkFi revision pin (Moonshine)
 
-Moonshine path-depends on sibling `../darkfi` and `../darkfi-lightwalletd`.
+Moonshine path-depends on sibling `../darkfi-nighthawk-testnet` (nighthawk24 `nighthawk-testnet` branch) and `../darkfi-lightwalletd`.
 
-For reproducible builds, check out DarkFi at the SHA in:
+Do not point at `darkrenaissance/darkfi` master — that tree is Arti 0.42 without the keccak overlay. The nighthawk24 branch is Arti 0.45 + keccak + latest master (kvdb-overlay).
 
-```text
-../darkfi-lightwalletd/scripts/darkfi.rev
-```
-
-```bash
-cd ../darkfi-lightwalletd
-FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
-```
-
-Current shared tip (pre-release): `064030ffdbf4d80e5400cef6fe57fcfeb5d07deb`.
+Current pin: `327fa9f134fc756b84be2ce327afaae1cd41a956` (`nighthawk-testnet`).
 
 ## Wallet crypto note
 
