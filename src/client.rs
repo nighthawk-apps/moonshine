@@ -263,7 +263,7 @@ impl LightwalletClient {
                 let verifier = Arc::new(PinnedVerifier {
                     pinned_sha256: pin_hash,
                 });
-                let rustls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                let mut rustls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
                 ))
                 .with_safe_default_protocol_versions()
@@ -271,6 +271,7 @@ impl LightwalletClient {
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth();
+                rustls_config.alpn_protocols = vec![b"h2".to_vec()];
 
                 let tls = tokio_rustls::TlsConnector::from(Arc::new(rustls_config));
                 let server_name = host.try_into().map_err(|e| {
@@ -289,7 +290,14 @@ impl LightwalletClient {
             }
         });
 
-        let channel = tonic::transport::Endpoint::from_shared(uri)?
+        // Connector already wraps TLS + ALPN h2. Tonic must see `http://` or it
+        // applies TLS again and fails with a generic "transport error" (ngrok).
+        let origin = if let Some(rest) = uri.strip_prefix("https://") {
+            format!("http://{rest}")
+        } else {
+            uri
+        };
+        let channel = tonic::transport::Endpoint::from_shared(origin)?
             .timeout(GRPC_TIMEOUT)
             .connect_with_connector(connector)
             .await?;
@@ -316,7 +324,17 @@ impl LightwalletClient {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
         let response = client.get_light_info(proto::Empty {}).await?;
-        Ok(response.into_inner())
+        let info = response.into_inner();
+        if !info.proto_version.is_empty() {
+            let major = info.proto_version.split('.').next().unwrap_or("0");
+            if major != "1" {
+                eprintln!(
+                    "  warning: lightwalletd proto_version '{}' major mismatch (expected 1.x.x)",
+                    info.proto_version
+                );
+            }
+        }
+        Ok(info)
     }
 
     /// Fetch chain tip.
@@ -336,6 +354,23 @@ impl LightwalletClient {
         let mut client = self.client.clone().unwrap();
         let response = client.get_tree_state(proto::BlockHeight { height }).await?;
         Ok(response.into_inner())
+    }
+
+    /// Stream checkpoint snapshot chunks from lightwalletd for instant restore.
+    pub async fn get_checkpoint_snapshot(
+        &mut self,
+        preferred_height: u32,
+    ) -> Result<Vec<proto::CheckpointSnapshot>, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let req = proto::CheckpointRequest { preferred_height };
+        let response = client.get_checkpoint_snapshot(req).await?;
+        let mut stream = response.into_inner();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+            chunks.push(chunk?);
+        }
+        Ok(chunks)
     }
 
     /// Send raw transaction with an optional UnifOMR clue.

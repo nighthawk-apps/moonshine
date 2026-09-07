@@ -58,6 +58,16 @@ const MIN_BUCKET_SIZE: u32 = 1024;
 /// Base sleep duration between sync iterations (seconds). CLI polls faster.
 const POLL_BASE_SECS: u64 = 1;
 
+/// Canonical checkpoint digest: blake3(height LE || tree_data || nullifier_index).
+/// Must stay lockstep with darkfi-mobile-ffi and darkfi-lightwalletd.
+pub fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&height.to_le_bytes());
+    hasher.update(tree_data);
+    hasher.update(nullifier_index);
+    *hasher.finalize().as_bytes()
+}
+
 /// Sync engine state.
 pub struct SyncEngine {
     pub db: WalletDb,
@@ -290,19 +300,9 @@ impl SyncEngine {
             .await?;
 
         // 3) Nullifiers → mark spent (full scan range)
-        let mut notes_spent = 0u32;
-        {
-            let mut nf_stream = client.get_nullifiers(scan_start, scan_end).await?;
-            while let Some(nf_result) = nf_stream.next().await {
-                let nf = nf_result?;
-                for nullifier in nf.nullifiers {
-                    let marked = self.db.mark_note_spent(&nullifier)?;
-                    if marked > 0 {
-                        notes_spent += marked as u32;
-                    }
-                }
-            }
-        }
+        let notes_spent = self
+            .apply_nullifiers_range(&mut client, scan_start, scan_end)
+            .await?;
 
         // Tip advance: commitments + nullifiers done; sparse fetches succeeded.
         self.db.set_sync_height(scan_end)?;
@@ -396,6 +396,170 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Rewrite unspent note commitments from compact-block `output.coin`.
+    ///
+    /// Local `CoinAttributes::to_coin()` can diverge from the on-chain coin
+    /// (truncated spend_hook, overwritten commitments). Spends and Merkle
+    /// marks require the exact leaf bytes in `GetNoteCommitments`.
+    async fn restore_commitments_from_compact(
+        &self,
+        client: &mut LightwalletClient,
+    ) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+        let locs = self.db.list_unspent_note_locs()?;
+        let n = locs.len() as u32;
+        if locs.is_empty() {
+            return Ok((0, 0));
+        }
+        let min_h = locs.iter().map(|l| l.2).min().unwrap_or(0);
+        let max_h = locs.iter().map(|l| l.2).max().unwrap_or(0);
+        eprintln!("  fetching compact blocks {min_h}..={max_h} to restore coin commitments...");
+        let mut blocks = self.fetch_window_range(client, min_h, max_h).await?;
+        let unique_h: Vec<u32> = {
+            let mut h: Vec<u32> = locs.iter().map(|l| l.2).collect();
+            h.sort_unstable();
+            h.dedup();
+            h
+        };
+        if let Ok(cached) = self.fetch_matching_blocks_sparse(client, &unique_h).await {
+            // Prefer a cached copy when it actually trial-decrypts.
+            for b in cached {
+                if blocks.iter().any(|x| x.height == b.height) {
+                    if self.secret_keys.iter().any(|sk| {
+                        b.txs.iter().any(|t| {
+                            t.outputs.iter().any(|o| {
+                                trial_decrypt_note(&o.encrypted_note, sk).is_some()
+                            })
+                        })
+                    }) {
+                        blocks.retain(|x| x.height != b.height);
+                        blocks.push(b);
+                    }
+                } else {
+                    blocks.push(b);
+                }
+            }
+        }
+        let mut by_h: std::collections::HashMap<u32, crate::client::proto::CompactBlock> =
+            std::collections::HashMap::new();
+        for b in blocks {
+            by_h.insert(b.height, b);
+        }
+        let mut updated = 0u32;
+        let mut missing_block = 0u32;
+        let mut missing_tx = 0u32;
+        let mut decrypted = 0u32;
+        let mut any_decrypt = 0u32;
+        // First pass: try every compact output in the window (output_index in
+        // the DB can lag the decrypting output).
+        for block in by_h.values() {
+            for tx in &block.txs {
+                for output in &tx.outputs {
+                    if output.encrypted_note.len() < 48 {
+                        continue;
+                    }
+                    for sk in &self.secret_keys {
+                        if trial_decrypt_note(&output.encrypted_note, sk).is_some() {
+                            any_decrypt += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if any_decrypt == 0 {
+            let sample = by_h.values().find_map(|b| {
+                b.txs.iter().find_map(|t| {
+                    t.outputs
+                        .iter()
+                        .find(|o| o.encrypted_note.len() >= 48)
+                        .map(|o| o.encrypted_note.len())
+                })
+            });
+            eprintln!(
+                "  no compact outputs in {min_h}..={max_h} decrypted (sample enc_len={sample:?}, keys={})",
+                self.secret_keys.len()
+            );
+        } else {
+            eprintln!("  compact outputs decryptable in window: {any_decrypt}");
+        }
+        for (tx_hash, idx, height) in &locs {
+            let Some(block) = by_h.get(height) else {
+                missing_block += 1;
+                continue;
+            };
+            let tx = block.txs.iter().find(|t| hex::encode(&t.tx_hash) == *tx_hash);
+            let Some(tx) = tx else {
+                missing_tx += 1;
+                continue;
+            };
+            let Some(output) = tx.outputs.get(*idx as usize) else {
+                missing_tx += 1;
+                continue;
+            };
+            if output.coin.len() != 32 {
+                continue;
+            }
+            let mut refreshed = false;
+            for sk in &self.secret_keys {
+                if let Some(note) = trial_decrypt_note(&output.encrypted_note, sk) {
+                    let derived = derived_coin_from_note(&note, sk);
+                    let matches_chain = derived.as_deref() == Some(output.coin.as_slice());
+                    if matches_chain {
+                        decrypted += 1;
+                    } else if decrypted == 0 && !refreshed {
+                        eprintln!(
+                            "  decrypt coin mismatch at {}:{} derived={} chain={}",
+                            tx_hash,
+                            idx,
+                            derived.as_ref().map(hex::encode).unwrap_or_else(|| "-".into()),
+                            hex::encode(&output.coin)
+                        );
+                    }
+                    self.db.update_note_spend_fields(
+                        tx_hash,
+                        *idx,
+                        note.value as i64,
+                        &hex::encode(&note.token_id),
+                        &note.coin_blind,
+                        &note.value_blind,
+                        &note.token_blind,
+                        note.spend_hook,
+                        &note.spend_hook_bytes,
+                        &note.user_data,
+                        &output.coin,
+                        sk,
+                    )?;
+                    refreshed = true;
+                    break;
+                }
+            }
+            if !refreshed {
+                if updated < 3 {
+                    eprintln!(
+                        "  trial_decrypt failed {}:{} enc_len={} reason={} keys={}",
+                        tx_hash,
+                        idx,
+                        output.encrypted_note.len(),
+                        trial_decrypt_fail_reason(
+                            &output.encrypted_note,
+                            self.secret_keys.first().map(|s| s.as_slice()).unwrap_or(&[])
+                        ),
+                        self.secret_keys.len()
+                    );
+                }
+                self.db.set_note_commitment(tx_hash, *idx, &output.coin)?;
+            }
+            updated += 1;
+        }
+        if missing_block > 0 || missing_tx > 0 {
+            eprintln!(
+                "  restore gaps: missing_block={missing_block} missing_tx_or_output={missing_tx}"
+            );
+        }
+        eprintln!("  re-decrypted MoneyNote fields matching on-chain coin for {decrypted}/{n} notes");
+        Ok((n, updated))
+    }
+
     /// Rebuild the Money Merkle tree from height 0 through the LWD tip.
     ///
     /// Birthday-skipped wallets only append post-birthday commitments, so spend
@@ -409,10 +573,30 @@ impl SyncEngine {
             .with_tor(self.use_tor);
 
         let tip = client.get_chain_tip().await?.height;
-        let owned_commitments: std::collections::HashSet<[u8; 32]> = self
+        match self.restore_commitments_from_compact(&mut client).await {
+            Ok((n, u)) => {
+                eprintln!("  restored on-chain coin commitments: {u}/{n} unspent notes");
+            }
+            Err(e) => {
+                eprintln!(
+                    "  warning: could not restore commitments from compact blocks: {}",
+                    redact_sync_error(&e.to_string())
+                );
+            }
+        }
+        let owned_list = self
             .db
             .list_owned_commitments()
-            .unwrap_or_default()
+            .map_err(|e| format!("list_owned_commitments: {e}"))?;
+        eprintln!(
+            "  owned note commitments: {} (example {})",
+            owned_list.len(),
+            owned_list
+                .first()
+                .map(hex::encode)
+                .unwrap_or_else(|| "<none>".into())
+        );
+        let owned_commitments: std::collections::HashSet<[u8; 32]> = owned_list
             .iter()
             .filter_map(|c| {
                 if c.len() == 32 {
@@ -420,19 +604,30 @@ impl SyncEngine {
                     arr.copy_from_slice(c);
                     Some(arr)
                 } else {
+                    eprintln!(
+                        "  skip owned commitment with len {} (want 32)",
+                        c.len()
+                    );
                     None
                 }
             })
             .collect();
 
+        // Server checkpoints authenticate the tree *root* but do not contain
+        // this wallet's marked leaf positions. `BridgeTree::mark()` only marks
+        // the most recently appended leaf, so spend witnesses require a genesis
+        // replay (dummy ZERO leaf, then every coin, mark on owned). Skipping
+        // that replay after a tip checkpoint leaves `leaf_position` unset and
+        // `make_transfer_call` fails with "Missing inputs in transfer call".
         let mut tree = MerkleTree::new(u32::MAX as usize);
         tree.append(MerkleNode::from(pallas::Base::from(0u64)));
         let _ = tree.mark();
+        let mut start = 0u32;
 
         let mut appended = 0u64;
         let mut marked = 0u32;
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         const CHUNK: u32 = 4096;
-        let mut start = 0u32;
         while start <= tip {
             let end = start.saturating_add(CHUNK - 1).min(tip);
             let mut stream = client.get_note_commitments(start, end).await?;
@@ -454,6 +649,7 @@ impl SyncEngine {
                     };
                     tree.append(node);
                     appended += 1;
+                    seen.insert(arr);
                     if owned_commitments.contains(&arr) {
                         let pos = tree
                             .mark()
@@ -473,6 +669,20 @@ impl SyncEngine {
             }
         }
 
+        let hits = owned_commitments.iter().filter(|c| seen.contains(*c)).count();
+        eprintln!(
+            "  owned coins found in chain stream: {hits}/{}",
+            owned_commitments.len()
+        );
+        if hits == 0 {
+            if let Some(c) = owned_commitments.iter().next() {
+                eprintln!("  wallet coin example: {}", hex::encode(c));
+            }
+            if let Some(ex) = seen.iter().next() {
+                eprintln!("  chain coin example:  {}", hex::encode(ex));
+            }
+        }
+
         match client.get_tree_state(tip).await {
             Ok(st) => {
                 let server_tree: MerkleTree = darkfi_serial::Decodable::decode(
@@ -481,12 +691,19 @@ impl SyncEngine {
                 .map_err(|e| format!("Failed to decode LWD GetTreeState: {e}"))?;
                 let local_root = tree.root(0);
                 let server_root = server_tree.root(0);
+                eprintln!(
+                    "  merkle roots tip={tip} local={} lwd={} darkfid_hint=compare-last_coins_root",
+                    local_root.map(|r| hex::encode(r.to_bytes())).unwrap_or_else(|| "-".into()),
+                    server_root.map(|r| hex::encode(r.to_bytes())).unwrap_or_else(|| "-".into()),
+                );
                 if local_root != server_root {
                     return Err(format!(
                         "rebuilt Merkle root does not match LWD GetTreeState at tip {tip}"
                     )
                     .into());
                 }
+                // Match `drk`: checkpoint the tip so rewind/witness depth > 0 stay valid.
+                let _ = tree.checkpoint(tip as usize);
             }
             Err(e) => {
                 // Tip can advance during the rebuild; retry against current tip.
@@ -534,6 +751,21 @@ impl SyncEngine {
         // Prevent the following `sync_once` from re-appending heights already
         // included in this rebuild (that would duplicate leaves and break spends).
         self.db.set_sync_height(final_tip)?;
+        match self.db.recompute_owned_nullifiers() {
+            Ok(n) => eprintln!("  recomputed nullifiers for {n} unspent notes"),
+            Err(e) => eprintln!("  warning: recompute nullifiers failed: {e}"),
+        }
+        match self.apply_nullifiers_range(&mut client, 0, final_tip).await {
+            Ok(spent) => {
+                if spent > 0 {
+                    eprintln!("  marked {spent} notes spent from chain nullifiers");
+                }
+            }
+            Err(e) => eprintln!(
+                "  warning: nullifier rescan failed: {}",
+                redact_sync_error(&e.to_string())
+            ),
+        }
         Ok((appended, marked, final_tip))
     }
 
@@ -553,6 +785,40 @@ impl SyncEngine {
         // next sync which will pick up the new DB entries.
         tracing::info!("mark_owned_positions: new coins discovered, will be marked on next sync");
         Ok(())
+    }
+
+    /// Mark wallet notes spent when their nullifiers appear in `[start, end]`.
+    ///
+    /// Recomputes `poseidon(secret, coin)` first so rows inserted before that
+    /// column was populated still match the LWD stream. Chunks at 10000 to
+    /// stay under the gRPC range cap.
+    async fn apply_nullifiers_range(
+        &self,
+        client: &mut LightwalletClient,
+        start: u32,
+        end: u32,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let _ = self.db.recompute_owned_nullifiers()?;
+        let mut notes_spent = 0u32;
+        let mut s = start;
+        while s <= end {
+            let e = s.saturating_add(9999).min(end);
+            let mut nf_stream = client.get_nullifiers(s, e).await?;
+            while let Some(nf_result) = nf_stream.next().await {
+                let nf = nf_result?;
+                for nullifier in nf.nullifiers {
+                    let marked = self.db.mark_note_spent(&nullifier)?;
+                    if marked > 0 {
+                        notes_spent += marked as u32;
+                    }
+                }
+            }
+            s = e.saturating_add(1);
+            if s == 0 {
+                break;
+            }
+        }
+        Ok(notes_spent)
     }
 
     /// Fetch compact blocks for OMR-matched heights **without revealing which
@@ -818,6 +1084,13 @@ impl SyncEngine {
                             nullifier_bytes.as_deref(),
                             Some(secret_key.as_slice()),
                         )?;
+                        if note.spend_hook_bytes.len() == 32 {
+                            let _ = self.db.set_spend_hook_bytes(
+                                &tx_hash_hex,
+                                idx as u32,
+                                &note.spend_hook_bytes,
+                            );
+                        }
                         self.db.insert_transaction(
                             &tx_hash_hex,
                             block.height,
@@ -1114,141 +1387,236 @@ pub struct DecryptedNote {
     pub token_blind: Vec<u8>,
     /// First byte of spend_hook field (matches `insert_note` `Option<u8>`).
     pub spend_hook: u8,
+    /// Full 32-byte `FuncId::to_repr()` — required for `CoinAttributes::to_coin()`.
+    pub spend_hook_bytes: Vec<u8>,
     pub user_data: Vec<u8>,
 }
 
-/// Trial decrypt a compact block note using the wallet's secret key.
-///
-/// Returns blinds / fields from the MoneyNote plaintext. Callers should use
-/// `CompactOutput.coin` as the note commitment when inserting (S5).
-pub fn trial_decrypt_note(encrypted_note: &[u8], wallet_key: &[u8]) -> Option<DecryptedNote> {
-    use chacha20poly1305::{aead::AeadInPlace, ChaCha20Poly1305, KeyInit};
-    use darkfi_sdk::crypto::diffie_hellman;
+/// Remaining AEAD plaintext (MoneyNote decode is applied separately so a
+/// truncated/odd memo cannot fail-closed the spend fields).
+struct RemainingBytes(Vec<u8>);
+
+impl darkfi_serial::Decodable for RemainingBytes {
+    fn decode<D: std::io::Read>(d: &mut D) -> std::io::Result<Self> {
+        let mut v = Vec::new();
+        d.read_to_end(&mut v)?;
+        Ok(Self(v))
+    }
+}
+
+fn aead_note_candidates(
+    encrypted_note: &[u8],
+) -> Vec<darkfi_sdk::crypto::note::AeadEncryptedNote> {
     use darkfi_sdk::crypto::note::AeadEncryptedNote;
-    use darkfi_sdk::crypto::SecretKey;
+    use darkfi_sdk::crypto::PublicKey;
     use darkfi_serial::Decodable;
     use std::io::Cursor;
 
-    const AEAD_TAG_SIZE: usize = 16;
-
-    if encrypted_note.len() < 48 || wallet_key.len() < 32 {
-        return None;
-    }
-
+    let mut out = Vec::new();
     let mut cursor = Cursor::new(encrypted_note);
-    let enc_note = match AeadEncryptedNote::decode(&mut cursor) {
-        Ok(note) => note,
-        Err(_) => return None,
-    };
-
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&wallet_key[..32]);
-    let secret = match SecretKey::from_bytes(key_bytes) {
-        Ok(sk) => sk,
-        Err(_) => return None,
-    };
-
-    // Perform raw DH + ChaCha20Poly1305 decryption to get the raw plaintext bytes,
-    // instead of using enc_note.decrypt::<D>() which routes through Decodable and
-    // would misinterpret the MoneyNote bytes as a length-prefixed Vec<u8>.
-    let shared_secret = match diffie_hellman::sapling_ka_agree(&secret, &enc_note.ephem_public) {
-        Ok(ss) => ss,
-        Err(_) => return None,
-    };
-    let key = diffie_hellman::kdf_sapling(&shared_secret, &enc_note.ephem_public);
-
-    let ct_len = enc_note.ciphertext.len();
-    if ct_len < AEAD_TAG_SIZE {
-        return None;
+    if let Ok(n) = AeadEncryptedNote::decode(&mut cursor) {
+        if cursor.position() as usize == encrypted_note.len() {
+            out.push(n);
+        }
     }
-    let mut plaintext = enc_note.ciphertext.clone();
-
-    if ChaCha20Poly1305::new(key.as_ref().into())
-        .decrypt_in_place([0u8; 12][..].into(), &[], &mut plaintext)
-        .is_err()
-    {
-        return None;
+    if encrypted_note.len() >= 48 {
+        let mut c = Cursor::new(encrypted_note);
+        if let Ok(ephem) = PublicKey::decode(&mut c) {
+            out.push(AeadEncryptedNote {
+                ciphertext: encrypted_note[32..].to_vec(),
+                ephem_public: ephem,
+            });
+        }
+        let (ct, ep) = encrypted_note.split_at(encrypted_note.len() - 32);
+        let mut c = Cursor::new(ep);
+        if let Ok(ephem) = PublicKey::decode(&mut c) {
+            out.push(AeadEncryptedNote {
+                ciphertext: ct.to_vec(),
+                ephem_public: ephem,
+            });
+        }
     }
+    out
+}
 
-    // After AEAD decrypt-in-place, plaintext is truncated to ct_len - AEAD_TAG_SIZE
-    let plaintext = &plaintext[..];
+fn money_note_from_plaintext(pt: &[u8]) -> Option<darkfi_money_contract::client::MoneyNote> {
+    use darkfi_money_contract::client::MoneyNote;
+    use darkfi_money_contract::model::TokenId;
+    use darkfi_sdk::crypto::{BaseBlind, FuncId, ScalarBlind};
+    use darkfi_sdk::pasta::pallas;
+    use darkfi_serial::Decodable;
+    use std::io::Cursor;
 
-    // Upstream MoneyNote layout (darkfi-serial encoded fixed fields):
-    //   value:       0..8     (u64 LE)
-    //   token_id:    8..40    (32 bytes)
-    //   spend_hook:  40..72   (32 bytes, FuncId)
-    //   user_data:   72..104  (32 bytes, pallas::Base)
-    //   coin_blind:  104..136 (32 bytes, BaseBlind)
-    //   value_blind: 136..168 (32 bytes, ScalarBlind)
-    //   token_blind: 168..200 (32 bytes, BaseBlind)
-    //   memo:        200+     (VarInt length + bytes)
-    if plaintext.len() < 200 {
-        return None;
+    let mut c = Cursor::new(pt);
+    if let Ok(n) = MoneyNote::decode(&mut c) {
+        return Some(n);
     }
+    // PoW / older notes: spend fields present, memo VarInt missing or truncated.
+    let mut c = Cursor::new(pt);
+    let value = u64::decode(&mut c).ok()?;
+    let token_id = TokenId::decode(&mut c).ok()?;
+    let spend_hook = FuncId::decode(&mut c).ok()?;
+    let user_data = pallas::Base::decode(&mut c).ok()?;
+    let coin_blind = BaseBlind::decode(&mut c).ok()?;
+    let value_blind = ScalarBlind::decode(&mut c).ok()?;
+    let token_blind = BaseBlind::decode(&mut c).ok()?;
+    let memo = Vec::<u8>::decode(&mut c).unwrap_or_default();
+    Some(MoneyNote {
+        value,
+        token_id,
+        spend_hook,
+        user_data,
+        coin_blind,
+        value_blind,
+        token_blind,
+        memo,
+    })
+}
 
-    let mut value_bytes = [0u8; 8];
-    value_bytes.copy_from_slice(&plaintext[0..8]);
-    let value = u64::from_le_bytes(value_bytes);
+fn decrypted_from_money_note(
+    note: darkfi_money_contract::client::MoneyNote,
+) -> Option<DecryptedNote> {
+    use darkfi_sdk::crypto::pasta_prelude::PrimeField;
+    use darkfi_serial::Encodable;
 
-    let token_id = plaintext[8..40].to_vec();
+    let mut coin_blind = Vec::new();
+    note.coin_blind.inner().encode(&mut coin_blind).ok()?;
+    let mut value_blind = Vec::new();
+    note.value_blind.inner().encode(&mut value_blind).ok()?;
+    let mut token_blind = Vec::new();
+    note.token_blind.inner().encode(&mut token_blind).ok()?;
+    let mut user_data = Vec::new();
+    note.user_data.encode(&mut user_data).ok()?;
 
-    // spend_hook: first 8 LE bytes of the 32-byte FuncId field
-    let mut hook_le = [0u8; 8];
-    hook_le.copy_from_slice(&plaintext[40..48]);
-    let spend_hook = u64::from_le_bytes(hook_le) as u8;
-
-    let user_data = plaintext[72..104].to_vec();
-    let coin_blind = plaintext[104..136].to_vec();
-    let value_blind = plaintext[136..168].to_vec();
-    let token_blind = plaintext[168..200].to_vec();
-
-    // There is no 'serial' field in upstream MoneyNote; use coin_blind as a substitute
-    // for any downstream code that references it (e.g., nullifier derivation).
-    let serial = coin_blind.clone();
-
-    let memo = if plaintext.len() > 200 {
-        // memo is darkfi-serial encoded: VarInt length + raw bytes.
-        // Read the VarInt length prefix, then extract the memo bytes.
-        let memo_region = &plaintext[200..];
-        // Try to read it as raw bytes (skip VarInt prefix for user display)
-        // The memo in PoW rewards contains serialize(&signing_secret_key) which is binary.
-        // For user transfers, it may be UTF-8 text.
-        // Read VarInt length
-        let (memo_len, prefix_size) = if memo_region.is_empty() {
-            (0usize, 0usize)
-        } else if memo_region[0] < 0xfd {
-            (memo_region[0] as usize, 1)
-        } else if memo_region[0] == 0xfd && memo_region.len() >= 3 {
-            (
-                u16::from_le_bytes([memo_region[1], memo_region[2]]) as usize,
-                3,
-            )
+    let spend_hook_bytes = note.spend_hook.inner().to_repr().to_vec();
+    let spend_hook = spend_hook_bytes.first().copied().unwrap_or(0);
+    let memo = {
+        let raw = &note.memo;
+        if raw.is_empty() {
+            None
         } else {
-            (0, 0)
-        };
-        if memo_len > 0 && prefix_size + memo_len <= memo_region.len() {
-            let raw = &memo_region[prefix_size..prefix_size + memo_len];
-            String::from_utf8(raw.to_vec())
+            String::from_utf8(raw.clone())
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-        } else {
-            None
         }
-    } else {
-        None
     };
 
     Some(DecryptedNote {
-        value,
-        token_id,
-        serial,
+        value: note.value,
+        token_id: note.token_id.to_bytes().to_vec(),
+        serial: coin_blind.clone(),
         memo,
         coin_blind,
         value_blind,
         token_blind,
         spend_hook,
+        spend_hook_bytes,
         user_data,
     })
+}
+
+/// `CoinAttributes::to_coin()` bytes for a decrypted note + owner secret.
+pub fn derived_coin_from_note(note: &DecryptedNote, wallet_key: &[u8]) -> Option<Vec<u8>> {
+    use darkfi_money_contract::model::{CoinAttributes, TokenId};
+    use darkfi_sdk::crypto::{FuncId, PublicKey, SecretKey};
+    use darkfi_sdk::pasta::pallas;
+    use darkfi_serial::Decodable;
+    use std::io::Cursor;
+
+    if wallet_key.len() < 32
+        || note.token_id.len() != 32
+        || note.coin_blind.len() != 32
+        || note.user_data.len() != 32
+        || note.spend_hook_bytes.len() != 32
+    {
+        return None;
+    }
+    let mut sk_arr = [0u8; 32];
+    sk_arr.copy_from_slice(&wallet_key[..32]);
+    let sk = SecretKey::from_bytes(sk_arr).ok()?;
+    let mut tok = [0u8; 32];
+    tok.copy_from_slice(&note.token_id);
+    let token_id = TokenId::from_bytes(tok).ok()?;
+    let mut hook = [0u8; 32];
+    hook.copy_from_slice(&note.spend_hook_bytes);
+    let spend_hook = FuncId::from_bytes(hook).ok()?;
+    let coin_blind = pallas::Base::decode(&mut Cursor::new(&note.coin_blind)).ok()?;
+    let user_data = pallas::Base::decode(&mut Cursor::new(&note.user_data)).ok()?;
+    Some(
+        CoinAttributes {
+            public_key: PublicKey::from_secret(sk),
+            value: note.value,
+            token_id,
+            spend_hook,
+            user_data,
+            blind: darkfi_sdk::crypto::Blind(coin_blind),
+        }
+        .to_coin()
+        .to_bytes()
+        .to_vec(),
+    )
+}
+
+/// Trial decrypt a compact block note using the wallet's secret key.
+///
+/// AEAD-decrypts the compact `AeadEncryptedNote`, then parses `MoneyNote`
+/// (full decode, or spend-fields-only if memo is truncated) so blinds match
+/// `CoinAttributes::to_coin()` / on-chain `output.coin`.
+pub fn trial_decrypt_note(encrypted_note: &[u8], wallet_key: &[u8]) -> Option<DecryptedNote> {
+    use darkfi_sdk::crypto::SecretKey;
+
+    if encrypted_note.len() < 48 || wallet_key.len() < 32 {
+        return None;
+    }
+
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&wallet_key[..32]);
+    let secret = SecretKey::from_bytes(key_bytes).ok()?;
+    for enc_note in aead_note_candidates(encrypted_note) {
+        let Ok(RemainingBytes(plaintext)) = enc_note.decrypt(&secret) else {
+            continue;
+        };
+        if let Some(note) = money_note_from_plaintext(&plaintext) {
+            return decrypted_from_money_note(note);
+        }
+    }
+    None
+}
+
+/// Why `trial_decrypt_note` returned None (first failing step).
+pub fn trial_decrypt_fail_reason(encrypted_note: &[u8], wallet_key: &[u8]) -> &'static str {
+    use darkfi_sdk::crypto::SecretKey;
+
+    if encrypted_note.len() < 48 {
+        return "too_short";
+    }
+    if wallet_key.len() < 32 {
+        return "key_short";
+    }
+    let cands = aead_note_candidates(encrypted_note);
+    if cands.is_empty() {
+        return "aead_decode";
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(&wallet_key[..32]);
+    let Ok(secret) = SecretKey::from_bytes(key_bytes) else {
+        return "bad_secret";
+    };
+    let mut aead_ok = false;
+    for enc_note in cands {
+        let Ok(RemainingBytes(plaintext)) = enc_note.decrypt(&secret) else {
+            continue;
+        };
+        aead_ok = true;
+        if money_note_from_plaintext(&plaintext).is_some() {
+            return "ok";
+        }
+    }
+    if aead_ok {
+        "note_parse"
+    } else {
+        "aead"
+    }
 }
 
 /// Ensure lightwalletd chain_name matches the wallet network byte.
@@ -1384,6 +1752,45 @@ mod tests {
     }
 
     #[test]
+    fn trial_decrypt_roundtrip_pow_style_memo() {
+        use darkfi_money_contract::client::MoneyNote;
+        use darkfi_money_contract::model::DARK_TOKEN_ID;
+        use darkfi_sdk::crypto::note::AeadEncryptedNote;
+        use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
+        use darkfi_sdk::crypto::{Blind, FuncId, Keypair};
+        use darkfi_sdk::pasta::pallas;
+        use darkfi_serial::serialize;
+
+        let kp = Keypair::default();
+        let note = MoneyNote {
+            value: 100_000_000,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook: FuncId::none(),
+            user_data: pallas::Base::ZERO,
+            coin_blind: Blind::from(1u64),
+            value_blind: Blind(pallas::Scalar::from(2u64)),
+            token_blind: Blind::from(3u64),
+            memo: serialize(&kp.secret),
+        };
+        let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
+        let bytes = serialize(&enc);
+        let dec = trial_decrypt_note(&bytes, &kp.secret.inner().to_repr()).expect("decrypt");
+        assert_eq!(dec.value, note.value);
+        assert_eq!(dec.token_id, note.token_id.to_bytes());
+        let derived = derived_coin_from_note(&dec, &kp.secret.inner().to_repr()).unwrap();
+        let coin = darkfi_money_contract::model::CoinAttributes {
+            public_key: kp.public,
+            value: note.value,
+            token_id: note.token_id,
+            spend_hook: note.spend_hook,
+            user_data: note.user_data,
+            blind: note.coin_blind,
+        }
+        .to_coin();
+        assert_eq!(derived, coin.to_bytes());
+    }
+
+    #[test]
     fn test_inter_match_gap_11_blocks() {
         // Gap of exactly 11 empty blocks between matches (100 -> 112)
         // 112 - 100 - 1 = 11 blocks (101..=111)
@@ -1393,5 +1800,19 @@ mod tests {
         assert!(extra.contains(&101));
         assert!(extra.contains(&111));
         assert_eq!(extra.iter().filter(|&&h| h > 100 && h < 112).count(), 11);
+    }
+
+    #[test]
+    fn snapshot_integrity_hash_lockstep() {
+        let height = 42u32;
+        let tree = b"tree-bytes";
+        let nfs = b"nullifiers";
+        let a = snapshot_integrity_hash(height, tree, nfs);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&height.to_le_bytes());
+        hasher.update(tree);
+        hasher.update(nfs);
+        assert_eq!(a, *hasher.finalize().as_bytes());
+        assert!(snapshot_integrity_hash(height, tree, b"").as_slice() != blake3::hash(tree).as_bytes());
     }
 }

@@ -2,6 +2,8 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC and syncs with **UnifOMR only** (scheme `0x05`). There is no PerfOMR fallback.
 
+**3.0.5 Instant Sync:** checkpoint Merkle restore (`blake3(height LE || tree_data || nullifier_index)`), birthday-clamped scan windows, proto_version 1.x on connect. Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+
 > **Strict UnifOMR (hard-coded):** Moonshine does **not** run supplemental / gap trial decrypt. **Only** transactions that carry UnifOMR clues are discovered during normal sync — typically **Moonshine ↔ Moonshine**, or **Nighthawk → Moonshine**. Payments from upstream `drk` / other non-UnifOMR wallets will **not** appear unless you explicitly run `moonshine sync --force-trial` (privacy trade-off). Nighthawk Android / iOS / desktop default the opposite (trial-decrypt fallback on) so they can receive from any DarkFi wallet.
 
 Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a **pruned SQLite** wallet (SQLCipher + wrapped secrets) and a small on-disk footprint.
@@ -158,6 +160,8 @@ moonshine
 | **Payment memo on wire** | ✅ | `--memo` → OMR-aware bytes in recipient `MoneyNote::memo` (not local-only) |
 | **Multi detection_keys** | ✅ | Up to 16 wallet secrets in `GetUnifOmrDigest` |
 | **Local BlockCache** | ✅ | Sparse/PIR compact blocks cached beside wallet DB |
+| **Instant Sync Checkpoints** | ✅ | Fast Merkle tree restore from authenticated `CheckpointSnapshot` (see [docs/instant-sync-strategy.md](docs/instant-sync-strategy.md)) |
+| **Proto Version Lockstep** | ✅ | Validates `LightInfo.proto_version` (1.x.x) on connect |
 | **OMR Err → no silent trial (S15)** | ✅ | Tip not advanced on OMR **error** |
 | **Empty OMR → supplemental trial** | ❌ (strict) | Use `sync --force-trial` for miss-safety |
 | **Tip regression rewind** | ✅ | Rewinds sync height when tip < last synced |

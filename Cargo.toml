@@ -1,6 +1,6 @@
 [package]
 name = "moonshine"
-version = "3.00.03"
+version = "3.0.5"
 description = "Moonshine: A lightweight, private CLI wallet for DarkFi utilizing OMR/OMD"
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 edition = "2021"

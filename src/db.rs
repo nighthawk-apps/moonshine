@@ -110,6 +110,7 @@ impl WalletDb {
                 value_blind BLOB,
                 token_blind BLOB,
                 spend_hook INTEGER,
+                spend_hook_bytes BLOB,
                 user_data BLOB,
                 leaf_position INTEGER,
                 commitment BLOB,
@@ -156,7 +157,7 @@ impl WalletDb {
         use darkfi_serial::Decodable;
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, value_raw, token_id, coin_blind, spend_hook, user_data, \
+            "SELECT id, value_raw, token_id, coin_blind, spend_hook, spend_hook_bytes, user_data, \
              commitment, owner_secret FROM notes \
              WHERE spent = 0 AND owner_secret IS NOT NULL AND coin_blind IS NOT NULL",
         )?;
@@ -169,7 +170,8 @@ impl WalletDb {
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<Vec<u8>>>(5)?,
                 row.get::<_, Option<Vec<u8>>>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
             ))
         })?;
 
@@ -177,8 +179,17 @@ impl WalletDb {
         let mut updated = 0u32;
         let mut updates: Vec<(i64, Vec<u8>)> = Vec::new();
         for row in rows {
-            let (id, value_raw, tok_hex, coin_blind, hook_i, user_data, old_commit, owner_stored) =
-                row?;
+            let (
+                id,
+                value_raw,
+                tok_hex,
+                coin_blind,
+                hook_i,
+                hook_bytes,
+                user_data,
+                old_commit,
+                owner_stored,
+            ) = row?;
             let hook = hook_i.unwrap_or(0) as u8;
             let Ok(owner) = crate::secret_wrap::unwrap_secret(&owner_stored, &self.wrap_key) else {
                 continue;
@@ -214,9 +225,12 @@ impl WalletDb {
             let Ok(user_data_f) = pallas::Base::decode(&mut std::io::Cursor::new(ud_arr)) else {
                 continue;
             };
-            let mut hook_bytes = [0u8; 32];
-            hook_bytes[0] = hook;
-            let Ok(spend_hook) = FuncId::from_bytes(hook_bytes) else {
+            let mut hook_arr = [0u8; 32];
+            match hook_bytes {
+                Some(b) if b.len() == 32 => hook_arr.copy_from_slice(&b),
+                _ => hook_arr[0] = hook,
+            }
+            let Ok(spend_hook) = FuncId::from_bytes(hook_arr) else {
                 continue;
             };
             let derived = CoinAttributes {
@@ -265,11 +279,96 @@ impl WalletDb {
         rows.collect()
     }
 
+    /// `(tx_hash, output_index, block_height)` for unspent notes.
+    pub fn list_unspent_note_locs(&self) -> SqlResult<Vec<(String, u32, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tx_hash, output_index, block_height FROM notes WHERE spent = 0 ORDER BY block_height",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Overwrite a note's on-chain coin commitment (clears leaf_position).
+    pub fn set_note_commitment(
+        &self,
+        tx_hash: &str,
+        output_index: u32,
+        commitment: &[u8],
+    ) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE notes SET commitment = ?1, leaf_position = NULL \
+             WHERE tx_hash = ?2 AND output_index = ?3 AND spent = 0",
+            params![commitment, tx_hash, output_index],
+        )
+    }
+
+    pub fn set_spend_hook_bytes(
+        &self,
+        tx_hash: &str,
+        output_index: u32,
+        spend_hook_bytes: &[u8],
+    ) -> SqlResult<usize> {
+        self.conn.execute(
+            "UPDATE notes SET spend_hook_bytes = ?1 \
+             WHERE tx_hash = ?2 AND output_index = ?3 AND spent = 0",
+            params![spend_hook_bytes, tx_hash, output_index],
+        )
+    }
+
+    /// Refresh spend fields from a re-decrypted MoneyNote (plus on-chain coin).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_note_spend_fields(
+        &self,
+        tx_hash: &str,
+        output_index: u32,
+        value_raw: i64,
+        token_id: &str,
+        coin_blind: &[u8],
+        value_blind: &[u8],
+        token_blind: &[u8],
+        spend_hook: u8,
+        spend_hook_bytes: &[u8],
+        user_data: &[u8],
+        commitment: &[u8],
+        owner_secret: &[u8],
+    ) -> SqlResult<usize> {
+        let wrapped_owner = crate::secret_wrap::wrap_secret(owner_secret, &self.wrap_key);
+        self.conn.execute(
+            "UPDATE notes SET value_raw = ?1, token_id = ?2, coin_blind = ?3, \
+             value_blind = ?4, token_blind = ?5, spend_hook = ?6, spend_hook_bytes = ?7, \
+             user_data = ?8, commitment = ?9, owner_secret = ?10, leaf_position = NULL \
+             WHERE tx_hash = ?11 AND output_index = ?12 AND spent = 0",
+            params![
+                value_raw,
+                token_id,
+                coin_blind,
+                value_blind,
+                token_blind,
+                spend_hook,
+                spend_hook_bytes,
+                user_data,
+                commitment,
+                wrapped_owner,
+                tx_hash,
+                output_index,
+            ],
+        )
+    }
+
     /// Ensure migrated columns exist on older wallet DBs.
     fn migrate_notes_columns(&self) -> SqlResult<()> {
         let _ = self
             .conn
             .execute("ALTER TABLE notes ADD COLUMN owner_secret BLOB", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE notes ADD COLUMN spend_hook_bytes BLOB", []);
         Ok(())
     }
 
@@ -285,7 +384,7 @@ impl WalletDb {
 
     /// Unspent notes with full fields for spend construction.
     /// Returns `(tx_hash, output_index, value, token_id, coin_blind, value_blind,
-    /// token_blind, spend_hook, user_data, leaf_position, commitment, owner_secret)`.
+    /// token_blind, spend_hook_bytes, user_data, leaf_position, commitment, owner_secret)`.
     #[allow(clippy::type_complexity)]
     pub fn list_unspent_full(
         &self,
@@ -298,7 +397,7 @@ impl WalletDb {
             Vec<u8>,
             Vec<u8>,
             Vec<u8>,
-            u8,
+            Vec<u8>,
             Vec<u8>,
             u32,
             Vec<u8>,
@@ -307,14 +406,24 @@ impl WalletDb {
     > {
         let mut stmt = self.conn.prepare(
             "SELECT tx_hash, output_index, value_raw, token_id, coin_blind, value_blind, token_blind, \
-             spend_hook, user_data, leaf_position, commitment, owner_secret \
+             spend_hook, spend_hook_bytes, user_data, leaf_position, commitment, owner_secret \
              FROM notes WHERE spent = 0 AND leaf_position IS NOT NULL \
              AND commitment IS NOT NULL AND length(commitment) = 32 \
              AND owner_secret IS NOT NULL \
              ORDER BY block_height",
         )?;
         let rows = stmt.query_map([], |row| {
-            let owner_stored: Vec<u8> = row.get(11)?;
+            let hook_i: u8 = row.get::<_, Option<u8>>(7)?.unwrap_or(0);
+            let hook_bytes: Option<Vec<u8>> = row.get(8)?;
+            let spend_hook = match hook_bytes {
+                Some(b) if b.len() == 32 => b,
+                _ => {
+                    let mut b = vec![0u8; 32];
+                    b[0] = hook_i;
+                    b
+                }
+            };
+            let owner_stored: Vec<u8> = row.get(12)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, u32>(1)?,
@@ -323,10 +432,10 @@ impl WalletDb {
                 row.get::<_, Vec<u8>>(4)?,
                 row.get::<_, Vec<u8>>(5)?,
                 row.get::<_, Vec<u8>>(6)?,
-                row.get::<_, u8>(7)?,
-                row.get::<_, Vec<u8>>(8)?,
-                row.get::<_, u32>(9)?,
-                row.get::<_, Vec<u8>>(10)?,
+                spend_hook,
+                row.get::<_, Vec<u8>>(9)?,
+                row.get::<_, u32>(10)?,
+                row.get::<_, Vec<u8>>(11)?,
                 owner_stored,
             ))
         })?;
@@ -514,6 +623,53 @@ impl WalletDb {
             params![nullifier],
         )?;
         Ok(rows)
+    }
+
+    /// Rewrite unspent `nullifier` columns as `poseidon(owner_secret, coin)`.
+    ///
+    /// Older rows were inserted with a missing or stale nullifier, so
+    /// `GetNullifiers` never marked them spent and send republished an
+    /// already-revealed nullifier (`-32110` / DuplicateNullifier).
+    pub fn recompute_owned_nullifiers(&self) -> SqlResult<u32> {
+        use darkfi_money_contract::model::Coin;
+        use darkfi_sdk::crypto::pasta_prelude::PrimeField;
+        use darkfi_sdk::crypto::{poseidon_hash, SecretKey};
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, commitment, owner_secret FROM notes \
+             WHERE spent = 0 AND commitment IS NOT NULL AND length(commitment) = 32 \
+             AND owner_secret IS NOT NULL",
+        )?;
+        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<SqlResult<_>>()?;
+        drop(stmt);
+
+        let mut n = 0u32;
+        for (id, commitment, owner_stored) in rows {
+            let owner = crate::secret_wrap::unwrap_secret(&owner_stored, &self.wrap_key)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            if owner.len() < 32 || commitment.len() != 32 {
+                continue;
+            }
+            let mut sk_arr = [0u8; 32];
+            sk_arr.copy_from_slice(&owner[..32]);
+            let Ok(sk) = SecretKey::from_bytes(sk_arr) else {
+                continue;
+            };
+            let mut coin_arr = [0u8; 32];
+            coin_arr.copy_from_slice(&commitment);
+            let Ok(coin) = Coin::from_bytes(coin_arr) else {
+                continue;
+            };
+            let nf = poseidon_hash([sk.inner(), coin.inner()]).to_repr();
+            self.conn.execute(
+                "UPDATE notes SET nullifier = ?1 WHERE id = ?2",
+                params![nf.as_slice(), id],
+            )?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// Confirmed balance for a token. `"DRK"` matches the native DarkFi token

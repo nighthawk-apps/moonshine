@@ -196,6 +196,14 @@ enum TxSubcommand {
     Broadcast {
         hex: String,
     },
+    /// Decode a serialized tx (hex file or `$TMPDIR/moonshine-last-tx.hex`).
+    Inspect {
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Fetch zkas from lightwalletd and verify ZK proofs + signatures.
+        #[arg(long)]
+        verify: bool,
+    },
 }
 
 #[tokio::main]
@@ -580,18 +588,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         coin_blind: darkfi_sdk::crypto::Blind(coin_blind),
                         value_blind: darkfi_sdk::crypto::Blind(value_blind),
                         token_blind: darkfi_sdk::crypto::Blind(token_blind),
-                        spend_hook: darkfi_sdk::crypto::FuncId::from_bytes([
-                            hook, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                            0, 0, 0, 0, 0, 0, 0, 0, 0,
-                        ])
+                        spend_hook: darkfi_sdk::crypto::FuncId::from_bytes({
+                            let mut hook_bytes = [0u8; 32];
+                            if hook.len() == 32 {
+                                hook_bytes.copy_from_slice(&hook);
+                            } else if !hook.is_empty() {
+                                hook_bytes[0] = hook[0];
+                            }
+                            hook_bytes
+                        })
                         .unwrap(),
                         user_data,
                         memo: Vec::new(),
                     };
 
-                    // OwnCoin.coin must equal CoinAttributes::to_coin() (same as the
-                    // burn circuit). Compact-block output.coin should match; if the DB
-                    // commitment was rewritten to a different leaf, spends fail 0x5.
+                    // OwnCoin.coin must equal CoinAttributes::to_coin() AND the
+                    // on-chain compact-block coin (Merkle leaf). Mismatch ⇒
+                    // burn proof publishes a root that is not on chain (-32110).
                     let derived = darkfi_money_contract::model::CoinAttributes {
                         public_key: darkfi_sdk::crypto::PublicKey::from_secret({
                             let mut sk_arr = [0u8; 32];
@@ -609,7 +622,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .unwrap(),
                         spend_hook: darkfi_sdk::crypto::FuncId::from_bytes({
                             let mut hook_bytes = [0u8; 32];
-                            hook_bytes[0] = hook;
+                            if hook.len() == 32 {
+                                hook_bytes.copy_from_slice(&hook);
+                            } else if !hook.is_empty() {
+                                hook_bytes[0] = hook[0];
+                            }
                             hook_bytes
                         })
                         .unwrap(),
@@ -617,8 +634,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         blind: darkfi_sdk::crypto::Blind(coin_blind),
                     }
                     .to_coin();
+                    if derived.to_bytes().as_slice() != commitment.as_slice() {
+                        eprintln!(
+                            "Skipping coin at leaf {lpos}: attributes do not hash to on-chain commitment"
+                        );
+                        continue;
+                    }
                     let coin = derived;
-                    let _ = commitment;
                     let mut sk_arr = [0u8; 32];
                     if owner_secret.len() < 32 {
                         return Err("Stored owner secret too short".into());
@@ -648,6 +670,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     })
                     .collect();
+                if all_coins.is_empty() {
+                    eprintln!(
+                        "Error: no spendable coins for token '{token}'. \
+                         Unspent rows exist but lack owner_secret/leaf_position/commitment, \
+                         or token_id does not match native DRK ({}). \
+                         Run: moonshine -w {} --server {} sync --rebuild-merkle",
+                        crate::db::WalletDb::dark_token_id_hex(),
+                        args.wallet_name,
+                        config.server_url
+                    );
+                    return Ok(());
+                }
 
                 let recipient_pubkey = darkfi_sdk::crypto::PublicKey::from_bytes({
                     let mut a = [0u8; 32];
@@ -727,6 +761,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 {
                     Ok(resp) => {
                         if !resp.error.is_empty() && resp.error != "0" {
+                            let path = std::env::temp_dir().join("moonshine-last-tx.hex");
+                            let _ = std::fs::write(&path, hex::encode(&tx_data));
+                            eprintln!("TX hex written to {}", path.display());
                             return Err(format!(
                                 "lightwalletd SendTransaction error: {}. \
                                  Refusing manual/darkfid fallback so the UnifOMR clue hint stays live.",
@@ -749,6 +786,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Err(e) => {
+                        let path = std::env::temp_dir().join("moonshine-last-tx.hex");
+                        let _ = std::fs::write(&path, hex::encode(&tx_data));
+                        eprintln!("TX hex written to {}", path.display());
                         return Err(format!(
                             "Broadcast via lightwalletd failed: {}. \
                              UnifOMR requires SendTransaction so the clue hint is stored (24h TTL).",
@@ -938,6 +978,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Err(e) => eprintln!("Invalid hex: {}", e),
                 }
             }
+            TxSubcommand::Inspect { file, verify } => {
+                let path = file.unwrap_or_else(|| {
+                    std::env::temp_dir().join("moonshine-last-tx.hex")
+                });
+                let hex_str = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("read {}: {e}", path.display()))?;
+                let raw = hex::decode(hex_str.trim())
+                    .map_err(|e| format!("hex decode: {e}"))?;
+                inspect_serialized_tx(&raw)?;
+                if verify {
+                    verify_serialized_tx(&raw, &config).await?;
+                }
+            }
         },
         Command::Sync {
             force_trial,
@@ -1049,16 +1102,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             if rebuild_merkle {
-                match w.db.recompute_note_commitments() {
-                    Ok((checked, updated)) => {
-                        println!(
-                            "Recomputed note commitments from attributes ({checked} notes, {updated} updated)."
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: could not recompute note commitments: {e}");
-                    }
-                }
+                // Do not recompute commitments from (possibly stale) attributes
+                // before restore — that overwrites on-chain `output.coin`.
+                println!(
+                    "Restoring on-chain coins + blinds, then rebuilding Money Merkle tree..."
+                );
             }
 
             let engine = sync::SyncEngine::new(
@@ -1165,7 +1213,191 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match wallet::Wallet::open(&args.wallet_name) {
                 Ok(w) => {
                     let (h, _) = w.db.get_sync_state().unwrap_or((0, 0));
+                    let unspent = w.db.list_unspent().unwrap_or_default();
+                    let spendable = w.db.list_unspent_full().unwrap_or_default();
                     println!("  Wallet DB:       OK (synced to {})", h);
+                    println!(
+                        "  Unspent notes:   {} (spendable with Merkle leaf: {})",
+                        unspent.len(),
+                        spendable.len()
+                    );
+                    let mut coin_ok = 0u32;
+                    for (
+                        _,
+                        _,
+                        val,
+                        tok_id,
+                        coin_b,
+                        _,
+                        _,
+                        hook,
+                        udata,
+                        lpos,
+                        commitment,
+                        owner_secret,
+                    ) in &spendable
+                    {
+                        use darkfi_sdk::pasta::pallas;
+                        use darkfi_serial::Decodable;
+                        if owner_secret.len() < 32
+                            || coin_b.len() != 32
+                            || udata.len() != 32
+                            || commitment.len() != 32
+                        {
+                            continue;
+                        }
+                        let Ok(tok_bytes) = hex::decode(tok_id) else {
+                            continue;
+                        };
+                        if tok_bytes.len() != 32 {
+                            continue;
+                        }
+                        let mut tok_arr = [0u8; 32];
+                        tok_arr.copy_from_slice(&tok_bytes);
+                        let Ok(token_id) =
+                            darkfi_money_contract::model::TokenId::from_bytes(tok_arr)
+                        else {
+                            continue;
+                        };
+                        let mut sk_arr = [0u8; 32];
+                        sk_arr.copy_from_slice(&owner_secret[..32]);
+                        let Ok(sk) = darkfi_sdk::crypto::SecretKey::from_bytes(sk_arr) else {
+                            continue;
+                        };
+                        let Ok(coin_blind) =
+                            pallas::Base::decode(&mut std::io::Cursor::new(coin_b))
+                        else {
+                            continue;
+                        };
+                        let Ok(user_data) =
+                            pallas::Base::decode(&mut std::io::Cursor::new(udata))
+                        else {
+                            continue;
+                        };
+                        let mut hook_bytes = [0u8; 32];
+                        if hook.len() == 32 {
+                            hook_bytes.copy_from_slice(hook);
+                        } else if !hook.is_empty() {
+                            hook_bytes[0] = hook[0];
+                        }
+                        let Ok(spend_hook) =
+                            darkfi_sdk::crypto::FuncId::from_bytes(hook_bytes)
+                        else {
+                            continue;
+                        };
+                        let derived = darkfi_money_contract::model::CoinAttributes {
+                            public_key: darkfi_sdk::crypto::PublicKey::from_secret(sk),
+                            value: *val as u64,
+                            token_id,
+                            spend_hook,
+                            user_data,
+                            blind: darkfi_sdk::crypto::Blind(coin_blind),
+                        }
+                        .to_coin();
+                        if derived.to_bytes().as_slice() == commitment.as_slice() {
+                            coin_ok += 1;
+                        }
+                        let hook_zero = hook.iter().all(|b| *b == 0);
+                        println!(
+                            "  note leaf={} value={} hook={}{}",
+                            lpos,
+                            val,
+                            hex::encode(hook),
+                            if hook_zero { " (none)" } else { " (NONZERO)" }
+                        );
+                    }
+                    println!(
+                        "  Coin soundness:  {coin_ok}/{} attributes hash to on-chain coin",
+                        spendable.len()
+                    );
+                    if let Ok(locs) = w.db.list_unspent_note_locs() {
+                        for (tx, idx, h) in locs.iter().take(8) {
+                            println!(
+                                "  unspent loc:     {}:{} height={}",
+                                &tx[..tx.len().min(8)],
+                                idx,
+                                h
+                            );
+                        }
+                    }
+                    if !unspent.is_empty() {
+                        let tok = &unspent[0].3;
+                        println!(
+                            "  Native DRK id:   {}",
+                            crate::db::WalletDb::dark_token_id_hex()
+                        );
+                        println!("  First note tok:  {}", tok);
+                    }
+                    match w.db.list_owned_commitments() {
+                        Ok(cs) => {
+                            let lens: Vec<usize> = cs.iter().map(|c| c.len()).take(8).collect();
+                            println!(
+                                "  Commitments:     {} (sample lens {:?})",
+                                cs.len(),
+                                lens
+                            );
+                            if let Some(c) = cs.first() {
+                                println!("  First coin hex:  {}", hex::encode(c));
+                            }
+                        }
+                        Err(e) => println!("  Commitments:     ERROR ({e})"),
+                    }
+                    match (
+                        w.db.get_meta("tree_state"),
+                        w.db.list_unspent_full(),
+                    ) {
+                        (Ok(Some(tree_bytes)), Ok(rows)) => {
+                            match darkfi_serial::Decodable::decode(
+                                &mut std::io::Cursor::new(&tree_bytes),
+                            ) {
+                                Ok(tree) => {
+                                    let tree: darkfi_sdk::crypto::MerkleTree = tree;
+                                    let tip = tree.root(0).map(|r| hex::encode(r.to_bytes()));
+                                    println!(
+                                        "  Merkle tip:      {}",
+                                        tip.as_deref().unwrap_or("-")
+                                    );
+                                    let mut ok = 0u32;
+                                    let mut bad = 0u32;
+                                    for row in &rows {
+                                        let lpos = row.9;
+                                        let commitment = &row.10;
+                                        if commitment.len() != 32 {
+                                            bad += 1;
+                                            continue;
+                                        }
+                                        let mut arr = [0u8; 32];
+                                        arr.copy_from_slice(commitment);
+                                        let Some(node) =
+                                            darkfi_sdk::crypto::MerkleNode::from_bytes(arr)
+                                        else {
+                                            bad += 1;
+                                            continue;
+                                        };
+                                        let pos: darkfi_sdk::bridgetree::Position =
+                                            (lpos as u64).into();
+                                        match crate::tx_builder::assert_witness_at_tip(
+                                            &tree, node, pos,
+                                        ) {
+                                            Ok(_) => ok += 1,
+                                            Err(e) => {
+                                                bad += 1;
+                                                eprintln!(
+                                                    "  Merkle witness leaf {lpos}: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    println!(
+                                        "  Merkle witnesses:{ok}/{} hash to tip (bad={bad})",
+                                        rows.len()
+                                    );
+                                }
+                                Err(e) => println!("  Merkle tree:     decode failed ({e})"),
+                            }
+                        }
+                        _ => println!("  Merkle tree:     missing (sync --rebuild-merkle)"),
+                    }
                 }
                 Err(_) => println!("  Wallet DB:       NOT FOUND"),
             }
@@ -1252,6 +1484,336 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn inspect_serialized_tx(raw: &[u8]) -> Result<(), Box<dyn Error>> {
+    use darkfi::tx::Transaction;
+    use darkfi_money_contract::{
+        model::{MoneyFeeParamsV1, MoneyTransferParamsV1},
+        MoneyFunction,
+    };
+    use darkfi_serial::{deserialize, Decodable};
+
+    let tx: Transaction = Decodable::decode(&mut std::io::Cursor::new(raw))?;
+    println!("TX hash:     {}", tx.hash());
+    println!("TX size:     {} bytes", raw.len());
+    println!(
+        "calls={} proofs={} signatures={}",
+        tx.calls.len(),
+        tx.proofs.len(),
+        tx.signatures.len()
+    );
+    for (i, call) in tx.calls.iter().enumerate() {
+        let n_proofs = tx.proofs.get(i).map(|p| p.len()).unwrap_or(0);
+        let n_sigs = tx.signatures.get(i).map(|s| s.len()).unwrap_or(0);
+        println!(
+            "call[{i}] cid={} parent={:?} children={:?} data={} proofs={n_proofs} sigs={n_sigs}",
+            call.data.contract_id,
+            call.parent_index,
+            call.children_indexes,
+            call.data.data.len()
+        );
+        if call.data.data.is_empty() {
+            continue;
+        }
+        let func = match MoneyFunction::try_from(call.data.data[0]) {
+            Ok(f) => f,
+            Err(_) => {
+                println!("  func=0x{:02x} (unknown)", call.data.data[0]);
+                continue;
+            }
+        };
+        println!("  func={func:?}");
+        match func {
+            MoneyFunction::TransferV1 => {
+                let params: MoneyTransferParamsV1 = deserialize(&call.data.data[1..])?;
+                println!(
+                    "  inputs={} outputs={}",
+                    params.inputs.len(),
+                    params.outputs.len()
+                );
+                for (j, inp) in params.inputs.iter().enumerate() {
+                    println!(
+                        "  in[{j}] merkle_root={} nullifier={} tx_local={}",
+                        hex::encode(inp.merkle_root.to_bytes()),
+                        hex::encode(inp.nullifier.to_bytes()),
+                        inp.tx_local
+                    );
+                }
+                for (j, out) in params.outputs.iter().enumerate() {
+                    println!(
+                        "  out[{j}] coin={} tx_local={}",
+                        hex::encode(out.coin.to_bytes()),
+                        out.tx_local
+                    );
+                }
+            }
+            MoneyFunction::FeeV1 => {
+                if call.data.data.len() < 9 {
+                    println!("  fee call too short");
+                    continue;
+                }
+                let fee: u64 = deserialize(&call.data.data[1..9])?;
+                let params: MoneyFeeParamsV1 = deserialize(&call.data.data[9..])?;
+                println!("  paid_fee={fee}");
+                println!(
+                    "  in merkle_root={} nullifier={} tx_local={}",
+                    hex::encode(params.input.merkle_root.to_bytes()),
+                    hex::encode(params.input.nullifier.to_bytes()),
+                    params.input.tx_local
+                );
+                println!(
+                    "  out coin={} tx_local={}",
+                    hex::encode(params.output.coin.to_bytes()),
+                    params.output.tx_local
+                );
+            }
+            _ => {}
+        }
+    }
+    println!(
+        "Explorer: https://explorer.testnet.dark.fi/tx/{}",
+        tx.hash()
+    );
+    Ok(())
+}
+
+async fn verify_serialized_tx(
+    raw: &[u8],
+    config: &config::Config,
+) -> Result<(), Box<dyn Error>> {
+    use darkfi::tx::Transaction;
+    use darkfi::zk::{proof::VerifyingKey, vm::ZkCircuit, vm_heap::empty_witnesses};
+    use darkfi::zkas::ZkBinary;
+    use darkfi_money_contract::{
+        model::{MoneyFeeParamsV1, MoneyTransferParamsV1},
+        MoneyFunction, MONEY_CONTRACT_ZKAS_BURN_NS_V1, MONEY_CONTRACT_ZKAS_FEE_NS_V1,
+        MONEY_CONTRACT_ZKAS_MINT_NS_V1,
+    };
+    use darkfi_sdk::crypto::pasta_prelude::{Curve, CurveAffine};
+    use darkfi_sdk::crypto::{FuncId, PublicKey};
+    use darkfi_serial::{deserialize, Decodable};
+    use std::collections::HashMap;
+
+    let tx: Transaction = Decodable::decode(&mut std::io::Cursor::new(raw))?;
+    println!("\nVerifying ZK proofs and signatures (lightwalletd zkas)...");
+
+    let mut client = client::LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+        .with_tor(config.use_tor);
+    let zkas = client
+        .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
+        .await?
+        .bincodes;
+    for kv in &zkas {
+        println!(
+            "  zkas {} len={} sha256={}",
+            kv.namespace,
+            kv.bincode.len(),
+            hex::encode(&sha2_256(&kv.bincode)[..8])
+        );
+    }
+
+    let mut vk_ns: HashMap<String, VerifyingKey> = HashMap::new();
+    for kv in &zkas {
+        if ![
+            MONEY_CONTRACT_ZKAS_BURN_NS_V1,
+            MONEY_CONTRACT_ZKAS_MINT_NS_V1,
+            MONEY_CONTRACT_ZKAS_FEE_NS_V1,
+        ]
+        .contains(&kv.namespace.as_str())
+        {
+            continue;
+        }
+        println!("  building VK {}...", kv.namespace);
+        let zkbin = ZkBinary::decode(&kv.bincode, false)?;
+        let circuit = ZkCircuit::new(empty_witnesses(&zkbin)?, &zkbin);
+        vk_ns.insert(kv.namespace.clone(), VerifyingKey::build(zkbin.k, &circuit));
+    }
+
+    let mut zkp_table = Vec::new();
+    let mut sig_table = Vec::new();
+    for call in &tx.calls {
+        if call.data.data.is_empty() {
+            zkp_table.push(vec![]);
+            sig_table.push(vec![]);
+            continue;
+        }
+        let func = MoneyFunction::try_from(call.data.data[0])
+            .map_err(|_| "unknown money function")?;
+        let spend_hook = match call.parent_index {
+            Some(_) => {
+                return Err("inspect verify does not yet handle parent spend_hook".into());
+            }
+            None => FuncId::none(),
+        };
+        match func {
+            MoneyFunction::TransferV1 => {
+                let params: MoneyTransferParamsV1 = deserialize(&call.data.data[1..])?;
+                let mut zkp = Vec::new();
+                let mut sigs: Vec<PublicKey> = Vec::new();
+                for input in &params.inputs {
+                    let value_coords = input.value_commit.to_affine().coordinates().unwrap();
+                    let (sig_x, sig_y) = input.signature_public.xy();
+                    zkp.push((
+                        MONEY_CONTRACT_ZKAS_BURN_NS_V1.to_string(),
+                        vec![
+                            input.nullifier.inner(),
+                            *value_coords.x(),
+                            *value_coords.y(),
+                            input.token_commit,
+                            input.merkle_root.inner(),
+                            input.user_data_enc,
+                            spend_hook.inner(),
+                            sig_x,
+                            sig_y,
+                        ],
+                    ));
+                    sigs.push(input.signature_public);
+                }
+                for output in &params.outputs {
+                    let value_coords = output.value_commit.to_affine().coordinates().unwrap();
+                    zkp.push((
+                        MONEY_CONTRACT_ZKAS_MINT_NS_V1.to_string(),
+                        vec![
+                            output.coin.inner(),
+                            *value_coords.x(),
+                            *value_coords.y(),
+                            output.token_commit,
+                        ],
+                    ));
+                }
+                zkp_table.push(zkp);
+                sig_table.push(sigs);
+            }
+            MoneyFunction::FeeV1 => {
+                let params: MoneyFeeParamsV1 = deserialize(&call.data.data[9..])?;
+                let input_value_coords = params.input.value_commit.to_affine().coordinates().unwrap();
+                let output_value_coords = params.output.value_commit.to_affine().coordinates().unwrap();
+                let (sig_x, sig_y) = params.input.signature_public.xy();
+                zkp_table.push(vec![(
+                    MONEY_CONTRACT_ZKAS_FEE_NS_V1.to_string(),
+                    vec![
+                        params.input.nullifier.inner(),
+                        *input_value_coords.x(),
+                        *input_value_coords.y(),
+                        params.input.token_commit,
+                        params.input.merkle_root.inner(),
+                        params.input.user_data_enc,
+                        sig_x,
+                        sig_y,
+                        params.output.coin.inner(),
+                        *output_value_coords.x(),
+                        *output_value_coords.y(),
+                    ],
+                )]);
+                sig_table.push(vec![params.input.signature_public]);
+            }
+            _ => {
+                zkp_table.push(vec![]);
+                sig_table.push(vec![]);
+            }
+        }
+    }
+
+    match tx.verify_sigs(sig_table) {
+        Ok(()) => println!("  signatures: OK"),
+        Err(e) => println!("  signatures: FAIL ({e})"),
+    }
+
+    let mut vks: HashMap<[u8; 32], HashMap<String, VerifyingKey>> = HashMap::new();
+    vks.insert(
+        darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_bytes(),
+        vk_ns,
+    );
+    match tx.verify_zkps(&vks, zkp_table).await {
+        Ok(()) => println!("  zk proofs:   OK"),
+        Err(e) => println!("  zk proofs:   FAIL ({e})"),
+    }
+
+    use darkfi_money_contract::model::DARK_TOKEN_ID;
+    use darkfi_sdk::crypto::poseidon_hash;
+    use darkfi_sdk::pasta::group::Group;
+    use darkfi_sdk::pasta::pallas;
+    use futures::StreamExt;
+    let mut nf_watch: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for (i, call) in tx.calls.iter().enumerate() {
+        if call.data.data.is_empty() {
+            continue;
+        }
+        match MoneyFunction::try_from(call.data.data[0]) {
+            Ok(MoneyFunction::TransferV1) => {
+                let params: MoneyTransferParamsV1 = deserialize(&call.data.data[1..])?;
+                let mut acc = pallas::Point::identity();
+                for inp in &params.inputs {
+                    acc += inp.value_commit;
+                    nf_watch.insert(inp.nullifier.to_bytes().to_vec());
+                }
+                for out in &params.outputs {
+                    acc -= out.value_commit;
+                }
+                println!(
+                    "  transfer[{i}] value-commit identity: {}",
+                    acc == pallas::Point::identity()
+                );
+            }
+            Ok(MoneyFunction::FeeV1) => {
+                let fee: u64 = deserialize(&call.data.data[1..9])?;
+                let params: MoneyFeeParamsV1 = deserialize(&call.data.data[9..])?;
+                nf_watch.insert(params.input.nullifier.to_bytes().to_vec());
+                let native = poseidon_hash([DARK_TOKEN_ID.inner(), params.token_blind.inner()]);
+                println!(
+                    "  fee[{i}] native token_commit match: {}",
+                    params.input.token_commit == native
+                        && params.output.token_commit == native
+                );
+                let mut acc = params.input.value_commit;
+                acc -= params.output.value_commit;
+                acc -= darkfi_sdk::crypto::pedersen_commitment_u64(fee, params.fee_value_blind);
+                println!(
+                    "  fee[{i}] value-commit identity: {}",
+                    acc == pallas::Point::identity()
+                );
+            }
+            _ => {}
+        }
+    }
+
+    println!("  scanning LWD nullifiers for {} input(s)...", nf_watch.len());
+    let tip = client.get_chain_tip().await?.height;
+    let mut start = 0u32;
+    let mut seen = 0u32;
+    let mut found = 0u32;
+    while start <= tip {
+        let end = start.saturating_add(9999).min(tip);
+        let mut stream = client.get_nullifiers(start, end).await?;
+        while let Some(item) = stream.next().await {
+            let upd = item?;
+            seen += upd.nullifiers.len() as u32;
+            for n in upd.nullifiers {
+                if nf_watch.contains(&n) {
+                    found += 1;
+                    println!(
+                        "  NULLIFIER ALREADY ON CHAIN at height {} nf={}",
+                        upd.height,
+                        hex::encode(&n)
+                    );
+                }
+            }
+        }
+        start = end.saturating_add(1);
+        if start == 0 {
+            break;
+        }
+    }
+    println!(
+        "  nullifier scan: {seen} revealed, on-chain matches={found} (0 means unspent on LWD)"
+    );
+    Ok(())
+}
+
+fn sha2_256(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
 }
 
 /// Verify GetCluePublicKey directory attestation, then build a UnifOMR clue.

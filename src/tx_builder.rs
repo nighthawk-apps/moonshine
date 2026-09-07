@@ -27,15 +27,16 @@ use darkfi_money_contract::{
         transfer_v1::make_transfer_call,
         MoneyNote, OwnCoin,
     },
-    model::{MoneyFeeParamsV1, TokenId},
+    model::{CoinAttributes, MoneyFeeParamsV1, TokenId},
     MoneyFunction, MONEY_CONTRACT_ZKAS_BURN_NS_V1, MONEY_CONTRACT_ZKAS_FEE_NS_V1,
     MONEY_CONTRACT_ZKAS_MINT_NS_V1,
 };
-use darkfi_sdk::crypto::pasta_prelude::Field;
+use darkfi_sdk::bridgetree::Hashable;
+use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
 use darkfi_sdk::{
     crypto::{
-        contract_id::MONEY_CONTRACT_ID, note::AeadEncryptedNote, FuncId, Keypair, MerkleTree,
-        PublicKey,
+        contract_id::MONEY_CONTRACT_ID, note::AeadEncryptedNote, FuncId, Keypair, MerkleNode,
+        MerkleTree, PublicKey,
     },
     crypto::{Blind, SecretKey},
     pasta::pallas,
@@ -43,6 +44,52 @@ use darkfi_sdk::{
 };
 use darkfi_serial::AsyncEncodable;
 use std::error::Error;
+
+/// Recompute the Money Merkle root the burn/fee circuits publish.
+pub(crate) fn merkle_root_from_path(
+    coin: MerkleNode,
+    position: u64,
+    path: &[MerkleNode],
+) -> MerkleNode {
+    let mut current = coin;
+    for (level, sibling) in path.iter().enumerate() {
+        let level = level as u8;
+        current = if position & (1 << level) == 0 {
+            MerkleNode::combine(level.into(), &current, sibling)
+        } else {
+            MerkleNode::combine(level.into(), sibling, &current)
+        };
+    }
+    current
+}
+
+/// `witness(pos, 0)` must authenticate the coin to the current tree root.
+/// A mismatch means `leaf_position` does not match the marked leaf (the
+/// published root will not be in darkfid `coin_roots` → `-32110`).
+pub(crate) fn assert_witness_at_tip(
+    tree: &MerkleTree,
+    coin: MerkleNode,
+    leaf_position: darkfi_sdk::bridgetree::Position,
+) -> Result<MerkleNode, Box<dyn Error>> {
+    let Some(tip_root) = tree.root(0) else {
+        return Err("Merkle tree has no current root".into());
+    };
+    let path = tree
+        .witness(leaf_position, 0)
+        .map_err(|_| format!("Merkle witness missing for leaf {leaf_position:?}"))?;
+    let position: u64 = leaf_position.into();
+    let witnessed = merkle_root_from_path(coin, position, &path);
+    if witnessed != tip_root {
+        return Err(format!(
+            "Merkle witness for leaf {position} hashes to {} but tree tip is {}. \
+             Rebuild with: moonshine sync --rebuild-merkle --allow-trial",
+            hex::encode(witnessed.to_bytes()),
+            hex::encode(tip_root.to_bytes()),
+        )
+        .into());
+    }
+    Ok(tip_root)
+}
 
 pub fn compute_remainder_blind(
     inputs: &[Blind<pallas::Scalar>],
@@ -113,7 +160,11 @@ pub async fn build_transaction(
         .cloned()
         .collect();
 
-    let (params, secrets, spent_coins) = make_transfer_call(
+    for coin in &all_coins {
+        assert_witness_at_tip(&tree, MerkleNode::from(coin.coin.inner()), coin.leaf_position)?;
+    }
+
+    let (mut params, secrets, spent_coins) = make_transfer_call(
         keypair,
         recipient_pubkey,
         amount,
@@ -130,6 +181,101 @@ pub async fn build_transaction(
     )?;
     let _ = payment_memo; // retained in local tx history by caller when present
 
+    struct FeeSrc {
+        coin: OwnCoin,
+        merkle_path: Vec<MerkleNode>,
+        input_tx_local: bool,
+        expected_root: Option<MerkleNode>,
+    }
+
+    let fee_src = if fee > 0 {
+        let leftover = fee_candidates.iter().find(|c| {
+            !spent_coins.iter().any(|sc| sc.coin == c.coin) && c.note.value >= fee
+        });
+        if let Some(c) = leftover {
+            let merkle_path = tree
+                .witness(c.leaf_position, 0)
+                .map_err(|_| "Merkle path missing for fee coin")?;
+            Some(FeeSrc {
+                coin: c.clone(),
+                merkle_path,
+                input_tx_local: false,
+                expected_root: tree.root(0),
+            })
+        } else {
+            // DEP-0008: spend transfer change inside this tx (tx-local tree).
+            // Must match host `merkle_add_local`: dummy ZERO leaf, then local coins.
+            let mut local_tree = MerkleTree::new(1);
+            local_tree.append(MerkleNode::from(pallas::Base::ZERO));
+            let mut src = None;
+            for output in params.outputs.iter_mut() {
+                let Ok(note) = output.note.decrypt::<MoneyNote>(&keypair.secret) else {
+                    continue;
+                };
+                if note.value < fee || note.token_id != token_id {
+                    continue;
+                }
+                let derived = CoinAttributes {
+                    public_key: PublicKey::from_secret(keypair.secret),
+                    value: note.value,
+                    token_id: note.token_id,
+                    spend_hook: note.spend_hook,
+                    user_data: note.user_data,
+                    blind: note.coin_blind,
+                }
+                .to_coin();
+                if derived != output.coin {
+                    return Err(format!(
+                        "tx-local change coin mismatch: output={} derived={}",
+                        hex::encode(output.coin.inner().to_repr()),
+                        hex::encode(derived.inner().to_repr())
+                    )
+                    .into());
+                }
+                output.tx_local = true;
+                local_tree.append(MerkleNode::from(output.coin.inner()));
+                let leaf_position = local_tree
+                    .mark()
+                    .ok_or("tx-local merkle mark failed")?;
+                let coin = OwnCoin {
+                    coin: output.coin,
+                    note,
+                    secret: keypair.secret,
+                    leaf_position,
+                };
+                let merkle_path = local_tree
+                    .witness(leaf_position, 0)
+                    .map_err(|_| "tx-local merkle path missing")?;
+                let expected_root = local_tree.root(0);
+                eprintln!(
+                    "tx-local tree root={} pos={:?} change={}",
+                    expected_root
+                        .map(|r| hex::encode(r.to_bytes()))
+                        .unwrap_or_default(),
+                    leaf_position,
+                    hex::encode(output.coin.inner().to_repr())
+                );
+                src = Some(FeeSrc {
+                    coin,
+                    merkle_path,
+                    input_tx_local: true,
+                    expected_root,
+                });
+                break;
+            }
+            src
+        }
+    } else {
+        None
+    };
+
+    if fee > 0 && fee_src.is_none() {
+        return Err(
+            "Not enough native tokens to pay for fee (need a leftover coin or change >= fee)"
+                .into(),
+        );
+    }
+
     let mut data = vec![MoneyFunction::TransferV1 as u8];
     params.encode_async(&mut data).await?;
     let call = ContractCall {
@@ -137,39 +283,26 @@ pub async fn build_transaction(
         data,
     };
 
-    let mut tx_builder = TransactionBuilder::new(
-        ContractCallLeaf {
-            call,
-            proofs: secrets.proofs,
-        },
-        vec![],
-    )?;
+    let transfer_leaf = ContractCallLeaf {
+        call,
+        proofs: secrets.proofs,
+    };
 
     // Fee call — only when fee > 0 (skip_fees mode on darkfid doesn't
     // require or support Fee calls).
-    if fee > 0 {
-        let available_fee_coins: Vec<&OwnCoin> = fee_candidates
-            .iter()
-            .filter(|c| !spent_coins.iter().any(|sc| sc.coin == c.coin))
-            .collect();
-
-        let fee_coin = available_fee_coins
-            .first()
-            .ok_or("Not enough native tokens to pay for fee")?;
-        let change_value = fee_coin.note.value - fee;
+    if let Some(fee_src) = fee_src {
+        let change_value = fee_src.coin.note.value - fee;
 
         let input = FeeCallInput {
-            coin: (*fee_coin).clone(),
-            merkle_path: tree
-                .witness(fee_coin.leaf_position, 0)
-                .map_err(|_| "Merkle path missing")?,
+            coin: fee_src.coin.clone(),
+            merkle_path: fee_src.merkle_path,
             user_data_blind: Blind::random(&mut rand_core::OsRng),
         };
 
         let output = FeeCallOutput {
-            public_key: PublicKey::from_secret(fee_coin.secret),
+            public_key: PublicKey::from_secret(fee_src.coin.secret),
             value: change_value,
-            token_id: fee_coin.note.token_id,
+            token_id: fee_src.coin.note.token_id,
             blind: Blind::random(&mut rand_core::OsRng),
             spend_hook: FuncId::none(),
             user_data: pallas::Base::ZERO,
@@ -195,6 +328,16 @@ pub async fn build_transaction(
             token_blind,
             signature_secret,
         )?;
+        if let Some(expected) = fee_src.expected_root {
+            if expected != public_inputs.merkle_root {
+                return Err(format!(
+                    "fee proof Merkle root {} != wallet tree root {}",
+                    hex::encode(public_inputs.merkle_root.to_bytes()),
+                    hex::encode(expected.to_bytes())
+                )
+                .into());
+            }
+        }
 
         let note = MoneyNote {
             coin_blind: output.blind,
@@ -219,7 +362,7 @@ pub async fn build_transaction(
                 merkle_root: public_inputs.merkle_root,
                 user_data_enc: public_inputs.input_user_data_enc,
                 signature_public: public_inputs.signature_public,
-                tx_local: false,
+                tx_local: fee_src.input_tx_local,
             },
             output: darkfi_money_contract::model::Output {
                 value_commit: public_inputs.output_value_commit,
@@ -241,6 +384,10 @@ pub async fn build_transaction(
             data,
         };
 
+        // Forest siblings, Transfer first then Fee. DarkTree children are
+        // emitted post-order (child before parent), which would run Fee
+        // before Transfer apply and miss the tx-local Merkle root.
+        let mut tx_builder = TransactionBuilder::new(transfer_leaf, vec![])?;
         tx_builder.append(
             ContractCallLeaf {
                 call: fee_call,
@@ -257,6 +404,7 @@ pub async fn build_transaction(
         Ok(tx)
     } else {
         // No fee call — build transaction with just the transfer call.
+        let mut tx_builder = TransactionBuilder::new(transfer_leaf, vec![])?;
         let mut tx = tx_builder.build()?;
         let sigs = tx.create_sigs(&secrets.signature_secrets)?;
         tx.signatures.push(sigs);
