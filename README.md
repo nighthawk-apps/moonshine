@@ -2,7 +2,7 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC and syncs with **UnifOMR only** (scheme `0x05`). There is no PerfOMR fallback.
 
-**3.0.5 Instant Sync:** checkpoint Merkle restore (`blake3(height LE || tree_data || nullifier_index)`), birthday-clamped scan windows, proto_version 1.x on connect. Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.00.007:** decimal send amounts, spent-note marking after broadcast, sibling `darkfi-nighthawk-testnet` pin. Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
 > **Strict UnifOMR (hard-coded):** Moonshine does **not** run supplemental / gap trial decrypt. **Only** transactions that carry UnifOMR clues are discovered during normal sync — typically **Moonshine ↔ Moonshine**, or **Nighthawk → Moonshine**. Payments from upstream `drk` / other non-UnifOMR wallets will **not** appear unless you explicitly run `moonshine sync --force-trial` (privacy trade-off). Nighthawk Android / iOS / desktop default the opposite (trial-decrypt fallback on) so they can receive from any DarkFi wallet.
 
