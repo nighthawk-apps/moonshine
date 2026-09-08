@@ -105,6 +105,24 @@ pub fn compute_remainder_blind(
     Blind(remainder)
 }
 
+/// Built Money transfer (+ optional fee) plus the coins it spends.
+///
+/// Callers must mark these notes spent after a successful broadcast so the
+/// next send cannot republish the same nullifiers.
+pub struct BuiltTransfer {
+    pub tx: Transaction,
+    pub spent_commitments: Vec<Vec<u8>>,
+    pub spent_nullifiers: Vec<Vec<u8>>,
+}
+
+fn own_coin_commitment(coin: &OwnCoin) -> Vec<u8> {
+    coin.coin.inner().to_repr().to_vec()
+}
+
+fn own_coin_nullifier(coin: &OwnCoin) -> Vec<u8> {
+    coin.nullifier().inner().to_repr().to_vec()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_transaction(
     amount: u64,
@@ -117,7 +135,7 @@ pub async fn build_transaction(
     zkas_bins: Vec<(String, Vec<u8>)>,
     payment_memo: Option<Vec<u8>>,
     half_split: bool,
-) -> Result<Transaction, Box<dyn Error>> {
+) -> Result<BuiltTransfer, Box<dyn Error>> {
     let keypair = Keypair::new(wallet_secret);
 
     // Decode ZK binaries
@@ -152,24 +170,36 @@ pub async fn build_transaction(
     // Transfer call (upstream make_transfer_call: no payment_memo arg;
     // notes currently use empty memo in money client builder).
 
-    // L5: Pre-collect fee candidate coins before make_transfer_call consumes
-    // all_coins, avoiding a full Vec<OwnCoin> clone.
-    let fee_candidates: Vec<OwnCoin> = all_coins
+    let mut spendable = Vec::with_capacity(all_coins.len());
+    for coin in all_coins {
+        match assert_witness_at_tip(&tree, MerkleNode::from(coin.coin.inner()), coin.leaf_position)
+        {
+            Ok(_) => spendable.push(coin),
+            Err(e) => eprintln!(
+                "Skipping coin not authenticated to the current Money tree: {e}"
+            ),
+        }
+    }
+    if spendable.is_empty() {
+        return Err(
+            "No spendable coins with a valid Merkle witness. Rebuild with: \
+             moonshine sync --rebuild-merkle --allow-trial"
+                .into(),
+        );
+    }
+
+    let fee_candidates: Vec<OwnCoin> = spendable
         .iter()
         .filter(|c| c.note.value >= fee && c.note.token_id == token_id)
         .cloned()
         .collect();
-
-    for coin in &all_coins {
-        assert_witness_at_tip(&tree, MerkleNode::from(coin.coin.inner()), coin.leaf_position)?;
-    }
 
     let (mut params, secrets, spent_coins) = make_transfer_call(
         keypair,
         recipient_pubkey,
         amount,
         token_id,
-        all_coins, // consumed, no clone needed
+        spendable.clone(),
         tree.clone(),
         None, // spend_hook
         None, // user_data
@@ -180,6 +210,11 @@ pub async fn build_transaction(
         half_split,
     )?;
     let _ = payment_memo; // retained in local tx history by caller when present
+
+    let mut spent_commitments: Vec<Vec<u8>> =
+        spent_coins.iter().map(own_coin_commitment).collect();
+    let mut spent_nullifiers: Vec<Vec<u8>> =
+        spent_coins.iter().map(own_coin_nullifier).collect();
 
     struct FeeSrc {
         coin: OwnCoin,
@@ -291,6 +326,10 @@ pub async fn build_transaction(
     // Fee call — only when fee > 0 (skip_fees mode on darkfid doesn't
     // require or support Fee calls).
     if let Some(fee_src) = fee_src {
+        if !fee_src.input_tx_local {
+            spent_commitments.push(own_coin_commitment(&fee_src.coin));
+            spent_nullifiers.push(own_coin_nullifier(&fee_src.coin));
+        }
         let change_value = fee_src.coin.note.value - fee;
 
         let input = FeeCallInput {
@@ -401,13 +440,21 @@ pub async fn build_transaction(
         tx.signatures.push(sigs);
         let fee_sigs = tx.create_sigs(&[signature_secret])?;
         tx.signatures.push(fee_sigs);
-        Ok(tx)
+        Ok(BuiltTransfer {
+            tx,
+            spent_commitments,
+            spent_nullifiers,
+        })
     } else {
         // No fee call — build transaction with just the transfer call.
         let mut tx_builder = TransactionBuilder::new(transfer_leaf, vec![])?;
         let mut tx = tx_builder.build()?;
         let sigs = tx.create_sigs(&secrets.signature_secrets)?;
         tx.signatures.push(sigs);
-        Ok(tx)
+        Ok(BuiltTransfer {
+            tx,
+            spent_commitments,
+            spent_nullifiers,
+        })
     }
 }

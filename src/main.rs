@@ -21,6 +21,7 @@ use std::error::Error;
 use std::io::IsTerminal;
 use std::str::FromStr;
 
+mod amount;
 mod block_cache;
 mod client;
 mod config;
@@ -175,8 +176,9 @@ enum TxSubcommand {
     Send {
         #[arg(long)]
         to: String,
+        /// Amount in DRK (decimal string, 8 places). Parsed without floating point.
         #[arg(long)]
-        amount: f64,
+        amount: String,
         #[arg(long, default_value = "DRK")]
         token: String,
         #[arg(long)]
@@ -345,8 +347,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Balance => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
             let balance = w.db.confirmed_balance("DRK")?;
-            let drk_amount = balance as f64 / 100_000_000.0; // 8 decimal places (1 DRK = 10^8 atomic)
-            println!("Balance: {:.8} DRK", drk_amount);
+            println!(
+                "Balance: {} DRK",
+                crate::amount::format_drk_atomic(balance as u64)
+            );
             println!("  Raw:   {} atomic units", balance);
         }
         Command::Coins { sub } => {
@@ -386,13 +390,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
                 let to_bytes = recipient_addr.public_key().to_bytes().to_vec();
 
-                // Convert amount to atomic units (1 DRK = 10^8 atomic)
-                let amount_atomic = (amount * 1e8) as u64;
+                let amount_atomic = match crate::amount::parse_drk_atomic(&amount) {
+                    Ok(v) if v > 0 => v,
+                    Ok(_) => {
+                        eprintln!("Error: Amount must be greater than 0.");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return Ok(());
+                    }
+                };
                 let fee_atomic = fee;
-                if amount_atomic == 0 {
-                    eprintln!("Error: Amount must be greater than 0.");
-                    return Ok(());
-                }
 
                 // Check balance
                 let balance = w.db.confirmed_balance(&token)?;
@@ -494,11 +503,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("║  To:      {}...  ║", &to[..24]);
                 println!(
                     "║  Amount:  {} {} ({} atomic)           ║",
-                    amount, token, amount_atomic
+                    crate::amount::format_drk_atomic(amount_atomic),
+                    token,
+                    amount_atomic
                 );
                 println!(
                     "║  Fee:     {} DRK ({} atomic)              ║",
-                    fee_atomic as f64 / 1e8,
+                    crate::amount::format_drk_atomic(fee_atomic),
                     fee_atomic
                 );
                 println!(
@@ -715,7 +726,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.as_bytes().to_vec());
 
-                let tx: darkfi::tx::Transaction = crate::tx_builder::build_transaction(
+                let built = crate::tx_builder::build_transaction(
                     amount_atomic,
                     fee_atomic,
                     token_id,
@@ -731,10 +742,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     half_split,
                 )
                 .await?;
+                let tx = built.tx;
 
                 use darkfi_serial::Encodable;
                 let mut tx_data = Vec::new();
                 tx.encode(&mut tx_data).unwrap();
+                let last_tx_path = wallet::Wallet::write_last_tx(&args.wallet_name, &tx_data);
 
                 println!("\n✅ ZK Transaction Generated!");
                 println!("TX size: {} bytes", tx_data.len());
@@ -761,9 +774,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 {
                     Ok(resp) => {
                         if !resp.error.is_empty() && resp.error != "0" {
-                            let path = std::env::temp_dir().join("moonshine-last-tx.hex");
-                            let _ = std::fs::write(&path, hex::encode(&tx_data));
-                            eprintln!("TX hex written to {}", path.display());
+                            eprintln!("TX hex written to {}", last_tx_path.display());
                             return Err(format!(
                                 "lightwalletd SendTransaction error: {}. \
                                  Refusing manual/darkfid fallback so the UnifOMR clue hint stays live.",
@@ -772,6 +783,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             .into());
                         }
                         if !omr_clue.is_empty() && !resp.clue_accepted {
+                            eprintln!("TX hex written to {}", last_tx_path.display());
                             return Err(
                                 "lightwalletd accepted the tx but rejected the UnifOMR clue \
                                  (clue_accepted=false). Refusing to treat this as success."
@@ -784,11 +796,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 "UnifOMR clue hint stored (24h TTL) — confirm while LWD indexes."
                             );
                         }
+                        let mut marked = 0usize;
+                        for nf in &built.spent_nullifiers {
+                            marked += w.db.mark_note_spent(nf).unwrap_or(0);
+                        }
+                        for commit in &built.spent_commitments {
+                            marked += w.db.mark_note_spent_by_commitment(commit).unwrap_or(0);
+                        }
+                        if marked == 0 {
+                            eprintln!(
+                                "Warning: broadcast OK but no local notes marked spent — \
+                                 refuse a second send until sync marks nullifiers."
+                            );
+                        } else {
+                            println!(
+                                "Reserved {marked} local note update(s) so the next send cannot double-spend."
+                            );
+                        }
                     }
                     Err(e) => {
-                        let path = std::env::temp_dir().join("moonshine-last-tx.hex");
-                        let _ = std::fs::write(&path, hex::encode(&tx_data));
-                        eprintln!("TX hex written to {}", path.display());
+                        eprintln!("TX hex written to {}", last_tx_path.display());
                         return Err(format!(
                             "Broadcast via lightwalletd failed: {}. \
                              UnifOMR requires SendTransaction so the clue hint is stored (24h TTL).",
@@ -813,12 +840,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 println!("TX hash: {}", tx_hash);
-                let explorer_base = if config.network.eq_ignore_ascii_case("mainnet") {
-                    "https://explorer.dark.fi"
-                } else {
-                    "https://explorer.testnet.dark.fi"
-                };
-                println!("Explorer: {}/tx/{}", explorer_base, tx_hash);
+                println!(
+                    "Explorer: {}/tx/{}",
+                    config.explorer_base_url(),
+                    tx_hash
+                );
+                println!("Last tx hex: {}", last_tx_path.display());
             }
             TxSubcommand::List => {
                 let w = wallet::Wallet::open(&args.wallet_name)?;
@@ -834,7 +861,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                     println!("{}", "-".repeat(90));
                     for tx in &txs {
-                        let drk_amount = tx.value_raw as f64 / 100_000_000.0;
+                        let drk_amount =
+                            crate::amount::format_drk_atomic(tx.value_raw as u64);
                         let dir_icon = if tx.direction == "incoming" {
                             "⬇ recv"
                         } else {
@@ -846,7 +874,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             &tx.hash
                         };
                         println!(
-                            "{:<10} {:<10} {:>15.8} {:<6} {:<20} {}…",
+                            "{:<10} {:<10} {:>16} {:<6} {:<20} {}…",
                             tx.block_height,
                             dir_icon,
                             drk_amount,
@@ -866,14 +894,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let w = wallet::Wallet::open(&args.wallet_name)?;
                 match w.db.get_transaction(&hash)? {
                     Some(tx) => {
-                        let drk_amount = tx.value_raw as f64 / 100_000_000.0;
                         println!("Transaction Details");
                         println!("  Hash:         {}", tx.hash);
                         println!("  Block Height: {}", tx.block_height);
                         println!("  Direction:    {}", tx.direction);
                         println!(
-                            "  Amount:       {:.8} {} ({} atomic)",
-                            drk_amount, tx.token_id, tx.value_raw
+                            "  Amount:       {} {} ({} atomic)",
+                            crate::amount::format_drk_atomic(tx.value_raw as u64),
+                            tx.token_id,
+                            tx.value_raw
                         );
                         println!("  Time:         {}", tx.timestamp);
                         if let Some(cp) = &tx.counterparty {
@@ -884,12 +913,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 println!("  Memo:         {}", memo);
                             }
                         }
-                        let explorer_base = if config.network == "mainnet" {
-                            "https://explorer.dark.fi"
-                        } else {
-                            "https://explorer.testnet.dark.fi"
-                        };
-                        println!("  Explorer:     {}/tx/{}", explorer_base, tx.hash);
+                        println!(
+                            "  Explorer:     {}/tx/{}",
+                            config.explorer_base_url(),
+                            tx.hash
+                        );
                     }
                     None => {
                         println!("Transaction not found: {}", hash);
@@ -980,7 +1008,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             TxSubcommand::Inspect { file, verify } => {
                 let path = file.unwrap_or_else(|| {
-                    std::env::temp_dir().join("moonshine-last-tx.hex")
+                    let scoped = wallet::Wallet::last_tx_path(&args.wallet_name);
+                    if scoped.exists() {
+                        scoped
+                    } else {
+                        std::env::temp_dir().join("moonshine-last-tx.hex")
+                    }
                 });
                 let hex_str = std::fs::read_to_string(&path)
                     .map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -1571,6 +1604,7 @@ fn inspect_serialized_tx(raw: &[u8]) -> Result<(), Box<dyn Error>> {
             _ => {}
         }
     }
+    println!("TX hash: {}", tx.hash());
     println!(
         "Explorer: https://explorer.testnet.dark.fi/tx/{}",
         tx.hash()

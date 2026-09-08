@@ -29,7 +29,7 @@ use darkfi_sdk::crypto::pasta_prelude::PrimeField;
 use darkfi_sdk::crypto::SecretKey;
 use std::error::Error;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Domain separation for `RegisterCluePublicKey` ownership proofs (v2:
 /// binds network byte + monotonic key_version against replay).
@@ -449,6 +449,25 @@ impl Wallet {
     pub fn db_path(name: &str) -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         format!("{}/.config/moonshine/wallets/{}.db", home, name)
+    }
+
+    /// Last failed/debug tx hex, scoped to this wallet (mode 0600).
+    pub fn last_tx_path(name: &str) -> PathBuf {
+        PathBuf::from(format!("{}.last-tx.hex", Self::db_path(name)))
+    }
+
+    /// Write serialized tx hex next to the wallet DB (not world-readable $TMPDIR).
+    pub fn write_last_tx(name: &str, tx_data: &[u8]) -> PathBuf {
+        let path = Self::last_tx_path(name);
+        if let Err(e) =
+            crate::secret_wrap::write_mode_0600_overwrite(&path, hex::encode(tx_data).as_bytes())
+        {
+            eprintln!(
+                "Warning: failed to write last-tx hex to {}: {e}",
+                path.display()
+            );
+        }
+        path
     }
 
     /// Delete a wallet database.

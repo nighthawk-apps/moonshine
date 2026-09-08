@@ -625,6 +625,27 @@ impl WalletDb {
         Ok(rows)
     }
 
+    /// Mark a note spent by on-chain coin commitment (32-byte leaf).
+    /// Used right after a successful broadcast so the next send cannot
+    /// republish the same nullifier before `GetNullifiers` sees it.
+    pub fn mark_note_spent_by_commitment(&self, commitment: &[u8]) -> SqlResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE notes SET spent = 1 WHERE commitment = ?1 AND spent = 0",
+            params![commitment],
+        )?;
+        Ok(rows)
+    }
+
+    /// Mark a note spent by wallet locator (`tx_hash` prefix + output index).
+    pub fn mark_note_spent_by_loc(&self, tx_hash: &str, output_index: u32) -> SqlResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE notes SET spent = 1 WHERE spent = 0 AND output_index = ?1 \
+             AND (tx_hash = ?2 OR tx_hash LIKE ?3)",
+            params![output_index, tx_hash, format!("{tx_hash}%")],
+        )?;
+        Ok(rows)
+    }
+
     /// Rewrite unspent `nullifier` columns as `poseidon(owner_secret, coin)`.
     ///
     /// Older rows were inserted with a missing or stale nullifier, so
@@ -774,6 +795,17 @@ impl WalletDb {
     // Transactions
     // =========================================================================
 
+    /// Promote a mempool (height 0) row once the compact block is scanned.
+    pub fn confirm_transaction(&self, hash: &str, height: u32) -> SqlResult<usize> {
+        if height == 0 {
+            return Ok(0);
+        }
+        self.conn.execute(
+            "UPDATE transactions SET block_height = ?1 WHERE hash = ?2 AND block_height = 0",
+            params![height, hash],
+        )
+    }
+
     /// Insert a transaction record.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_transaction(
@@ -787,8 +819,11 @@ impl WalletDb {
         memo: Option<&str>,
     ) -> SqlResult<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO transactions (hash, block_height, direction, value_raw, token_id, counterparty, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO transactions (hash, block_height, direction, value_raw, token_id, counterparty, memo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(hash) DO UPDATE SET
+               block_height = excluded.block_height
+             WHERE transactions.block_height = 0 AND excluded.block_height > 0",
             params![hash, block_height, direction, value_raw, token_id, counterparty, memo],
         )?;
         Ok(())
@@ -1023,6 +1058,57 @@ mod tests {
     }
 
     #[test]
+    fn test_mark_spent_by_commitment_and_loc() {
+        let db = WalletDb::in_memory().unwrap();
+        let commit_a = [0xAAu8; 32];
+        let commit_b = [0xBBu8; 32];
+        db.insert_note(
+            "aabbccdd1111",
+            0,
+            1000,
+            "DRK",
+            &[1, 2, 3, 4],
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&commit_a),
+            Some(&[1, 2, 3, 4]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.insert_note(
+            "ccddeeff2222",
+            1,
+            500,
+            "DRK",
+            &[5, 6, 7, 8],
+            101,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&commit_b),
+            Some(&[5, 6, 7, 8]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+
+        assert_eq!(db.mark_note_spent_by_commitment(&commit_a).unwrap(), 1);
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 500);
+        assert_eq!(db.mark_note_spent_by_loc("ccddeeff", 1).unwrap(), 1);
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
+        assert_eq!(db.list_unspent().unwrap().len(), 0);
+    }
+
+    #[test]
     fn test_sync_state_update() {
         let db = WalletDb::in_memory().unwrap();
         db.set_sync_height(42).unwrap();
@@ -1238,6 +1324,27 @@ mod tests {
         let remaining = db.list_transactions(100).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].hash, "hash_100");
+    }
+
+    #[test]
+    fn test_insert_transaction_promotes_mempool_height() {
+        let db = WalletDb::in_memory().unwrap();
+        db.insert_transaction("685d3b0f", 0, "outgoing", 1_000_000, "DRK", None, Some("e2e"))
+            .unwrap();
+        db.insert_transaction("685d3b0f", 62369, "incoming", 4_000_000, "DRK", None, None)
+            .unwrap();
+        let tx = db.get_transaction("685d3b0f").unwrap().expect("row");
+        assert_eq!(tx.block_height, 62369);
+        assert_eq!(tx.direction, "outgoing");
+        assert_eq!(tx.memo.as_deref(), Some("e2e"));
+
+        db.insert_transaction("aabbccdd", 0, "outgoing", 1, "DRK", None, None)
+            .unwrap();
+        assert_eq!(db.confirm_transaction("aabbccdd", 61675).unwrap(), 1);
+        assert_eq!(
+            db.get_transaction("aabbccdd").unwrap().unwrap().block_height,
+            61675
+        );
     }
 
     #[test]

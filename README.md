@@ -27,7 +27,7 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 |-------------|--------|
 | **Rust** stable | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` |
-| **Sibling `darkfi-nighthawk-testnet`** | nighthawk24 `nighthawk-testnet` (Arti 0.45 + kvdb), not upstream master |
+| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `327fa9f13` (full `327fa9f134fc756b84be2ce327afaae1cd41a956`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough. You may `ln -s nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet` — that tree is the same pin. |
 | **Sibling `darkfi-lightwalletd`** | Proto from `../darkfi-lightwalletd/proto/lightwallet.proto` |
 | **Running lightwalletd** | Local or remote before `moonshine sync` |
 
@@ -35,14 +35,20 @@ Clone the path dependencies as **sibling directories** (names matter — see `Ca
 
 ```text
 parent/
-  darkfi-nighthawk-testnet/ # nighthawk24/darkfi branch nighthawk-testnet
-  darkfi-lightwalletd/    # gRPC server + proto + UnifOMR crate
-  moonshine/              # this repo
-  # optional client siblings (not required to build moonshine):
-  darkfi-mobile-ffi/      # shared UniFFI crate used by mobile/desktop
-  nighthawk-android-wallet/
-  nighthawk-ios-wallet/
-  nighthawk-desktop/
+  darkfi-nighthawk-testnet/ # MUST be this name — pin 327fa9f13, not darkfi master
+  darkfi-lightwalletd/      # gRPC server + proto + UnifOMR crate
+  moonshine/                # this repo
+  # optional; same pin if you already built Android:
+  nighthawk-android-wallet/third_party/darkfi
+```
+
+Reuse the Android vendored tree (same pin) instead of a second clone:
+
+```bash
+# from the parent/ directory that contains moonshine/
+ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
+# or, if the Android repo is named new-nighthawk-android-wallet:
+# ln -sfn new-nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
 Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
@@ -50,6 +56,7 @@ Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
 ```bash
 # from darkfi-lightwalletd/
 FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
+# See docs/darkfi-pin.md — current SHA 327fa9f134fc756b84be2ce327afaae1cd41a956
 ```
 
 Moonshine’s own pruned wallet remains **SQLCipher** (`PRAGMA key`) by design — it does
@@ -81,9 +88,9 @@ cargo test
 `~/.config/moonshine/config.toml` (created on first run):
 
 ```toml
-server_url = "https://epidermis-sandbox-marshland.ngrok-free.dev"
+server_url = "http://127.0.0.1:9067"
 network = "testnet"
-use_tor = true
+use_tor = false
 ```
 
 ```bash
@@ -194,7 +201,7 @@ moonshine
 - Flow: RegisterCluePublicKey → GetClue → SendTransaction(omr_clue) → GetUnifOmrDigest → FetchPirBatch
 - Empty OMR → **no** supplemental trial (strict UnifOMR); use `sync --force-trial` for miss-safety
 - Send fails closed unless GetClue **ownership proof** verifies (rejects directory decoys)
-- First-run default LWD: nighthawk ngrok HTTPS with **Tor on**; override with `--server` / config for localhost
+- First-run default LWD: loopback `http://127.0.0.1:9067` (Tor off). Remote HTTPS still needs `tls_pin_sha256` + Tor if you want it.
 - Limits: [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md) (Param2 active)
 - MVP fork archive: [`docs/unifomr_mvp_archive.md`](docs/unifomr_mvp_archive.md)
 - Checklist: [`docs/verification-checklist.md`](docs/verification-checklist.md)
@@ -205,12 +212,12 @@ moonshine
 
 | Sibling directory | Role |
 |-------------------|------|
-| `../darkfi-nighthawk-testnet` | DarkFi node / SDK (nighthawk24 pin) |
+| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `327fa9f13` (symlink to Android `third_party/darkfi` is OK) |
 | `../darkfi-lightwalletd` | gRPC lightwalletd + shared UnifOMR |
 | `../darkfi-mobile-ffi` | Shared UniFFI crate (Android / iOS / desktop) |
-| `../nighthawk-android-wallet` | Android wallet |
+| `../new-nighthawk-android-wallet` | Android wallet (`third_party/darkfi` = same pin) |
 | `../nighthawk-ios-wallet` | iOS wallet |
-| `../nighthawk-desktop` | Desktop wallet (Tauri) |
+| `../nighthawk-app-desktop` | Desktop wallet (Tauri) |
 
 ---
 

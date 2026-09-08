@@ -173,6 +173,18 @@ pub fn load_or_create_passphrase(db_path: &str) -> Result<String, String> {
     Ok(pass)
 }
 
+/// Write bytes to a file with mode 0600, replacing any previous contents.
+pub fn write_mode_0600_overwrite(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true).mode(0o600);
+    let mut f = opts.open(path).map_err(|e| e.to_string())?;
+    f.write_all(data).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Write bytes to a new file with mode 0600.
 fn write_mode_0600(path: &str, data: &[u8]) -> Result<(), String> {
     if let Some(parent) = Path::new(path).parent() {
@@ -243,6 +255,23 @@ mod tests {
         let key = test_wrap_key();
         let pt = vec![1u8, 2, 3, 4];
         assert_eq!(unwrap_secret(&pt, &key).unwrap(), pt);
+    }
+
+    #[test]
+    fn overwrite_0600_replaces_and_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "moonshine-last-tx-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last-tx.hex");
+        write_mode_0600_overwrite(&path, b"aaa").unwrap();
+        write_mode_0600_overwrite(&path, b"bbb").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"bbb");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

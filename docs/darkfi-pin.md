@@ -1,6 +1,12 @@
 # DarkFi revision pin (Moonshine)
 
-Moonshine path-depends on sibling `../darkfi-nighthawk-testnet` (nighthawk24 `nighthawk-testnet` branch) and `../darkfi-lightwalletd`.
+Moonshine path-depends on sibling `../darkfi-nighthawk-testnet` (directory name is
+literal) and `../darkfi-lightwalletd`. A checkout named `darkfi` on master will not
+resolve. Reuse the Android pin:
+
+```bash
+ln -sfn new-nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
+```
 
 Do not point at `darkrenaissance/darkfi` master — that tree is Arti 0.42 without the keccak overlay. The nighthawk24 branch is Arti 0.45 + keccak + latest master (kvdb-overlay).
 

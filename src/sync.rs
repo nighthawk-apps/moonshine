@@ -536,7 +536,8 @@ impl SyncEngine {
             if !refreshed {
                 if updated < 3 {
                     eprintln!(
-                        "  trial_decrypt failed {}:{} enc_len={} reason={} keys={}",
+                        "  trial_decrypt failed {}:{} enc_len={} reason={} keys={} \
+                         (keeping stored commitment — do not overwrite from compact coin)",
                         tx_hash,
                         idx,
                         output.encrypted_note.len(),
@@ -547,9 +548,12 @@ impl SyncEngine {
                         self.secret_keys.len()
                     );
                 }
-                self.db.set_note_commitment(tx_hash, *idx, &output.coin)?;
+                // Legacy compact AEAD often fails (enc_len=300). Writing
+                // `output.coin` here desyncs blinds from the leaf and makes
+                // later spends prove a coin the wallet cannot open.
+            } else {
+                updated += 1;
             }
-            updated += 1;
         }
         if missing_block > 0 || missing_tx > 0 {
             eprintln!(
@@ -1032,6 +1036,8 @@ impl SyncEngine {
     ) -> Result<u32, Box<dyn std::error::Error>> {
         let mut notes_found = 0u32;
         for tx in &block.txs {
+            let tx_hash_hex = hex::encode(&tx.tx_hash);
+            let _ = self.db.confirm_transaction(&tx_hash_hex, block.height);
             for (idx, output) in tx.outputs.iter().enumerate() {
                 for secret_key in &self.secret_keys {
                     if let Some(note) = trial_decrypt_note(&output.encrypted_note, secret_key) {
