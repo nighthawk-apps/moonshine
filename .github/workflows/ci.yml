@@ -9,11 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Sibling path in Cargo.toml; pin must match docs/darkfi-pin.md
+  DARKFI_PIN: 327fa9f134fc756b84be2ce327afaae1cd41a956
 
 # Path deps expect siblings:
-#   darkfi/
+#   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not darkrenaissance/darkfi master)
 #   darkfi-lightwalletd/
-#   moonshine/   ← this repo
+#   moonshine/                 ← this repo
 jobs:
   check:
     name: Cargo Check
@@ -26,11 +28,12 @@ jobs:
         with:
           path: moonshine
 
-      - name: Checkout darkfi
+      - name: Checkout darkfi-nighthawk-testnet
         uses: actions/checkout@v4
         with:
-          repository: darkrenaissance/darkfi
-          path: darkfi
+          repository: nighthawk24/darkfi
+          ref: ${{ env.DARKFI_PIN }}
+          path: darkfi-nighthawk-testnet
 
       - name: Checkout darkfi-lightwalletd
         uses: actions/checkout@v4
@@ -68,11 +71,12 @@ jobs:
         with:
           path: moonshine
 
-      - name: Checkout darkfi
+      - name: Checkout darkfi-nighthawk-testnet
         uses: actions/checkout@v4
         with:
-          repository: darkrenaissance/darkfi
-          path: darkfi
+          repository: nighthawk24/darkfi
+          ref: ${{ env.DARKFI_PIN }}
+          path: darkfi-nighthawk-testnet
 
       - name: Checkout darkfi-lightwalletd
         uses: actions/checkout@v4
@@ -125,11 +129,12 @@ jobs:
         with:
           path: moonshine
 
-      - name: Checkout darkfi
+      - name: Checkout darkfi-nighthawk-testnet
         uses: actions/checkout@v4
         with:
-          repository: darkrenaissance/darkfi
-          path: darkfi
+          repository: nighthawk24/darkfi
+          ref: ${{ env.DARKFI_PIN }}
+          path: darkfi-nighthawk-testnet
 
       - name: Checkout darkfi-lightwalletd
         uses: actions/checkout@v4
@@ -169,11 +174,12 @@ jobs:
         with:
           path: moonshine
 
-      - name: Checkout darkfi
+      - name: Checkout darkfi-nighthawk-testnet
         uses: actions/checkout@v4
         with:
-          repository: darkrenaissance/darkfi
-          path: darkfi
+          repository: nighthawk24/darkfi
+          ref: ${{ env.DARKFI_PIN }}
+          path: darkfi-nighthawk-testnet
 
       - name: Checkout darkfi-lightwalletd
         uses: actions/checkout@v4

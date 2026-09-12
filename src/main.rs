@@ -582,12 +582,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         None,
                         config.use_tor,
                     );
-                    engine.rebuild_money_tree_from_genesis().await.map_err(|e| {
-                        format!(
-                            "Merkle rebuild failed: {}",
-                            sync::redact_sync_error(&e.to_string())
-                        )
-                    })?;
+                    engine
+                        .rebuild_money_tree_from_genesis()
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Merkle rebuild failed: {}",
+                                sync::redact_sync_error(&e.to_string())
+                            )
+                        })?;
                 }
 
                 // 2. Fetch local Merkle Tree
@@ -903,11 +906,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 println!("TX hash: {}", tx_hash);
-                println!(
-                    "Explorer: {}/tx/{}",
-                    config.explorer_base_url(),
-                    tx_hash
-                );
+                println!("Explorer: {}/tx/{}", config.explorer_base_url(), tx_hash);
                 println!("Last tx hex: {}", last_tx_path.display());
             }
             TxSubcommand::List => {
@@ -924,8 +923,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                     println!("{}", "-".repeat(90));
                     for tx in &txs {
-                        let drk_amount =
-                            crate::amount::format_drk_atomic(tx.value_raw as u64);
+                        let drk_amount = crate::amount::format_drk_atomic(tx.value_raw as u64);
                         let dir_icon = if tx.direction == "incoming" {
                             "⬇ recv"
                         } else {
@@ -1080,8 +1078,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 });
                 let hex_str = std::fs::read_to_string(&path)
                     .map_err(|e| format!("read {}: {e}", path.display()))?;
-                let raw = hex::decode(hex_str.trim())
-                    .map_err(|e| format!("hex decode: {e}"))?;
+                let raw = hex::decode(hex_str.trim()).map_err(|e| format!("hex decode: {e}"))?;
                 inspect_serialized_tx(&raw)?;
                 if verify {
                     verify_serialized_tx(&raw, &config).await?;
@@ -1200,9 +1197,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if rebuild_merkle {
                 // Do not recompute commitments from (possibly stale) attributes
                 // before restore — that overwrites on-chain `output.coin`.
-                println!(
-                    "Restoring on-chain coins + blinds, then rebuilding Money Merkle tree..."
-                );
+                println!("Restoring on-chain coins + blinds, then rebuilding Money Merkle tree...");
             }
 
             let engine = sync::SyncEngine::new(
@@ -1218,9 +1213,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
 
             if rebuild_merkle {
-                println!(
-                    "Rebuilding Money Merkle tree from LWD GetNoteCommitments (0..=tip)..."
-                );
+                println!("Rebuilding Money Merkle tree from LWD GetNoteCommitments (0..=tip)...");
                 match engine.rebuild_money_tree_from_genesis().await {
                     Ok((appended, marked, tip)) => {
                         println!(
@@ -1367,8 +1360,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         else {
                             continue;
                         };
-                        let Ok(user_data) =
-                            pallas::Base::decode(&mut std::io::Cursor::new(udata))
+                        let Ok(user_data) = pallas::Base::decode(&mut std::io::Cursor::new(udata))
                         else {
                             continue;
                         };
@@ -1378,8 +1370,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         } else if !hook.is_empty() {
                             hook_bytes[0] = hook[0];
                         }
-                        let Ok(spend_hook) =
-                            darkfi_sdk::crypto::FuncId::from_bytes(hook_bytes)
+                        let Ok(spend_hook) = darkfi_sdk::crypto::FuncId::from_bytes(hook_bytes)
                         else {
                             continue;
                         };
@@ -1429,25 +1420,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     match w.db.list_owned_commitments() {
                         Ok(cs) => {
                             let lens: Vec<usize> = cs.iter().map(|c| c.len()).take(8).collect();
-                            println!(
-                                "  Commitments:     {} (sample lens {:?})",
-                                cs.len(),
-                                lens
-                            );
+                            println!("  Commitments:     {} (sample lens {:?})", cs.len(), lens);
                             if let Some(c) = cs.first() {
                                 println!("  First coin hex:  {}", hex::encode(c));
                             }
                         }
                         Err(e) => println!("  Commitments:     ERROR ({e})"),
                     }
-                    match (
-                        w.db.get_meta("tree_state"),
-                        w.db.list_unspent_full(),
-                    ) {
+                    match (w.db.get_meta("tree_state"), w.db.list_unspent_full()) {
                         (Ok(Some(tree_bytes)), Ok(rows)) => {
-                            match darkfi_serial::Decodable::decode(
-                                &mut std::io::Cursor::new(&tree_bytes),
-                            ) {
+                            match darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(
+                                &tree_bytes,
+                            )) {
                                 Ok(tree) => {
                                     let tree: darkfi_sdk::crypto::MerkleTree = tree;
                                     let tip = tree.root(0).map(|r| hex::encode(r.to_bytes()));
@@ -1480,9 +1464,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                             Ok(_) => ok += 1,
                                             Err(e) => {
                                                 bad += 1;
-                                                eprintln!(
-                                                    "  Merkle witness leaf {lpos}: {e}"
-                                                );
+                                                eprintln!("  Merkle witness leaf {lpos}: {e}");
                                             }
                                         }
                                     }
@@ -1677,10 +1659,7 @@ fn inspect_serialized_tx(raw: &[u8]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn verify_serialized_tx(
-    raw: &[u8],
-    config: &config::Config,
-) -> Result<(), Box<dyn Error>> {
+async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(), Box<dyn Error>> {
     use darkfi::tx::Transaction;
     use darkfi::zk::{proof::VerifyingKey, vm::ZkCircuit, vm_heap::empty_witnesses};
     use darkfi::zkas::ZkBinary;
@@ -1697,8 +1676,9 @@ async fn verify_serialized_tx(
     let tx: Transaction = Decodable::decode(&mut std::io::Cursor::new(raw))?;
     println!("\nVerifying ZK proofs and signatures (lightwalletd zkas)...");
 
-    let mut client = client::LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
-        .with_tor(config.use_tor);
+    let mut client =
+        client::LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+            .with_tor(config.use_tor);
     let zkas = client
         .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
         .await?
@@ -1737,8 +1717,8 @@ async fn verify_serialized_tx(
             sig_table.push(vec![]);
             continue;
         }
-        let func = MoneyFunction::try_from(call.data.data[0])
-            .map_err(|_| "unknown money function")?;
+        let func =
+            MoneyFunction::try_from(call.data.data[0]).map_err(|_| "unknown money function")?;
         let spend_hook = match call.parent_index {
             Some(_) => {
                 return Err("inspect verify does not yet handle parent spend_hook".into());
@@ -1786,8 +1766,14 @@ async fn verify_serialized_tx(
             }
             MoneyFunction::FeeV1 => {
                 let params: MoneyFeeParamsV1 = deserialize(&call.data.data[9..])?;
-                let input_value_coords = params.input.value_commit.to_affine().coordinates().unwrap();
-                let output_value_coords = params.output.value_commit.to_affine().coordinates().unwrap();
+                let input_value_coords =
+                    params.input.value_commit.to_affine().coordinates().unwrap();
+                let output_value_coords = params
+                    .output
+                    .value_commit
+                    .to_affine()
+                    .coordinates()
+                    .unwrap();
                 let (sig_x, sig_y) = params.input.signature_public.xy();
                 zkp_table.push(vec![(
                     MONEY_CONTRACT_ZKAS_FEE_NS_V1.to_string(),
@@ -1862,8 +1848,7 @@ async fn verify_serialized_tx(
                 let native = poseidon_hash([DARK_TOKEN_ID.inner(), params.token_blind.inner()]);
                 println!(
                     "  fee[{i}] native token_commit match: {}",
-                    params.input.token_commit == native
-                        && params.output.token_commit == native
+                    params.input.token_commit == native && params.output.token_commit == native
                 );
                 let mut acc = params.input.value_commit;
                 acc -= params.output.value_commit;
@@ -1877,7 +1862,10 @@ async fn verify_serialized_tx(
         }
     }
 
-    println!("  scanning LWD nullifiers for {} input(s)...", nf_watch.len());
+    println!(
+        "  scanning LWD nullifiers for {} input(s)...",
+        nf_watch.len()
+    );
     let tip = client.get_chain_tip().await?.height;
     let mut start = 0u32;
     let mut seen = 0u32;

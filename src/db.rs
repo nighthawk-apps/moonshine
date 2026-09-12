@@ -150,6 +150,7 @@ impl WalletDb {
     /// makes spend proofs use a Merkle root that is not on chain (Money 0x5).
     ///
     /// Returns `(checked, updated)`.
+    #[allow(dead_code)]
     pub fn recompute_note_commitments(&self) -> SqlResult<(u32, u32)> {
         use darkfi_money_contract::model::{CoinAttributes, TokenId};
         use darkfi_sdk::crypto::{FuncId, PublicKey, SecretKey};
@@ -295,6 +296,7 @@ impl WalletDb {
     }
 
     /// Overwrite a note's on-chain coin commitment (clears leaf_position).
+    #[allow(dead_code)]
     pub fn set_note_commitment(
         &self,
         tx_hash: &str,
@@ -659,6 +661,7 @@ impl WalletDb {
     }
 
     /// Mark a note spent by wallet locator (`tx_hash` prefix + output index).
+    #[allow(dead_code)]
     pub fn mark_note_spent_by_loc(&self, tx_hash: &str, output_index: u32) -> SqlResult<usize> {
         let rows = self.conn.execute(
             "UPDATE notes SET spent = 1 WHERE spent = 0 AND output_index = ?1 \
@@ -1353,8 +1356,16 @@ mod tests {
     #[test]
     fn test_insert_transaction_promotes_mempool_height() {
         let db = WalletDb::in_memory().unwrap();
-        db.insert_transaction("685d3b0f", 0, "outgoing", 1_000_000, "DRK", None, Some("e2e"))
-            .unwrap();
+        db.insert_transaction(
+            "685d3b0f",
+            0,
+            "outgoing",
+            1_000_000,
+            "DRK",
+            None,
+            Some("e2e"),
+        )
+        .unwrap();
         db.insert_transaction("685d3b0f", 62369, "incoming", 4_000_000, "DRK", None, None)
             .unwrap();
         let tx = db.get_transaction("685d3b0f").unwrap().expect("row");
@@ -1366,7 +1377,10 @@ mod tests {
             .unwrap();
         assert_eq!(db.confirm_transaction("aabbccdd", 61675).unwrap(), 1);
         assert_eq!(
-            db.get_transaction("aabbccdd").unwrap().unwrap().block_height,
+            db.get_transaction("aabbccdd")
+                .unwrap()
+                .unwrap()
+                .block_height,
             61675
         );
     }

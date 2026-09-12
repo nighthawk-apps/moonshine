@@ -383,7 +383,7 @@ mod tests {
         let word_count = phrase.split_whitespace().count();
         // DarkFi mnemonics are 21 or 22 words (depends on entropy)
         assert!(
-            word_count >= 21 && word_count <= 22,
+            (21..=22).contains(&word_count),
             "Expected 21-22 words, got {word_count}"
         );
     }

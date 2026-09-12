@@ -172,12 +172,13 @@ pub async fn build_transaction(
 
     let mut spendable = Vec::with_capacity(all_coins.len());
     for coin in all_coins {
-        match assert_witness_at_tip(&tree, MerkleNode::from(coin.coin.inner()), coin.leaf_position)
-        {
+        match assert_witness_at_tip(
+            &tree,
+            MerkleNode::from(coin.coin.inner()),
+            coin.leaf_position,
+        ) {
             Ok(_) => spendable.push(coin),
-            Err(e) => eprintln!(
-                "Skipping coin not authenticated to the current Money tree: {e}"
-            ),
+            Err(e) => eprintln!("Skipping coin not authenticated to the current Money tree: {e}"),
         }
     }
     if spendable.is_empty() {
@@ -211,10 +212,8 @@ pub async fn build_transaction(
     )?;
     let _ = payment_memo; // retained in local tx history by caller when present
 
-    let mut spent_commitments: Vec<Vec<u8>> =
-        spent_coins.iter().map(own_coin_commitment).collect();
-    let mut spent_nullifiers: Vec<Vec<u8>> =
-        spent_coins.iter().map(own_coin_nullifier).collect();
+    let mut spent_commitments: Vec<Vec<u8>> = spent_coins.iter().map(own_coin_commitment).collect();
+    let mut spent_nullifiers: Vec<Vec<u8>> = spent_coins.iter().map(own_coin_nullifier).collect();
 
     struct FeeSrc {
         coin: OwnCoin,
@@ -224,9 +223,9 @@ pub async fn build_transaction(
     }
 
     let fee_src = if fee > 0 {
-        let leftover = fee_candidates.iter().find(|c| {
-            !spent_coins.iter().any(|sc| sc.coin == c.coin) && c.note.value >= fee
-        });
+        let leftover = fee_candidates
+            .iter()
+            .find(|c| !spent_coins.iter().any(|sc| sc.coin == c.coin) && c.note.value >= fee);
         if let Some(c) = leftover {
             let merkle_path = tree
                 .witness(c.leaf_position, 0)
@@ -269,9 +268,7 @@ pub async fn build_transaction(
                 }
                 output.tx_local = true;
                 local_tree.append(MerkleNode::from(output.coin.inner()));
-                let leaf_position = local_tree
-                    .mark()
-                    .ok_or("tx-local merkle mark failed")?;
+                let leaf_position = local_tree.mark().ok_or("tx-local merkle mark failed")?;
                 let coin = OwnCoin {
                     coin: output.coin,
                     note,

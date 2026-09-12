@@ -185,7 +185,7 @@ impl BlockCache {
     /// Check if a contiguous range [start, end] is fully cached.
     #[cfg(test)]
     pub fn is_range_cached(&self, start: u32, end: u32) -> SqlResult<bool> {
-        let expected = (end - start + 1) as u32;
+        let expected = end - start + 1;
         let mut stmt = self
             .conn
             .prepare("SELECT COUNT(*) FROM compact_blocks WHERE height >= ?1 AND height <= ?2")?;

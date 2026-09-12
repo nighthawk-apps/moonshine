@@ -84,6 +84,7 @@ fn genesis_money_tree() -> MerkleTree {
 
 /// Canonical checkpoint digest: blake3(height LE || tree_data || nullifier_index).
 /// Must stay lockstep with darkfi-mobile-ffi and darkfi-lightwalletd.
+#[allow(dead_code)]
 pub fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&height.to_le_bytes());
@@ -334,8 +335,7 @@ impl SyncEngine {
         //    Trial decrypt has already inserted owned coins so they can be marked.
         //    Pre-birthday heights are backfilled first; never append birthday..tip
         //    onto a dummy-only tree (that is Money Custom(5) on spend).
-        self.ensure_genesis_merkle(&mut client, scan_start)
-            .await?;
+        self.ensure_genesis_merkle(&mut client, scan_start).await?;
         self.apply_note_commitments(&mut client, scan_start, scan_end)
             .await?;
         if scan_start == 0 {
@@ -530,9 +530,9 @@ impl SyncEngine {
                 if blocks.iter().any(|x| x.height == b.height) {
                     if self.secret_keys.iter().any(|sk| {
                         b.txs.iter().any(|t| {
-                            t.outputs.iter().any(|o| {
-                                trial_decrypt_note(&o.encrypted_note, sk).is_some()
-                            })
+                            t.outputs
+                                .iter()
+                                .any(|o| trial_decrypt_note(&o.encrypted_note, sk).is_some())
                         })
                     }) {
                         blocks.retain(|x| x.height != b.height);
@@ -591,7 +591,10 @@ impl SyncEngine {
                 missing_block += 1;
                 continue;
             };
-            let tx = block.txs.iter().find(|t| hex::encode(&t.tx_hash) == *tx_hash);
+            let tx = block
+                .txs
+                .iter()
+                .find(|t| hex::encode(&t.tx_hash) == *tx_hash);
             let Some(tx) = tx else {
                 missing_tx += 1;
                 continue;
@@ -615,7 +618,10 @@ impl SyncEngine {
                             "  decrypt coin mismatch at {}:{} derived={} chain={}",
                             tx_hash,
                             idx,
-                            derived.as_ref().map(hex::encode).unwrap_or_else(|| "-".into()),
+                            derived
+                                .as_ref()
+                                .map(hex::encode)
+                                .unwrap_or_else(|| "-".into()),
                             hex::encode(&output.coin)
                         );
                     }
@@ -647,7 +653,10 @@ impl SyncEngine {
                         output.encrypted_note.len(),
                         trial_decrypt_fail_reason(
                             &output.encrypted_note,
-                            self.secret_keys.first().map(|s| s.as_slice()).unwrap_or(&[])
+                            self.secret_keys
+                                .first()
+                                .map(|s| s.as_slice())
+                                .unwrap_or(&[])
                         ),
                         self.secret_keys.len()
                     );
@@ -664,7 +673,9 @@ impl SyncEngine {
                 "  restore gaps: missing_block={missing_block} missing_tx_or_output={missing_tx}"
             );
         }
-        eprintln!("  re-decrypted MoneyNote fields matching on-chain coin for {decrypted}/{n} notes");
+        eprintln!(
+            "  re-decrypted MoneyNote fields matching on-chain coin for {decrypted}/{n} notes"
+        );
         Ok((n, updated))
     }
 
@@ -712,10 +723,7 @@ impl SyncEngine {
                     arr.copy_from_slice(c);
                     Some(arr)
                 } else {
-                    eprintln!(
-                        "  skip owned commitment with len {} (want 32)",
-                        c.len()
-                    );
+                    eprintln!("  skip owned commitment with len {} (want 32)", c.len());
                     None
                 }
             })
@@ -766,16 +774,17 @@ impl SyncEngine {
                     }
                 }
             }
-            eprintln!(
-                "  merkle rebuild {end}/{tip} (appended {appended}, marked {marked})"
-            );
+            eprintln!("  merkle rebuild {end}/{tip} (appended {appended}, marked {marked})");
             start = end.saturating_add(1);
             if start == 0 {
                 break;
             }
         }
 
-        let hits = owned_commitments.iter().filter(|c| seen.contains(*c)).count();
+        let hits = owned_commitments
+            .iter()
+            .filter(|c| seen.contains(*c))
+            .count();
         eprintln!(
             "  owned coins found in chain stream: {hits}/{}",
             owned_commitments.len()
@@ -791,16 +800,19 @@ impl SyncEngine {
 
         match client.get_tree_state(tip).await {
             Ok(st) => {
-                let server_tree: MerkleTree = darkfi_serial::Decodable::decode(
-                    &mut std::io::Cursor::new(st.tree_data),
-                )
-                .map_err(|e| format!("Failed to decode LWD GetTreeState: {e}"))?;
+                let server_tree: MerkleTree =
+                    darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(st.tree_data))
+                        .map_err(|e| format!("Failed to decode LWD GetTreeState: {e}"))?;
                 let local_root = tree.root(0);
                 let server_root = server_tree.root(0);
                 eprintln!(
                     "  merkle roots tip={tip} local={} lwd={} darkfid_hint=compare-last_coins_root",
-                    local_root.map(|r| hex::encode(r.to_bytes())).unwrap_or_else(|| "-".into()),
-                    server_root.map(|r| hex::encode(r.to_bytes())).unwrap_or_else(|| "-".into()),
+                    local_root
+                        .map(|r| hex::encode(r.to_bytes()))
+                        .unwrap_or_else(|| "-".into()),
+                    server_root
+                        .map(|r| hex::encode(r.to_bytes()))
+                        .unwrap_or_else(|| "-".into()),
                 );
                 if local_root != server_root {
                     return Err(format!(
@@ -881,6 +893,7 @@ impl SyncEngine {
     /// Note: primary marking now happens inline in `apply_note_commitments`.
     /// This method is called as a safety net for coins discovered in the current
     /// sync batch (which weren't in the DB yet when the tree was built).
+    #[allow(dead_code)]
     fn mark_owned_positions(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Reload tree and rebuild with marks for newly discovered coins.
         // We re-run apply_note_commitments conceptually, but since the tree is
@@ -1349,15 +1362,16 @@ impl SyncEngine {
                     if let Some(&end_h) = slot_heights.iter().max() {
                         covered_end = Some(covered_end.map_or(end_h, |c: u32| c.min(end_h)));
                     } else {
-                        return Err(
-                            "UnifOMR digest truncated with empty slot_heights; \
+                        return Err("UnifOMR digest truncated with empty slot_heights; \
                              refusing to skip the uncovered tail"
-                                .into(),
-                        );
+                            .into());
                     }
                 }
-                let chunk_heights =
-                    decrypt_unif_omr_heights(&chunk_clients, &digest.encrypted_digest, &slot_heights)?;
+                let chunk_heights = decrypt_unif_omr_heights(
+                    &chunk_clients,
+                    &digest.encrypted_digest,
+                    &slot_heights,
+                )?;
                 heights.extend(chunk_heights);
                 chunk_clients.clear();
                 chunk_bytes = 0;
@@ -1513,9 +1527,7 @@ impl darkfi_serial::Decodable for RemainingBytes {
     }
 }
 
-fn aead_note_candidates(
-    encrypted_note: &[u8],
-) -> Vec<darkfi_sdk::crypto::note::AeadEncryptedNote> {
+fn aead_note_candidates(encrypted_note: &[u8]) -> Vec<darkfi_sdk::crypto::note::AeadEncryptedNote> {
     use darkfi_sdk::crypto::note::AeadEncryptedNote;
     use darkfi_sdk::crypto::PublicKey;
     use darkfi_serial::Decodable;
@@ -1750,6 +1762,7 @@ pub fn ensure_chain_matches_network(
     }
 }
 
+#[allow(dead_code)]
 pub fn compute_supplemental_heights(
     scan_start: u32,
     scan_end: u32,
@@ -1929,6 +1942,8 @@ mod tests {
         hasher.update(tree);
         hasher.update(nfs);
         assert_eq!(a, *hasher.finalize().as_bytes());
-        assert!(snapshot_integrity_hash(height, tree, b"").as_slice() != blake3::hash(tree).as_bytes());
+        assert!(
+            snapshot_integrity_hash(height, tree, b"").as_slice() != blake3::hash(tree).as_bytes()
+        );
     }
 }

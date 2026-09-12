@@ -260,10 +260,8 @@ mod tests {
     #[test]
     fn overwrite_0600_replaces_and_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "moonshine-last-tx-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("moonshine-last-tx-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("last-tx.hex");
         write_mode_0600_overwrite(&path, b"aaa").unwrap();

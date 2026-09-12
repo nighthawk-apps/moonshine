@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tonic::transport::Channel;
 
 pub mod proto {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("darkfi.lightwallet");
 }
 
@@ -40,11 +41,17 @@ const GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 fn host_is_loopback(server_url: &str) -> bool {
     let rest = server_url.split("://").nth(1).unwrap_or(server_url);
     let authority = rest.split('/').next().unwrap_or(rest);
-    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
     let host = if let Some(inside) = hostport.strip_prefix('[') {
         inside.split(']').next().unwrap_or(inside)
     } else {
-        hostport.rsplit_once(':').map(|(h, _)| h).unwrap_or(hostport)
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(hostport)
     };
     matches!(host, "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1")
         || host.eq_ignore_ascii_case("localhost")
@@ -357,6 +364,7 @@ impl LightwalletClient {
     }
 
     /// Stream checkpoint snapshot chunks from lightwalletd for instant restore.
+    #[allow(dead_code)]
     pub async fn get_checkpoint_snapshot(
         &mut self,
         preferred_height: u32,

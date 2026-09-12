@@ -677,7 +677,10 @@ mod tests {
         cache.insert(a); // update must not refresh FIFO position
         cache.insert(c);
         assert_eq!(cache.len(), 2);
-        assert!(!cache.contains(&a), "oldest insert was a, even after update");
+        assert!(
+            !cache.contains(&a),
+            "oldest insert was a, even after update"
+        );
         assert!(cache.contains(&b));
         assert!(cache.contains(&c));
     }
