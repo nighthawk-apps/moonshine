@@ -455,6 +455,28 @@ impl WalletDb {
     // Wallet Metadata
     // =========================================================================
 
+    /// Set when the Money Merkle tree includes height-0 coins after the dummy
+    /// ZERO leaf. Birthday rescan used to append only post-birthday coins onto
+    /// a fresh dummy tree, so spend proofs published a root the contract never
+    /// stored (Money `Custom(5)` / `TransferMerkleRootNotFound`).
+    const META_MERKLE_FROM_GENESIS: &'static str = "merkle_from_genesis";
+
+    pub fn merkle_from_genesis(&self) -> bool {
+        matches!(self.get_meta(Self::META_MERKLE_FROM_GENESIS), Ok(Some(v)) if v == b"1")
+    }
+
+    pub fn set_merkle_from_genesis(&self, complete: bool) -> SqlResult<()> {
+        if complete {
+            self.set_meta(Self::META_MERKLE_FROM_GENESIS, b"1")
+        } else {
+            self.conn.execute(
+                "DELETE FROM wallet_meta WHERE key = ?1",
+                params![Self::META_MERKLE_FROM_GENESIS],
+            )?;
+            Ok(())
+        }
+    }
+
     /// Store a key-value pair in wallet metadata.
     pub fn set_meta(&self, key: &str, value: &[u8]) -> SqlResult<()> {
         self.conn.execute(
@@ -717,8 +739,10 @@ impl WalletDb {
     pub fn reset_for_rescan(&self, height: u32) -> SqlResult<()> {
         self.conn.execute("DELETE FROM notes", [])?;
         self.conn.execute("DELETE FROM transactions", [])?;
-        self.conn
-            .execute("DELETE FROM wallet_meta WHERE key = 'tree_state'", [])?;
+        self.conn.execute(
+            "DELETE FROM wallet_meta WHERE key = 'tree_state' OR key = ?1",
+            params![Self::META_MERKLE_FROM_GENESIS],
+        )?;
         self.set_sync_height(height)?;
         Ok(())
     }
@@ -1379,8 +1403,21 @@ mod tests {
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
         assert!(db.list_transactions(100).unwrap().is_empty());
         assert_eq!(db.get_meta("tree_state").unwrap(), None);
+        assert!(!db.merkle_from_genesis());
         let (h, _) = db.get_sync_state().unwrap();
         assert_eq!(h, 0);
+    }
+
+    #[test]
+    fn test_merkle_from_genesis_flag_roundtrip() {
+        let db = WalletDb::in_memory().unwrap();
+        assert!(!db.merkle_from_genesis());
+        db.set_merkle_from_genesis(true).unwrap();
+        assert!(db.merkle_from_genesis());
+        db.set_meta("tree_state", &[0xFF; 8]).unwrap();
+        db.reset_for_rescan(52999).unwrap();
+        assert!(!db.merkle_from_genesis());
+        assert_eq!(db.get_meta("tree_state").unwrap(), None);
     }
 
     #[test]

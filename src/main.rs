@@ -101,7 +101,8 @@ enum Command {
         )]
         strict_omr: bool,
         /// Rebuild the Money Merkle tree from LWD `GetNoteCommitments` (height 0..=tip).
-        /// Required before spend if the wallet birthday skipped earlier commitments.
+        /// Sync/spend also do this automatically when a birthday rescan skipped
+        /// earlier commitments (Money Custom(5) / TransferMerkleRootNotFound).
         #[arg(long)]
         rebuild_merkle: bool,
     },
@@ -190,6 +191,12 @@ enum TxSubcommand {
         /// Split the recipient output into two equal coins (value + fee reserve).
         #[arg(long)]
         half_split: bool,
+        /// Omit UnifOMR clue so the recipient must trial-decrypt (normal note).
+        #[arg(long)]
+        no_omr: bool,
+        /// Build and reserve inputs but do not broadcast (hex for `tx broadcast`).
+        #[arg(long)]
+        no_broadcast: bool,
     },
     List,
     Show {
@@ -377,6 +384,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 memo,
                 fee,
                 half_split,
+                no_omr,
+                no_broadcast,
             } => {
                 let w = wallet::Wallet::open(&args.wallet_name)?;
 
@@ -444,14 +453,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                 let change = input_total - total_needed;
 
-                // UnifOMR only: clue from directory PK (GetCluePublicKey → build_omr_clue_from_pk).
+                // UnifOMR clue from directory PK (GetCluePublicKey → build_omr_clue_from_pk).
+                // `--no-omr` skips the clue so the recipient discovers via trial decrypt.
                 let mut recipient_pk = [0u8; 32];
                 recipient_pk.copy_from_slice(&to_bytes);
 
-                // Strict UnifOMR: fail closed unless GetClue ownership verifies
-                // (decoys look like valid PKs without this check).
                 let network_byte = wallet::Wallet::network_byte(&config.network);
-                let omr_clue = {
+                let omr_clue = if no_omr {
+                    println!("Sending without UnifOMR clue (recipient must trial-decrypt).");
+                    Vec::new()
+                } else {
+                    // Strict UnifOMR: fail closed unless GetClue ownership verifies
+                    // (decoys look like valid PKs without this check).
                     let mut lookup = crate::client::LightwalletClient::new(
                         &config.server_url,
                         config.tls_pin_sha256.clone(),
@@ -480,9 +493,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     "Error: UnifOMR clue rejected ({e}). \
                                      Recipient may be unregistered — moonshine \
                                      is strict UnifOMR (no trial-decrypt send). \
-                                     Ask the recipient to register, or they can \
-                                     `moonshine sync --force-trial` after a \
-                                     clearnet send from another wallet."
+                                     Ask the recipient to register, use \
+                                     `tx send --no-omr`, or they can \
+                                     `moonshine sync --force-trial`."
                                 );
                                 return Ok(());
                             }
@@ -526,7 +539,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         &m[..m.len().min(32)]
                     );
                 }
-                println!("║  OMR:     UnifOMR (0x05) ✓                    ║");
+                if no_omr {
+                    println!("║  OMR:     none (trial-decrypt receive)        ║");
+                } else {
+                    println!("║  OMR:     UnifOMR (0x05) ✓                    ║");
+                }
                 println!("╠════════════════════════════════════════════════╣");
                 println!("╚════════════════════════════════════════════════╝");
 
@@ -543,6 +560,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
                     .await?
                     .bincodes;
+
+                // Birthday rescan used to build a dummy-leaf + post-birthday tree whose
+                // root is not in the contract's coin_roots (Money Custom(5)). Rebuild
+                // before proving if this wallet never recorded a genesis-complete tree.
+                if !w.db.merkle_from_genesis() {
+                    println!(
+                        "Money Merkle tree is missing pre-birthday leaves; \
+                         rebuilding from genesis so the spend root is on-chain..."
+                    );
+                    let w_rebuild = wallet::Wallet::open(&args.wallet_name)?;
+                    let secret_keys = w_rebuild.db.get_all_secrets()?;
+                    let engine = sync::SyncEngine::new(
+                        w_rebuild.db,
+                        &config.server_url,
+                        secret_keys,
+                        config.tls_pin_sha256.clone(),
+                        network_byte,
+                        false,
+                        true,
+                        None,
+                        config.use_tor,
+                    );
+                    engine.rebuild_money_tree_from_genesis().await.map_err(|e| {
+                        format!(
+                            "Merkle rebuild failed: {}",
+                            sync::redact_sync_error(&e.to_string())
+                        )
+                    })?;
+                }
 
                 // 2. Fetch local Merkle Tree
                 let tree_bytes =
@@ -707,7 +753,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .map_err(|e| format!("Invalid wallet secret: {e:?}"))?;
 
                 // Build OMR metadata (plaintext) and encrypt for the recipient.
-                let omr_metadata_enc = {
+                let omr_metadata_enc = if no_omr {
+                    Vec::new()
+                } else {
                     use darkfi_sdk::crypto::pasta_prelude::PrimeField;
                     let secret_bytes: [u8; 32] = wallet_secret.inner().to_repr();
                     let recipient_pk_bytes = recipient_pubkey.to_bytes();
@@ -752,8 +800,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("\n✅ ZK Transaction Generated!");
                 println!("TX size: {} bytes", tx_data.len());
 
-                // Auto-broadcast via lightwalletd
-                println!("\nBroadcasting transaction...");
                 if omr_clue.is_empty() {
                     println!("(No OMR clue — recipient will trial-decrypt)");
                 } else {
@@ -763,65 +809,82 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
 
-                let mut broadcast_client = crate::client::LightwalletClient::new(
-                    &config.server_url,
-                    config.tls_pin_sha256.clone(),
-                )
-                .with_tor(config.use_tor);
-                match broadcast_client
-                    .send_transaction(tx_data.clone(), omr_clue.clone(), omr_metadata_enc)
-                    .await
-                {
-                    Ok(resp) => {
-                        if !resp.error.is_empty() && resp.error != "0" {
+                if no_broadcast {
+                    let mut marked = 0usize;
+                    for nf in &built.spent_nullifiers {
+                        marked += w.db.mark_note_spent(nf).unwrap_or(0);
+                    }
+                    for commit in &built.spent_commitments {
+                        marked += w.db.mark_note_spent_by_commitment(commit).unwrap_or(0);
+                    }
+                    println!("Skipping broadcast (--no-broadcast).");
+                    println!(
+                        "Reserved {marked} local note update(s); hex at {}",
+                        last_tx_path.display()
+                    );
+                } else {
+                    // Auto-broadcast via lightwalletd
+                    println!("\nBroadcasting transaction...");
+                    let mut broadcast_client = crate::client::LightwalletClient::new(
+                        &config.server_url,
+                        config.tls_pin_sha256.clone(),
+                    )
+                    .with_tor(config.use_tor);
+                    match broadcast_client
+                        .send_transaction(tx_data.clone(), omr_clue.clone(), omr_metadata_enc)
+                        .await
+                    {
+                        Ok(resp) => {
+                            if !resp.error.is_empty() && resp.error != "0" {
+                                eprintln!("TX hex written to {}", last_tx_path.display());
+                                return Err(format!(
+                                    "lightwalletd SendTransaction error: {}. \
+                                     Refusing manual/darkfid fallback so the UnifOMR clue hint stays live.",
+                                    resp.error
+                                )
+                                .into());
+                            }
+                            if !omr_clue.is_empty() && !resp.clue_accepted {
+                                eprintln!("TX hex written to {}", last_tx_path.display());
+                                return Err(
+                                    "lightwalletd accepted the tx but rejected the UnifOMR clue \
+                                     (clue_accepted=false). Refusing to treat this as success."
+                                        .into(),
+                                );
+                            }
+                            println!("✅ Transaction broadcast successfully via lightwalletd!");
+                            if resp.clue_accepted {
+                                println!(
+                                    "UnifOMR clue hint stored (24h TTL) — confirm while LWD indexes."
+                                );
+                            }
+                            let mut marked = 0usize;
+                            for nf in &built.spent_nullifiers {
+                                marked += w.db.mark_note_spent(nf).unwrap_or(0);
+                            }
+                            for commit in &built.spent_commitments {
+                                marked += w.db.mark_note_spent_by_commitment(commit).unwrap_or(0);
+                            }
+                            if marked == 0 {
+                                eprintln!(
+                                    "Warning: broadcast OK but no local notes marked spent — \
+                                     refuse a second send until sync marks nullifiers."
+                                );
+                            } else {
+                                println!(
+                                    "Reserved {marked} local note update(s) so the next send cannot double-spend."
+                                );
+                            }
+                        }
+                        Err(e) => {
                             eprintln!("TX hex written to {}", last_tx_path.display());
                             return Err(format!(
-                                "lightwalletd SendTransaction error: {}. \
-                                 Refusing manual/darkfid fallback so the UnifOMR clue hint stays live.",
-                                resp.error
+                                "Broadcast via lightwalletd failed: {}. \
+                                 UnifOMR requires SendTransaction so the clue hint is stored (24h TTL).",
+                                sync::redact_sync_error(&e.to_string())
                             )
                             .into());
                         }
-                        if !omr_clue.is_empty() && !resp.clue_accepted {
-                            eprintln!("TX hex written to {}", last_tx_path.display());
-                            return Err(
-                                "lightwalletd accepted the tx but rejected the UnifOMR clue \
-                                 (clue_accepted=false). Refusing to treat this as success."
-                                    .into(),
-                            );
-                        }
-                        println!("✅ Transaction broadcast successfully via lightwalletd!");
-                        if resp.clue_accepted {
-                            println!(
-                                "UnifOMR clue hint stored (24h TTL) — confirm while LWD indexes."
-                            );
-                        }
-                        let mut marked = 0usize;
-                        for nf in &built.spent_nullifiers {
-                            marked += w.db.mark_note_spent(nf).unwrap_or(0);
-                        }
-                        for commit in &built.spent_commitments {
-                            marked += w.db.mark_note_spent_by_commitment(commit).unwrap_or(0);
-                        }
-                        if marked == 0 {
-                            eprintln!(
-                                "Warning: broadcast OK but no local notes marked spent — \
-                                 refuse a second send until sync marks nullifiers."
-                            );
-                        } else {
-                            println!(
-                                "Reserved {marked} local note update(s) so the next send cannot double-spend."
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("TX hex written to {}", last_tx_path.display());
-                        return Err(format!(
-                            "Broadcast via lightwalletd failed: {}. \
-                             UnifOMR requires SendTransaction so the clue hint is stored (24h TTL).",
-                            sync::redact_sync_error(&e.to_string())
-                        )
-                        .into());
                     }
                 }
 
@@ -1216,7 +1279,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let floor = birthday.saturating_sub(1);
             w.db.reset_for_rescan(floor)?;
             println!(
-                "Wallet state cleared and sync reset to birthday height {}. Run `moonshine sync` to rescan.",
+                "Wallet state cleared and sync reset to birthday height {}. \
+                 Run `moonshine sync` to rescan notes and backfill the Money Merkle \
+                 tree from genesis (required for spends).",
                 birthday
             );
         }

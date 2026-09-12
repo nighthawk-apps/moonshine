@@ -2,7 +2,7 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC and syncs with **UnifOMR only** (scheme `0x05`). There is no PerfOMR fallback.
 
-**3.00.007:** decimal send amounts, spent-note marking after broadcast, sibling `darkfi-nighthawk-testnet` pin. Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.00.008** (crate semver **3.0.8** — leading zeros are not valid Cargo versions): FIFO-capped clue-registration session cache (10,000 ids; updates do not refresh eviction order). Reorg recovery reports real SQLite `execute` rowcounts for notes and transactions (`invalidate_above_height`). Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
 > **Strict UnifOMR (hard-coded):** Moonshine does **not** run supplemental / gap trial decrypt. **Only** transactions that carry UnifOMR clues are discovered during normal sync — typically **Moonshine ↔ Moonshine**, or **Nighthawk → Moonshine**. Payments from upstream `drk` / other non-UnifOMR wallets will **not** appear unless you explicitly run `moonshine sync --force-trial` (privacy trade-off). Nighthawk Android / iOS / desktop default the opposite (trial-decrypt fallback on) so they can receive from any DarkFi wallet.
 
@@ -162,8 +162,8 @@ moonshine
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **UnifOMR only (0x05)** | ✅ | `GetUnifOmrDigest` + `FetchPirBatch` when capabilities say `unifomr` |
-| **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses |
-| **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable |
+| **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses. Session cache is FIFO-capped at 10,000 ids |
+| **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive |
 | **Payment memo on wire** | ✅ | `--memo` → OMR-aware bytes in recipient `MoneyNote::memo` (not local-only) |
 | **Multi detection_keys** | ✅ | Up to 16 wallet secrets in `GetUnifOmrDigest` |
 | **Local BlockCache** | ✅ | Sparse/PIR compact blocks cached beside wallet DB |
@@ -171,7 +171,7 @@ moonshine
 | **Proto Version Lockstep** | ✅ | Validates `LightInfo.proto_version` (1.x.x) on connect |
 | **OMR Err → no silent trial (S15)** | ✅ | Tip not advanced on OMR **error** |
 | **Empty OMR → supplemental trial** | ❌ (strict) | Use `sync --force-trial` for miss-safety |
-| **Tip regression rewind** | ✅ | Rewinds sync height when tip < last synced |
+| **Tip regression rewind** | ✅ | Rewinds sync height when tip < last synced. Deleted note/tx counts come from SQLite `execute` rowcounts, not log-line length |
 | **`chain_name` network guard** | ✅ | Must match config `network` |
 | **TLS pin remote HTTPS** | ✅ | `tls_pin_sha256` + `PinnedVerifier` (leaf DER SHA-256); remote cleartext refused |
 | **Address validation** | ✅ | DarkFi checksum addresses |

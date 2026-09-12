@@ -67,9 +67,56 @@ pub fn clue_key_version_now() -> u64 {
         .unwrap_or(1)
 }
 
-static CLUE_PK_REGISTERED: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
-> = std::sync::OnceLock::new();
+/// Session-scoped clue-registration ids. Oldest insert is dropped at `cap`.
+/// Updating an already-present id does not refresh FIFO position.
+const MAX_CLUE_REG_CACHE: usize = 10_000;
+
+struct BoundedIdSet {
+    set: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+}
+
+impl BoundedIdSet {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            set: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn new() -> Self {
+        Self::with_capacity(MAX_CLUE_REG_CACHE)
+    }
+
+    fn contains(&self, id: &[u8; 32]) -> bool {
+        self.set.contains(id)
+    }
+
+    fn insert(&mut self, id: [u8; 32]) {
+        if self.set.len() >= self.cap && !self.set.contains(&id) {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        if self.set.insert(id) {
+            self.order.push_back(id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+static CLUE_PK_REGISTERED: std::sync::OnceLock<std::sync::Mutex<BoundedIdSet>> =
+    std::sync::OnceLock::new();
+
+fn clue_reg_cache() -> &'static std::sync::Mutex<BoundedIdSet> {
+    CLUE_PK_REGISTERED.get_or_init(|| std::sync::Mutex::new(BoundedIdSet::new()))
+}
 
 fn clue_registration_id(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key("moonshine clue-reg v1");
@@ -81,8 +128,7 @@ fn clue_registration_id(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> [u8; 
 
 pub fn clue_already_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> bool {
     let id = clue_registration_id(network, pay_pk, clue_pk);
-    CLUE_PK_REGISTERED
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    clue_reg_cache()
         .lock()
         .map(|s| s.contains(&id))
         .unwrap_or(false)
@@ -90,10 +136,7 @@ pub fn clue_already_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -
 
 pub fn mark_clue_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) {
     let id = clue_registration_id(network, pay_pk, clue_pk);
-    if let Ok(mut s) = CLUE_PK_REGISTERED
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-    {
+    if let Ok(mut s) = clue_reg_cache().lock() {
         s.insert(id);
     }
 }
@@ -621,6 +664,22 @@ mod tests {
             !clue_already_registered(0, &pk, &clue),
             "different network must not collide"
         );
+    }
+
+    #[test]
+    fn bounded_id_set_fifo_evicts_oldest_insert() {
+        let mut cache = BoundedIdSet::with_capacity(2);
+        let a = [0x01u8; 32];
+        let b = [0x02u8; 32];
+        let c = [0x03u8; 32];
+        cache.insert(a);
+        cache.insert(b);
+        cache.insert(a); // update must not refresh FIFO position
+        cache.insert(c);
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains(&a), "oldest insert was a, even after update");
+        assert!(cache.contains(&b));
+        assert!(cache.contains(&c));
     }
 
     #[test]

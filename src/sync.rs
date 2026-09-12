@@ -20,7 +20,11 @@
 //!
 //! Sparse OMR sync with lightwalletd:
 //! 1. OMR Round 1 (UnifOMR only) → matching heights
-//! 2. `GetNoteCommitments(scan_start..scan_end)` — append all coins to Merkle tree
+//! 2. `GetNoteCommitments` — append **all** coins to the Money Merkle tree
+//!    from height 0 (dummy ZERO leaf + genesis mints). Note trial-decrypt
+//!    may start at the wallet birthday, but the tree must not: skipping
+//!    pre-birthday leaves makes spend proofs use a root the contract never
+//!    stored (Money `Custom(5)`).
 //! 3. `GetNullifiers(scan_start..scan_end)` — mark spent notes
 //! 4. Round 2: Batch PIR for matching heights when UnifOMR is available;
 //!    else `GetCompactBlocksAtHeights` / N× `GetBlock`
@@ -57,6 +61,26 @@ const MIN_BUCKET_SIZE: u32 = 1024;
 
 /// Base sleep duration between sync iterations (seconds). CLI polls faster.
 const POLL_BASE_SECS: u64 = 1;
+
+/// Inclusive LWD height range that must sit after the dummy ZERO leaf before
+/// a birthday-clamped note scan. Height 0 holds genesis mint coins; the dummy
+/// leaf is not block 0. `None` only when there is no pre-history to backfill.
+#[allow(dead_code)] // covered by unit tests; Android FFI has the same helper
+pub fn pre_birthday_commitment_range(birthday_height: u32) -> Option<(u32, u32)> {
+    if birthday_height == 0 {
+        None
+    } else {
+        Some((0, birthday_height.saturating_sub(1)))
+    }
+}
+
+fn genesis_money_tree() -> MerkleTree {
+    // Match darkfid: dummy zero coin at position 0 (dummy inputs).
+    let mut tree = MerkleTree::new(u32::MAX as usize);
+    tree.append(MerkleNode::from(pallas::Base::from(0u64)));
+    let _ = tree.mark();
+    tree
+}
 
 /// Canonical checkpoint digest: blake3(height LE || tree_data || nullifier_index).
 /// Must stay lockstep with darkfi-mobile-ffi and darkfi-lightwalletd.
@@ -169,6 +193,13 @@ impl SyncEngine {
         }
 
         if last_synced >= tip_height {
+            if !self.db.merkle_from_genesis() {
+                eprintln!(
+                    "Money Merkle tree is missing pre-birthday / height-0 leaves; \
+                     rebuilding from genesis so spend roots match the chain..."
+                );
+                self.rebuild_money_tree_from_genesis().await?;
+            }
             return Ok(SyncResult {
                 blocks_scanned: 0,
                 notes_found: 0,
@@ -177,7 +208,13 @@ impl SyncEngine {
             });
         }
 
-        let scan_start = (last_synced + 1).max(birthday);
+        // last_synced == 0 means never synced (or rescan-to-genesis), not
+        // "already applied height 0". Include genesis mint coins.
+        let scan_start = if last_synced == 0 {
+            birthday
+        } else {
+            (last_synced + 1).max(birthday)
+        };
         // May be clamped down below if the server truncates the OMR digest at its
         // DoS cap; the dropped tail is then re-scanned on the next cycle.
         let mut scan_end = tip_height.min(scan_start + MAX_BLOCKS_PER_REQUEST - 1);
@@ -293,11 +330,17 @@ impl SyncEngine {
             }
         }
 
-        // 2) Note commitments → Merkle tree (full scan range).
-        //    Runs AFTER trial decrypt so owned coins are in the DB and can be
-        //    marked in the tree during append.
+        // 2) Note commitments → Merkle tree.
+        //    Trial decrypt has already inserted owned coins so they can be marked.
+        //    Pre-birthday heights are backfilled first; never append birthday..tip
+        //    onto a dummy-only tree (that is Money Custom(5) on spend).
+        self.ensure_genesis_merkle(&mut client, scan_start)
+            .await?;
         self.apply_note_commitments(&mut client, scan_start, scan_end)
             .await?;
+        if scan_start == 0 {
+            self.db.set_merkle_from_genesis(true)?;
+        }
 
         // 3) Nullifiers → mark spent (full scan range)
         let notes_spent = self
@@ -326,15 +369,10 @@ impl SyncEngine {
         scan_start: u32,
         scan_end: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let owned = self.owned_commitment_set()?;
         let tree_bytes = self.db.get_meta("tree_state")?.unwrap_or_else(|| {
-            // Match darkfid's genesis initialization: the on-chain Merkle tree
-            // starts with a fake zero coin at position 0 (used for dummy inputs).
-            // See darkfi/src/contract/money/src/entrypoint.rs line 195-196.
-            let mut genesis_tree = MerkleTree::new(u32::MAX as usize);
-            genesis_tree.append(MerkleNode::from(pallas::Base::from(0u64)));
-            let _ = genesis_tree.mark();
             let mut out = Vec::new();
-            darkfi_serial::Encodable::encode(&genesis_tree, &mut out).unwrap_or(0);
+            darkfi_serial::Encodable::encode(&genesis_money_tree(), &mut out).unwrap_or(0);
             out
         });
 
@@ -342,8 +380,28 @@ impl SyncEngine {
             darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(&tree_bytes))
                 .map_err(|e| format!("Failed to decode MerkleTree: {}", e))?;
 
-        // Collect commitments of all owned unspent notes for marking.
-        let owned_commitments: std::collections::HashSet<[u8; 32]> = self
+        let total_marked = self
+            .append_note_commitments_range(client, &mut tree, &owned, scan_start, scan_end)
+            .await?;
+
+        if total_marked > 0 {
+            eprintln!(
+                "[DEBUG] Marked {} owned positions in Merkle tree",
+                total_marked
+            );
+        }
+
+        let mut out = Vec::new();
+        darkfi_serial::Encodable::encode(&tree, &mut out)
+            .map_err(|e| format!("Failed to encode MerkleTree: {}", e))?;
+        self.db.set_meta("tree_state", &out)?;
+        Ok(())
+    }
+
+    fn owned_commitment_set(
+        &self,
+    ) -> Result<std::collections::HashSet<[u8; 32]>, Box<dyn std::error::Error>> {
+        Ok(self
             .db
             .list_owned_commitments()
             .unwrap_or_default()
@@ -357,42 +415,88 @@ impl SyncEngine {
                     None
                 }
             })
-            .collect();
+            .collect())
+    }
 
-        let mut nc_stream = client.get_note_commitments(scan_start, scan_end).await?;
+    /// Stream `GetNoteCommitments(start..=end)` and append every coin.
+    async fn append_note_commitments_range(
+        &self,
+        client: &mut LightwalletClient,
+        tree: &mut MerkleTree,
+        owned_commitments: &std::collections::HashSet<[u8; 32]>,
+        start: u32,
+        end: u32,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        if start > end {
+            return Ok(0);
+        }
+        let mut nc_stream = client.get_note_commitments(start, end).await?;
         let mut total_marked = 0u64;
         while let Some(nc_result) = nc_stream.next().await {
             let nc = nc_result?;
             for coin in nc.coins {
-                if coin.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&coin);
-                    let Some(node) = MerkleNode::from_bytes(arr) else {
-                        continue;
-                    };
-                    tree.append(node);
-                    if owned_commitments.contains(&arr) {
-                        if let Some(pos) = tree.mark() {
-                            let pos_u64: u64 = pos.into();
-                            self.db.update_leaf_position(&arr, pos_u64 as u32).ok();
-                            total_marked += 1;
-                        }
+                if coin.len() != 32 {
+                    continue;
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&coin);
+                let Some(node) = MerkleNode::from_bytes(arr) else {
+                    continue;
+                };
+                tree.append(node);
+                if owned_commitments.contains(&arr) {
+                    if let Some(pos) = tree.mark() {
+                        let pos_u64: u64 = pos.into();
+                        self.db.update_leaf_position(&arr, pos_u64 as u32).ok();
+                        total_marked += 1;
                     }
                 }
             }
         }
+        Ok(total_marked)
+    }
 
-        if total_marked > 0 {
-            eprintln!(
-                "[DEBUG] Marked {} owned positions in Merkle tree",
-                total_marked
-            );
+    /// If the Money tree is not known to include height 0, replay 0..=scan_start-1
+    /// onto a fresh dummy leaf. Never append a birthday window onto a dummy-only tree.
+    async fn ensure_genesis_merkle(
+        &self,
+        client: &mut LightwalletClient,
+        scan_start: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.db.merkle_from_genesis() {
+            return Ok(());
         }
-
+        if scan_start == 0 {
+            return Ok(());
+        }
+        let end = scan_start - 1;
+        eprintln!(
+            "Backfilling Money Merkle tree for heights 0..={end} \
+             (note scan starts at {scan_start}; pre-history must still be in the tree)..."
+        );
+        let owned = self.owned_commitment_set()?;
+        let mut tree = genesis_money_tree();
+        let mut start = 0u32;
+        let mut marked = 0u64;
+        while start <= end {
+            let chunk_end = start.saturating_add(MAX_BLOCKS_PER_REQUEST - 1).min(end);
+            marked += self
+                .append_note_commitments_range(client, &mut tree, &owned, start, chunk_end)
+                .await?;
+            eprintln!("  merkle backfill {chunk_end}/{end}");
+            start = chunk_end.saturating_add(1);
+            if start == 0 {
+                break;
+            }
+        }
+        if marked > 0 {
+            eprintln!("[DEBUG] Marked {marked} owned positions during genesis backfill");
+        }
         let mut out = Vec::new();
         darkfi_serial::Encodable::encode(&tree, &mut out)
-            .map_err(|e| format!("Failed to encode MerkleTree: {}", e))?;
+            .map_err(|e| format!("Failed to encode MerkleTree: {e}"))?;
         self.db.set_meta("tree_state", &out)?;
+        self.db.set_merkle_from_genesis(true)?;
         Ok(())
     }
 
@@ -623,9 +727,7 @@ impl SyncEngine {
         // replay (dummy ZERO leaf, then every coin, mark on owned). Skipping
         // that replay after a tip checkpoint leaves `leaf_position` unset and
         // `make_transfer_call` fails with "Missing inputs in transfer call".
-        let mut tree = MerkleTree::new(u32::MAX as usize);
-        tree.append(MerkleNode::from(pallas::Base::from(0u64)));
-        let _ = tree.mark();
+        let mut tree = genesis_money_tree();
         let mut start = 0u32;
 
         let mut appended = 0u64;
@@ -739,6 +841,7 @@ impl SyncEngine {
         darkfi_serial::Encodable::encode(&tree, &mut out)
             .map_err(|e| format!("Failed to encode MerkleTree: {e}"))?;
         self.db.set_meta("tree_state", &out)?;
+        self.db.set_merkle_from_genesis(true)?;
 
         let now = client.get_chain_tip().await?.height;
         let final_tip = if now > tip {
@@ -1678,6 +1781,13 @@ pub fn compute_supplemental_heights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pre_birthday_commitment_range() {
+        assert_eq!(pre_birthday_commitment_range(0), None);
+        assert_eq!(pre_birthday_commitment_range(1), Some((0, 0)));
+        assert_eq!(pre_birthday_commitment_range(53000), Some((0, 52999)));
+    }
 
     #[test]
     fn test_chain_matches_testnet() {
