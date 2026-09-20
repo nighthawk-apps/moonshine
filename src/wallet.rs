@@ -159,6 +159,14 @@ impl Wallet {
     /// The resulting mnemonic can be imported into any DarkFi wallet
     /// (Android, iOS, Moonshine) and will produce the same secret key.
     pub fn create(name: &str, network: &str) -> Result<Self, Box<dyn Error>> {
+        // Refuse before opening the DB so a failed TTY check cannot leave an
+        // unrecoverable wallet whose seed was never displayed.
+        if !std::io::stderr().is_terminal() {
+            return Err("Refusing to print mnemonic: stderr is not a TTY. \
+                 Run `moonshine wallet create` in an interactive terminal to back up the seed."
+                .into());
+        }
+
         let db_path = Self::db_path(name);
 
         // Ensure wallet directory exists
@@ -204,12 +212,6 @@ impl Wallet {
         db.insert_address(&public_hex, &secret_bytes)?;
         db.set_default_address(&public_hex)?;
 
-        // Mnemonic must never hit stdout (pipes/logs). Only print to an interactive stderr TTY.
-        if !std::io::stderr().is_terminal() {
-            return Err("Refusing to print mnemonic: stderr is not a TTY. \
-                 Run `moonshine wallet create` in an interactive terminal to back up the seed."
-                .into());
-        }
         eprintln!();
         eprintln!("╔════════════════════════════════════════════════╗");
         eprintln!("║         BACKUP YOUR MNEMONIC SEED              ║");

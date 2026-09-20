@@ -104,7 +104,7 @@ per-height OR). The remaining deviations from the paper are:
 | BFV moduli sizes | `[40, 40, 40]` (digest served at last level) |
 | `R_PRIME` (`r′`) | **149** (paper value, active) |
 
-Detection keys are larger than MVP (~2× BFV degree); gRPC decode/encode limits are **64 MB** (matching `MAX_DETECTION_KEYS_TOTAL_BYTES`; per-key cap 48 MB). Detection-key count remains capped at **16**, but a single Param2 det-key is ~38 MB, so clients chunk `GetUnifOmrDigest` requests to stay under the 64 MB total budget.
+Detection keys are larger than MVP (~2× BFV degree); gRPC decode/encode limits are **160 MiB** (matching `MAX_DETECTION_KEYS_TOTAL_BYTES` / `MAX_DETECTION_KEY_BYTES`). Detection-key count remains capped at **16**, but a single Param2 det-key is ~120 MiB, so clients stream `GetUnifOmrDigest` in 1 MiB chunks under the 160 MiB total budget.
 
 ## Cross-client parity (required)
 

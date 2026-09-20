@@ -10,7 +10,7 @@ ln -sfn new-nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 
 Do not point at `darkrenaissance/darkfi` master — that tree is Arti 0.42 without the keccak overlay. The nighthawk24 branch is Arti 0.45 + keccak + latest master (kvdb-overlay).
 
-Current pin: `327fa9f134fc756b84be2ce327afaae1cd41a956` (`nighthawk-testnet`).
+Current pin: `f0978c22242267b5684e6b8334cdf063652d2b37` (`nighthawk-testnet`).
 
 ## Wallet crypto note
 

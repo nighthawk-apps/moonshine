@@ -412,9 +412,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
                 let fee_atomic = fee;
 
+                if token != "DRK"
+                    && token.to_ascii_lowercase()
+                        != crate::db::WalletDb::dark_token_id_hex().to_ascii_lowercase()
+                {
+                    eprintln!(
+                        "Error: custom tokens are not supported yet (got '{token}'). \
+                         Omit --token or pass DRK."
+                    );
+                    return Ok(());
+                }
+
                 // Check balance
                 let balance = w.db.confirmed_balance(&token)?;
-                let total_needed = amount_atomic + fee_atomic;
+                let total_needed = amount_atomic.checked_add(fee_atomic).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "amount+fee overflow")
+                })?;
                 if (balance as u64) < total_needed {
                     eprintln!(
                         "Error: Insufficient funds. Have {} atomic, need {} ({} + {} fee).",
@@ -513,7 +526,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("╔════════════════════════════════════════════════╗");
                 println!("║         TRANSACTION SUMMARY                   ║");
                 println!("╠════════════════════════════════════════════════╣");
-                println!("║  To:      {}...  ║", &to[..24]);
+                println!(
+                    "║  To:      {}...  ║",
+                    to.chars().take(24).collect::<String>()
+                );
                 println!(
                     "║  Amount:  {} {} ({} atomic)           ║",
                     crate::amount::format_drk_atomic(amount_atomic),
@@ -536,7 +552,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(ref m) = memo {
                     println!(
                         "║  Memo:    {}                               ║",
-                        &m[..m.len().min(32)]
+                        m.chars().take(32).collect::<String>()
                     );
                 }
                 if no_omr {

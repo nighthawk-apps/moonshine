@@ -54,7 +54,7 @@ impl Default for Config {
             server_url: "http://127.0.0.1:9067".to_string(),
             network: "testnet".to_string(),
             tls_pin_sha256: None,
-            use_tor: false,
+            use_tor: default_use_tor(),
             explorer_url: None,
         }
     }

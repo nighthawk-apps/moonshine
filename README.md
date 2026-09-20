@@ -2,7 +2,7 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC and syncs with **UnifOMR only** (scheme `0x05`). There is no PerfOMR fallback.
 
-**3.00.013** (crate semver **3.0.13** — leading zeros are not valid Cargo versions): Money Merkle tree is backfilled from genesis after a birthday rescan so spend proofs stay on-chain (Money `Custom(5)` / `TransferMerkleRootNotFound`). CI checks out the pinned `nighthawk24/darkfi` sibling as `darkfi-nighthawk-testnet`. FIFO-capped clue-registration session cache (10,000 ids; updates do not refresh eviction order). Reorg recovery reports real SQLite `execute` rowcounts for notes and transactions (`invalidate_above_height`). Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.00.014** (crate semver **3.0.14** — leading zeros are not valid Cargo versions): DarkFi pin `f0978c222` (`nighthawk-testnet` with public `Drk::scan_block` and darkfid sync hardening). Money Merkle tree is backfilled from genesis after a birthday rescan so spend proofs stay on-chain (Money `Custom(5)` / `TransferMerkleRootNotFound`). CI checks out the pinned `nighthawk24/darkfi` sibling as `darkfi-nighthawk-testnet`. FIFO-capped clue-registration session cache (10,000 ids; updates do not refresh eviction order). Reorg recovery reports real SQLite `execute` rowcounts for notes and transactions (`invalidate_above_height`). Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
 > **Strict UnifOMR (hard-coded):** Moonshine does **not** run supplemental / gap trial decrypt. **Only** transactions that carry UnifOMR clues are discovered during normal sync — typically **Moonshine ↔ Moonshine**, or **Nighthawk → Moonshine**. Payments from upstream `drk` / other non-UnifOMR wallets will **not** appear unless you explicitly run `moonshine sync --force-trial` (privacy trade-off). Nighthawk Android / iOS / desktop default the opposite (trial-decrypt fallback on) so they can receive from any DarkFi wallet.
 
@@ -27,7 +27,7 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 |-------------|--------|
 | **Rust** stable | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` |
-| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `327fa9f13` (full `327fa9f134fc756b84be2ce327afaae1cd41a956`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough. You may `ln -s nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet` — that tree is the same pin. |
+| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `f0978c222` (full `f0978c22242267b5684e6b8334cdf063652d2b37`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough. You may `ln -s nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet` — that tree is the same pin. |
 | **Sibling `darkfi-lightwalletd`** | Proto from `../darkfi-lightwalletd/proto/lightwallet.proto` |
 | **Running lightwalletd** | Local or remote before `moonshine sync` |
 
@@ -35,7 +35,7 @@ Clone the path dependencies as **sibling directories** (names matter — see `Ca
 
 ```text
 parent/
-  darkfi-nighthawk-testnet/ # MUST be this name — pin 327fa9f13, not darkfi master
+  darkfi-nighthawk-testnet/ # MUST be this name — pin f0978c222, not darkfi master
   darkfi-lightwalletd/      # gRPC server + proto + UnifOMR crate
   moonshine/                # this repo
   # optional; same pin if you already built Android:
@@ -56,7 +56,7 @@ Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
 ```bash
 # from darkfi-lightwalletd/
 FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
-# See docs/darkfi-pin.md — current SHA 327fa9f134fc756b84be2ce327afaae1cd41a956
+# See docs/darkfi-pin.md — current SHA f0978c22242267b5684e6b8334cdf063652d2b37
 ```
 
 Moonshine’s own pruned wallet remains **SQLCipher** (`PRAGMA key`) by design — it does
@@ -212,7 +212,7 @@ moonshine
 
 | Sibling directory | Role |
 |-------------------|------|
-| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `327fa9f13` (symlink to Android `third_party/darkfi` is OK) |
+| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `f0978c222` (symlink to Android `third_party/darkfi` is OK) |
 | `../darkfi-lightwalletd` | gRPC lightwalletd + shared UnifOMR |
 | `../darkfi-mobile-ffi` | Shared UniFFI crate (Android / iOS / desktop) |
 | `../new-nighthawk-android-wallet` | Android wallet (`third_party/darkfi` = same pin) |
