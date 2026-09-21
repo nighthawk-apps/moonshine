@@ -79,24 +79,47 @@ for ((i=0; i<COUNT; i++)); do
   fi
   echo "" | tee -a "$LOG"
   echo "[$i/$COUNT] → $name ($mode) $to" | tee -a "$LOG"
-  if out=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" "${send_args[@]}" 2>&1); then
-    echo "$out" | tee -a "$LOG"
-    hash=$(echo "$out" | awk '/TX hash:/{print $NF; exit} /tx hash/{print $NF; exit} /^[a-f0-9]{64}$/{print; exit}')
-    if [[ -z "$hash" ]]; then
-      hash=$(echo "$out" | rg -o '[a-f0-9]{64}' | tail -1 || true)
-    fi
-    if [[ -n "$hash" ]]; then
-      HASHES+=("$hash|$mode|$name")
-      echo "explorer: $EXPLORER/tx/$hash" | tee -a "$LOG"
-      ok=$((ok+1))
-    else
-      echo "WARN: send ok but no tx hash parsed" | tee -a "$LOG"
-      ok=$((ok+1))
-    fi
-  else
-    echo "$out" | tee -a "$LOG"
+  # Ensure spendable change is visible before each send (except first).
+  if (( i > 0 )); then
+    "$MOON" -w "$SENDER_WALLET" --server "$SERVER" sync --force-trial 2>&1 | tee -a "$LOG" | tail -8
+  fi
+  out=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" "${send_args[@]}" 2>&1) || true
+  echo "$out" | tee -a "$LOG"
+  if echo "$out" | rg -q 'Error:|Insufficient funds|FAILED|failed to'; then
     fail=$((fail+1))
     echo "FAIL send #$i" | tee -a "$LOG"
+    # Stop early when sender is drained — remaining COUNT cannot succeed.
+    if echo "$out" | rg -q 'Insufficient funds'; then
+      echo "STOP: sender drained after ok=$ok fail=$fail" | tee -a "$LOG"
+      break
+    fi
+    continue
+  fi
+  hash=$(echo "$out" | awk '/TX hash:/{print $NF; exit} /tx hash/{print $NF; exit}')
+  if [[ -z "$hash" ]]; then
+    hash=$(echo "$out" | rg -o '[a-f0-9]{64}' | tail -1 || true)
+  fi
+  if [[ -n "$hash" ]] && echo "$out" | rg -q 'broadcast successfully|TX hash:'; then
+    HASHES+=("$hash|$mode|$name")
+    echo "explorer: $EXPLORER/tx/$hash" | tee -a "$LOG"
+    ok=$((ok+1))
+    # Wait for at least one tip advance so change becomes spendable.
+    prev_tip=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" sync --force-trial 2>&1 | awk '/Chain tip:/{print $NF; exit}')
+    for _w in $(seq 1 40); do
+      sleep 10
+      tip=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" sync --force-trial 2>&1 | awk '/Chain tip:/{print $NF; exit}')
+      bal=$("$MOON" -w "$SENDER_WALLET" balance 2>&1 | awk '/Raw:/{print $2; exit}')
+      echo "  wait tip=$tip bal=$bal (prev=$prev_tip)" | tee -a "$LOG"
+      if [[ -n "$tip" && -n "$prev_tip" && "$tip" -gt "$prev_tip" && "$bal" != "0" ]]; then
+        break
+      fi
+      if [[ "$bal" != "0" && -n "$bal" ]]; then
+        break
+      fi
+    done
+  else
+    fail=$((fail+1))
+    echo "FAIL send #$i (no tx hash / not broadcast)" | tee -a "$LOG"
   fi
 done
 
