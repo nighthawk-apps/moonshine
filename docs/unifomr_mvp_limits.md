@@ -40,7 +40,7 @@ discrete Gaussian σ=0.5, `‖u‖₀ = h/2 = 40`, `‖s‖₀ = h = 80` ⇒ σ_
   for `M` flattened messages. The slot → height map is returned once, out-of-band,
   in `OmrDigestResponse.slot_heights` (packed little-endian `u32`).
 - **Ownership-proof replay fix (v2)** — `RegisterCluePublicKey` proofs sign
-  `b"DarkFi-UnifOMR-CluePK-v2" || network_byte || key_version (u32 LE) ||
+  `b"DarkFi-UnifOMR-CluePK-v2" || network_byte || key_version (u64 LE) ||
   payment_pubkey || clue_public_key`. The network byte kills cross-network
   replay; `key_version` (unix seconds) is monotonic — the server only replaces
   a registration when the new version is strictly greater (signed rotation),
@@ -121,6 +121,8 @@ Detection keys are larger than MVP (~2× BFV degree); gRPC decode/encode limits 
 | Tor (arti) routing for remote LWD traffic, default ON | n/a | ✓ (embedded arti) | socks5 route via bootstrap `use_tor` | socks5 route via bootstrap `use_tor` | ✓ (`use_tor` pref, default true) |
 
 Malformed UnifOMR clues are rejected at validation; clients fall back to trial decrypt over the window when OMR returns no matches (including decoy-directory / unregistered receivers).
+
+**Cross-client strict OMR parity note:** Moonshine in strict OMR mode requires valid UnifOMR matches and rejects decoy clues; in non-strict mode it falls back to trial-decrypt only (no PIR). Nighthawk FFI in non-strict mode utilizes PIR for candidate matched blocks combined with supplemental trial-decrypt over empty OMR or gap ranges. Both maintain equivalent privacy guarantees with different bandwidth trade-offs.
 
 **Round-2 privacy invariant:** the server may learn the padded digest window,
 but never which heights matched. Matched blocks are fetched via batch PIR; on

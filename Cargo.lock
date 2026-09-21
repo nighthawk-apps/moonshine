@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "darkfi-lightwalletd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "3.0.14"
+version = "3.0.15"
 dependencies = [
  "argon2",
  "arti-client",
