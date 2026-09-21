@@ -19,7 +19,8 @@ MOON="${MOON:-$ROOT/../moonshine/target/release/moonshine}"
 SERVER="${SERVER:-http://127.0.0.1:9067}"
 COUNT="${COUNT:-100}"
 AMOUNT="${AMOUNT:-0.001}"
-FEE=""
+# Default fee must clear ~464k atomic floor on testnet; env FEE overrides.
+FEE="${FEE:-500000}"
 SENDER_WALLET="${SENDER_WALLET:-e2e_alice}"
 BOB_WALLET="${BOB_WALLET:-e2e_bob}"
 LOG="${LOG:-/tmp/nh-e2e-100-tx.log}"
@@ -69,17 +70,16 @@ for ((i=0; i<COUNT; i++)); do
   name="${entry%%|*}"
   to="${entry##*|}"
   memo="e2e015-$i-$name"
+  send_args=(tx send --to "$to" --amount "$AMOUNT" --fee "$FEE" --memo "$memo")
   if (( i % 2 == 0 )); then
     mode="UnifOMR"
-    extra=()
   else
     mode="TrialDecrypt"
-    extra=(--no-omr)
+    send_args+=(--no-omr)
   fi
   echo "" | tee -a "$LOG"
   echo "[$i/$COUNT] → $name ($mode) $to" | tee -a "$LOG"
-  if out=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" tx send \
-      --to "$to" --amount "$AMOUNT" --fee "$FEE" --memo "$memo" "${extra[@]}" 2>&1); then
+  if out=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" "${send_args[@]}" 2>&1); then
     echo "$out" | tee -a "$LOG"
     hash=$(echo "$out" | awk '/TX hash:/{print $NF; exit} /tx hash/{print $NF; exit} /^[a-f0-9]{64}$/{print; exit}')
     if [[ -z "$hash" ]]; then
@@ -108,5 +108,9 @@ echo "=== sync bob + verify balance movement ===" | tee -a "$LOG"
 
 echo "" | tee -a "$LOG"
 echo "RESULT ok=$ok fail=$fail total=$COUNT log=$LOG" | tee -a "$LOG"
-printf '%s\n' "${HASHES[@]}" | tee /tmp/nh-e2e-100-hashes.txt >/dev/null
+if ((${#HASHES[@]} > 0)); then
+  printf '%s\n' "${HASHES[@]}" | tee /tmp/nh-e2e-100-hashes.txt >/dev/null
+else
+  : > /tmp/nh-e2e-100-hashes.txt
+fi
 echo "hashes: /tmp/nh-e2e-100-hashes.txt (${#HASHES[@]} recorded)"
