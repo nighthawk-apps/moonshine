@@ -8,7 +8,7 @@ resolve. Reuse the Android pin:
 ln -sfn new-nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
-Do not point at `darkrenaissance/darkfi` master — that tree is Arti 0.42 without the keccak overlay. The nighthawk24 branch is Arti 0.45 + keccak + latest master (kvdb-overlay).
+Upstream DarkFi is [https://git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi). Do not clone the GitHub mirror (`github.com/darkrenaissance/darkfi`). Do not pin git.dark.fi master — that tree is Arti 0.42 without the keccak overlay. The Nighthawk pin below is not published on git.dark.fi; CI checks it out from `nighthawk24/darkfi` (`nighthawk-testnet`, Arti 0.45 + keccak + kvdb-overlay).
 
 Current pin: `f0978c22242267b5684e6b8334cdf063652d2b37` (`nighthawk-testnet`).
 

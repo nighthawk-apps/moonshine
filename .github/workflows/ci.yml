@@ -13,7 +13,7 @@ env:
   DARKFI_PIN: f0978c22242267b5684e6b8334cdf063652d2b37
 
 # Path deps expect siblings:
-#   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not darkrenaissance/darkfi master)
+#   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not git.dark.fi master; do not use the GitHub mirror)
 #   darkfi-lightwalletd/
 #   moonshine/                 ← this repo
 jobs:
