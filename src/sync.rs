@@ -278,8 +278,8 @@ impl SyncEngine {
         //    so that discovered coins are in the DB when the tree is built (allowing
         //    inline marking of owned positions).
         let mut notes_found = 0u32;
-        // Default: trial-decrypt the scan window so non-UnifOMR counterparties
-        // (`drk`) are received. `--strict-omr` keeps UnifOMR-only sparse PIR.
+        // Strict UniFOMR is the default. `--allow-trial` or `--force-trial`
+        // trial-decrypts the window so payments with no clue are still received.
         let use_full_window_trial = self.force_trial || !self.strict_omr;
         let heights_to_fetch: Vec<u32> = if use_full_window_trial {
             (scan_start..=scan_end).collect()
@@ -1106,7 +1106,7 @@ impl SyncEngine {
                 if max_need == 0 {
                     return Err("PIR returned empty payloads for all matching heights".into());
                 }
-                needed_limbs = Some(max_need);
+                needed_limbs = Some(darkfi_lightwalletd::pir_server::padded_limb_count(max_need));
             }
             if let Some(n) = needed_limbs {
                 if limb_cols.len() >= n {

@@ -26,11 +26,11 @@ tower = "0.5"
 
 # Async Runtime
 tokio = { version = "1", features = ["full"] }
-futures = "0.3.32"
+futures = "0.3.34"
 
 # Argument Parsing / Formatting
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 toml = "0.8"
 prettytable-rs = "0.10.0"
 
@@ -39,9 +39,9 @@ rusqlite = { version = "0.37.0", features = ["bundled-sqlcipher-vendored-openssl
 
 # Cryptography & Utils
 argon2 = "0.5"
-blake3 = "1.8.5"
+blake3 = "1.8.7"
 hex = "0.4.3"
-thiserror = "2.0.18"
+thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 tracing-appender = "0.2.5"
