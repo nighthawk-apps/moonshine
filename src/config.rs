@@ -60,18 +60,6 @@ impl Default for Config {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_config_routes_remote_traffic_through_tor() {
-        let cfg = Config::default();
-        assert!(cfg.use_tor);
-        assert_eq!(cfg.network, "testnet");
-    }
-}
-
 impl Config {
     /// Get the path of the config file.
     pub fn config_path() -> PathBuf {
@@ -138,5 +126,17 @@ impl Config {
         let serialized = toml::to_string_pretty(self)?;
         fs::write(path, serialized)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_routes_remote_traffic_through_tor() {
+        let cfg = Config::default();
+        assert!(cfg.use_tor);
+        assert_eq!(cfg.network, "testnet");
     }
 }
