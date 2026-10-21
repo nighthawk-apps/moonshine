@@ -161,6 +161,11 @@ impl SyncEngine {
                 last_synced,
                 rewind_to
             );
+            if let Some(cache) = &self.block_cache {
+                if let Err(e) = cache.delete_above(rewind_to) {
+                    tracing::warn!("block cache reorg prune failed: {e}");
+                }
+            }
             match self.db.invalidate_above_height(rewind_to) {
                 Ok((notes, txs)) => {
                     if notes > 0 || txs > 0 {
@@ -516,33 +521,13 @@ impl SyncEngine {
         }
         let min_h = locs.iter().map(|l| l.2).min().unwrap_or(0);
         let max_h = locs.iter().map(|l| l.2).max().unwrap_or(0);
-        eprintln!("  fetching compact blocks {min_h}..={max_h} to restore coin commitments...");
-        let mut blocks = self.fetch_window_range(client, min_h, max_h).await?;
-        let unique_h: Vec<u32> = {
-            let mut h: Vec<u32> = locs.iter().map(|l| l.2).collect();
-            h.sort_unstable();
-            h.dedup();
-            h
-        };
-        if let Ok(cached) = self.fetch_matching_blocks_sparse(client, &unique_h).await {
-            // Prefer a cached copy when it actually trial-decrypts.
-            for b in cached {
-                if blocks.iter().any(|x| x.height == b.height) {
-                    if self.secret_keys.iter().any(|sk| {
-                        b.txs.iter().any(|t| {
-                            t.outputs
-                                .iter()
-                                .any(|o| trial_decrypt_note(&o.encrypted_note, sk).is_some())
-                        })
-                    }) {
-                        blocks.retain(|x| x.height != b.height);
-                        blocks.push(b);
-                    }
-                } else {
-                    blocks.push(b);
-                }
-            }
-        }
+        // Pad the window so the server does not learn the exact heights of
+        // unspent notes. A sparse height list would reveal those heights.
+        let (pad_start, pad_end) = pad_block_range(min_h, max_h, max_h);
+        eprintln!(
+            "  fetching compact blocks {pad_start}..={pad_end} to restore coin commitments..."
+        );
+        let blocks = self.fetch_window_range(client, pad_start, pad_end).await?;
         let mut by_h: std::collections::HashMap<u32, crate::client::proto::CompactBlock> =
             std::collections::HashMap::new();
         for b in blocks {
@@ -927,7 +912,7 @@ impl SyncEngine {
             while let Some(nf_result) = nf_stream.next().await {
                 let nf = nf_result?;
                 for nullifier in nf.nullifiers {
-                    let marked = self.db.mark_note_spent(&nullifier)?;
+                    let marked = self.db.mark_note_spent_at(&nullifier, Some(nf.height))?;
                     if marked > 0 {
                         notes_spent += marked as u32;
                     }
@@ -1277,7 +1262,6 @@ impl SyncEngine {
         }
 
         let net = self.network_byte;
-        const MAX_DETECTION_KEYS: usize = 16;
         // Server cap on the sum of detection_keys lengths per request
         // (lightwalletd MAX_DETECTION_KEYS_TOTAL_BYTES = 160 MiB).  One Param2
         // det-key is ~120 MiB (D=4096, n=1024, 3×40-bit moduli), so
@@ -1288,7 +1272,11 @@ impl SyncEngine {
 
         let mut clients = Vec::new();
         let mut detection_keys = Vec::new();
-        for sk in self.secret_keys.iter().take(MAX_DETECTION_KEYS) {
+        // The registered clue key is derived from the first wallet secret
+        // (`Wallet::wallet_secret_bytes`). Detection keys from other
+        // sub-address secrets never match that clue and only upload ~120 MiB
+        // of ciphertext the server can ignore.
+        for sk in self.secret_keys.iter().take(1) {
             let Some(bytes) = sk.get(..32) else {
                 continue;
             };

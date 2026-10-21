@@ -165,6 +165,15 @@ impl BlockCache {
         stmt.query_row([], |row| row.get(0))
     }
 
+    /// Drop cached blocks above a fork height (reorg).
+    pub fn delete_above(&self, height: u32) -> SqlResult<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM compact_blocks WHERE height > ?1",
+            params![height],
+        )?;
+        Ok(n)
+    }
+
     /// Prune blocks below a given height.
     pub fn prune_below(&self, height: u32) -> SqlResult<usize> {
         let rows = self.conn.execute(

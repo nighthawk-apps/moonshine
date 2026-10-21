@@ -94,7 +94,9 @@ pub fn unwrap_secret(stored: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     expected.update(DOMAIN);
     expected.update(b"-mac");
     expected.update(body);
-    if mac != &expected.finalize().as_bytes()[..16] {
+    let digest = expected.finalize();
+    let got = &digest.as_bytes()[..16];
+    if !ct_eq(mac, got) {
         return Err("Wrapped secret MAC mismatch".into());
     }
     let nonce = &body[4..4 + NONCE_LEN];
@@ -165,12 +167,60 @@ pub fn load_or_create_passphrase(db_path: &str) -> Result<String, String> {
         }
         return Ok(s);
     }
-    // Generate a random passphrase and store with mode 0600.
-    let mut raw = [0u8; 32];
-    rand::rng().fill_bytes(&mut raw);
-    let pass = hex::encode(raw);
-    write_mode_0600(&pass_path, pass.as_bytes())?;
-    Ok(pass)
+    Err(format!(
+        "No wallet passphrase. Set MOONSHINE_WALLET_PASS (it is not written next to the database). \
+         Existing wallets that already have {pass_path} still open."
+    ))
+}
+
+/// Constant-time equality for fixed-length MAC tags.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Wrap key previously stored beside the database, if that legacy file exists.
+pub fn read_legacy_wrap_key(db_path: &str) -> Result<Option<[u8; 32]>, String> {
+    let key_path = format!("{db_path}.wrapkey");
+    if !Path::new(&key_path).exists() {
+        return Ok(None);
+    }
+    let mut f = fs::File::open(&key_path).map_err(|e| e.to_string())?;
+    let mut key = [0u8; 32];
+    f.read_exact(&mut key).map_err(|e| e.to_string())?;
+    Ok(Some(key))
+}
+
+/// Remove `{db}.wrapkey` after the key has been stored inside the encrypted DB.
+pub fn delete_legacy_wrap_key(db_path: &str) {
+    let key_path = format!("{db_path}.wrapkey");
+    if Path::new(&key_path).exists() {
+        let _ = fs::remove_file(&key_path);
+    }
+}
+
+pub fn random_wrap_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    key
+}
+
+/// Recover the wrap key stored in `wallet_meta` under the passphrase.
+pub fn unwrap_meta_wrap_key(stored: &[u8], passphrase: &str) -> Result<[u8; 32], String> {
+    let meta_key = meta_key_from_passphrase(passphrase);
+    let raw = unwrap_secret(stored, &meta_key)?;
+    if raw.len() != 32 {
+        return Err("wallet_meta wrap key has the wrong length".into());
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&raw);
+    Ok(key)
 }
 
 /// Write bytes to a file with mode 0600, replacing any previous contents.
@@ -183,33 +233,6 @@ pub fn write_mode_0600_overwrite(path: &Path, data: &[u8]) -> Result<(), String>
     let mut f = opts.open(path).map_err(|e| e.to_string())?;
     f.write_all(data).map_err(|e| e.to_string())?;
     Ok(())
-}
-
-/// Write bytes to a new file with mode 0600.
-fn write_mode_0600(path: &str, data: &[u8]) -> Result<(), String> {
-    if let Some(parent) = Path::new(path).parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true).mode(0o600);
-    let mut f = opts.open(path).map_err(|e| e.to_string())?;
-    f.write_all(data).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Load or create a 32-byte wrap key beside the wallet DB path (`{db}.wrapkey`).
-pub fn load_or_create_wrap_key(db_path: &str) -> Result<[u8; 32], String> {
-    let key_path = format!("{db_path}.wrapkey");
-    if Path::new(&key_path).exists() {
-        let mut f = fs::File::open(&key_path).map_err(|e| e.to_string())?;
-        let mut key = [0u8; 32];
-        f.read_exact(&mut key).map_err(|e| e.to_string())?;
-        return Ok(key);
-    }
-    let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
-    write_mode_0600(&key_path, &key)?;
-    Ok(key)
 }
 
 /// Persist the wrap key into `wallet_meta`, wrapped under a passphrase-derived key.

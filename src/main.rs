@@ -370,7 +370,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         println!("Unspent coins:");
                         for (tx_hash, idx, value, token) in unspent {
-                            println!("  {}:{} — {} {}", &tx_hash[..8], idx, value, token);
+                            let short = if tx_hash.len() >= 8 {
+                                &tx_hash[..8]
+                            } else {
+                                tx_hash.as_str()
+                            };
+                            println!("  {short}:{idx} — {value} {token}");
                         }
                     }
                 }
@@ -413,8 +418,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let fee_atomic = fee;
 
                 if token != "DRK"
-                    && token.to_ascii_lowercase()
-                        != crate::db::WalletDb::dark_token_id_hex().to_ascii_lowercase()
+                    && !token.eq_ignore_ascii_case(&crate::db::WalletDb::dark_token_id_hex())
                 {
                     eprintln!(
                         "Error: custom tokens are not supported yet (got '{token}'). \
@@ -849,8 +853,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         config.tls_pin_sha256.clone(),
                     )
                     .with_tor(config.use_tor);
+                    let extra_omr_clues = self_change_clues(
+                        &config.network,
+                        &w,
+                        &omr_clue,
+                        &built.self_output_indices,
+                    );
                     match broadcast_client
-                        .send_transaction(tx_data.clone(), omr_clue.clone(), omr_metadata_enc)
+                        .send_transaction(
+                            tx_data.clone(),
+                            omr_clue.clone(),
+                            omr_metadata_enc,
+                            extra_omr_clues,
+                        )
                         .await
                     {
                         Ok(resp) => {
@@ -1064,7 +1079,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 return Ok(());
                             }
                         };
-                        match client.send_transaction(raw_tx, omr_clue, vec![]).await {
+                        match client
+                            .send_transaction(raw_tx, omr_clue, vec![], vec![])
+                            .await
+                        {
                             Ok(resp) => {
                                 if resp.error.is_empty() || resp.error == "0" {
                                     println!(
@@ -1675,6 +1693,24 @@ fn inspect_serialized_tx(raw: &[u8]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn commit_xy(
+    point: darkfi_sdk::pasta::pallas::Point,
+) -> Result<
+    (
+        darkfi_sdk::pasta::pallas::Base,
+        darkfi_sdk::pasta::pallas::Base,
+    ),
+    Box<dyn Error>,
+> {
+    use darkfi_sdk::crypto::pasta_prelude::{Curve, CurveAffine};
+    let coords = point.to_affine().coordinates();
+    if bool::from(coords.is_none()) {
+        return Err("value commitment is the identity".into());
+    }
+    let coords = coords.unwrap();
+    Ok((*coords.x(), *coords.y()))
+}
+
 async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(), Box<dyn Error>> {
     use darkfi::tx::Transaction;
     use darkfi::zk::{proof::VerifyingKey, vm::ZkCircuit, vm_heap::empty_witnesses};
@@ -1684,7 +1720,6 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
         MoneyFunction, MONEY_CONTRACT_ZKAS_BURN_NS_V1, MONEY_CONTRACT_ZKAS_FEE_NS_V1,
         MONEY_CONTRACT_ZKAS_MINT_NS_V1,
     };
-    use darkfi_sdk::crypto::pasta_prelude::{Curve, CurveAffine};
     use darkfi_sdk::crypto::{FuncId, PublicKey};
     use darkfi_serial::{deserialize, Decodable};
     use std::collections::HashMap;
@@ -1747,14 +1782,14 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
                 let mut zkp = Vec::new();
                 let mut sigs: Vec<PublicKey> = Vec::new();
                 for input in &params.inputs {
-                    let value_coords = input.value_commit.to_affine().coordinates().unwrap();
+                    let value_coords = commit_xy(input.value_commit)?;
                     let (sig_x, sig_y) = input.signature_public.xy();
                     zkp.push((
                         MONEY_CONTRACT_ZKAS_BURN_NS_V1.to_string(),
                         vec![
                             input.nullifier.inner(),
-                            *value_coords.x(),
-                            *value_coords.y(),
+                            value_coords.0,
+                            value_coords.1,
                             input.token_commit,
                             input.merkle_root.inner(),
                             input.user_data_enc,
@@ -1766,13 +1801,13 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
                     sigs.push(input.signature_public);
                 }
                 for output in &params.outputs {
-                    let value_coords = output.value_commit.to_affine().coordinates().unwrap();
+                    let value_coords = commit_xy(output.value_commit)?;
                     zkp.push((
                         MONEY_CONTRACT_ZKAS_MINT_NS_V1.to_string(),
                         vec![
                             output.coin.inner(),
-                            *value_coords.x(),
-                            *value_coords.y(),
+                            value_coords.0,
+                            value_coords.1,
                             output.token_commit,
                         ],
                     ));
@@ -1781,30 +1816,27 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
                 sig_table.push(sigs);
             }
             MoneyFunction::FeeV1 => {
+                if call.data.data.len() < 9 {
+                    return Err("FeeV1 call data shorter than 9 bytes".into());
+                }
                 let params: MoneyFeeParamsV1 = deserialize(&call.data.data[9..])?;
-                let input_value_coords =
-                    params.input.value_commit.to_affine().coordinates().unwrap();
-                let output_value_coords = params
-                    .output
-                    .value_commit
-                    .to_affine()
-                    .coordinates()
-                    .unwrap();
+                let input_value_coords = commit_xy(params.input.value_commit)?;
+                let output_value_coords = commit_xy(params.output.value_commit)?;
                 let (sig_x, sig_y) = params.input.signature_public.xy();
                 zkp_table.push(vec![(
                     MONEY_CONTRACT_ZKAS_FEE_NS_V1.to_string(),
                     vec![
                         params.input.nullifier.inner(),
-                        *input_value_coords.x(),
-                        *input_value_coords.y(),
+                        input_value_coords.0,
+                        input_value_coords.1,
                         params.input.token_commit,
                         params.input.merkle_root.inner(),
                         params.input.user_data_enc,
                         sig_x,
                         sig_y,
                         params.output.coin.inner(),
-                        *output_value_coords.x(),
-                        *output_value_coords.y(),
+                        output_value_coords.0,
+                        output_value_coords.1,
                     ],
                 )]);
                 sig_table.push(vec![params.input.signature_public]);
@@ -1858,6 +1890,9 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
                 );
             }
             Ok(MoneyFunction::FeeV1) => {
+                if call.data.data.len() < 9 {
+                    return Err("FeeV1 call data shorter than 9 bytes".into());
+                }
                 let fee: u64 = deserialize(&call.data.data[1..9])?;
                 let params: MoneyFeeParamsV1 = deserialize(&call.data.data[9..])?;
                 nf_watch.insert(params.input.nullifier.to_bytes().to_vec());
@@ -1920,6 +1955,35 @@ fn sha2_256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Verify GetCluePublicKey directory attestation, then build a UnifOMR clue.
+/// Clues for the sender's change outputs. Output 0 keeps the recipient clue.
+fn self_change_clues(
+    network: &str,
+    w: &wallet::Wallet,
+    payment_clue: &[u8],
+    indices: &[u32],
+) -> Vec<crate::client::proto::OutputOmrClue> {
+    if payment_clue.is_empty() {
+        return Vec::new();
+    }
+    let Ok(secret) = w.wallet_secret_bytes() else {
+        return Vec::new();
+    };
+    let net = wallet::Wallet::network_byte(network);
+    let Ok((_sk, pk)) = darkfi_lightwalletd::unifomr::clue_keypair_from_wallet(&secret, net) else {
+        return Vec::new();
+    };
+    let clue = darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk);
+    indices
+        .iter()
+        .copied()
+        .filter(|idx| *idx != 0)
+        .map(|output_index| crate::client::proto::OutputOmrClue {
+            output_index,
+            omr_clue: clue.clone(),
+        })
+        .collect()
+}
+
 fn verified_unifomr_clue(
     network_byte: u8,
     recipient_pk: &[u8; 32],

@@ -2,7 +2,7 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC and syncs with **UnifOMR only** (scheme `0x05`). There is no PerfOMR fallback.
 
-**3.00.015** (crate semver **3.0.15** — leading zeros are not valid Cargo versions): DarkFi pin `f0978c222` (`nighthawk-testnet` with public `Drk::scan_block` and darkfid sync hardening). Money Merkle tree is backfilled from genesis after a birthday rescan so spend proofs stay on-chain (Money `Custom(5)` / `TransferMerkleRootNotFound`). CI checks out the pinned `nighthawk24/darkfi` sibling as `darkfi-nighthawk-testnet`. FIFO-capped clue-registration session cache (10,000 ids; updates do not refresh eviction order). Reorg recovery reports real SQLite `execute` rowcounts for notes and transactions (`invalidate_above_height`). Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.00.016** (crate semver **3.0.16** — leading zeros are not valid Cargo versions): DarkFi checkout `e4e624179` (`nighthawk-testnet`, path dependency). Reorg recovery unspends a coin only when its nullifier was in a block above the fork. New wallets take `MOONSHINE_WALLET_PASS` and keep the wrap key inside the encrypted database. Sends attach a UniFOMR clue for the sender's change outputs. Money Merkle tree is backfilled from genesis after a birthday rescan so spend proofs stay on-chain (Money `Custom(5)` / `TransferMerkleRootNotFound`). CI checks out the pinned `nighthawk24/darkfi` sibling as `darkfi-nighthawk-testnet`. FIFO-capped clue-registration session cache (10,000 ids; updates do not refresh eviction order). Reorg recovery reports real SQLite `execute` rowcounts for notes and transactions (`invalidate_above_height`). Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
 > **Strict UnifOMR (hard-coded):** Moonshine does **not** run supplemental / gap trial decrypt. **Only** transactions that carry UnifOMR clues are discovered during normal sync — typically **Moonshine ↔ Moonshine**, or **Nighthawk → Moonshine**. Payments from upstream `drk` / other non-UnifOMR wallets will **not** appear unless you explicitly run `moonshine sync --force-trial` (privacy trade-off). Nighthawk Android / iOS / desktop default the opposite (trial-decrypt fallback on) so they can receive from any DarkFi wallet.
 
@@ -163,7 +163,7 @@ moonshine
 |---------|--------|-------|
 | **UnifOMR only (0x05)** | ✅ | `GetUnifOmrDigest` + `FetchPirBatch` when capabilities say `unifomr` |
 | **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses. Session cache is FIFO-capped at 10,000 ids |
-| **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive |
+| **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive. Change outputs get their own clues (`extra_omr_clues`) |
 | **Payment memo on wire** | ✅ | `--memo` → OMR-aware bytes in recipient `MoneyNote::memo` (not local-only) |
 | **Multi detection_keys** | ✅ | Up to 16 wallet secrets in `GetUnifOmrDigest` |
 | **Local BlockCache** | ✅ | Sparse/PIR compact blocks cached beside wallet DB |
@@ -182,7 +182,7 @@ moonshine
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **SQLCipher DB (S14)** | ✅ | `PRAGMA key` from `MOONSHINE_WALLET_PASS` or `{db}.pass` (0600) |
-| **Secret wrap** | ✅ | Address `secret_key` BLOBs wrapped (`MSK1` + MAC); `.wrapkey` sidecar |
+| **Secret wrap** | ✅ | Address `secret_key` BLOBs wrapped (`MSK1` + MAC). The wrap key is stored inside the encrypted database. A legacy `.wrapkey` file is imported once and deleted |
 | **WAL + secure_delete** | ✅ | SQLite pragmas on open |
 | **22-word DarkFi mnemonic** | ✅ | Same derivation as Nighthawk Android/iOS |
 

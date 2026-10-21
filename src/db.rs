@@ -39,22 +39,52 @@ impl WalletDb {
     pub fn open(path: &str) -> SqlResult<Self> {
         let passphrase = crate::secret_wrap::load_or_create_passphrase(path)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-        let wrap_key = crate::secret_wrap::load_or_create_wrap_key(path)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
         let conn = Connection::open(path)?;
         // SQLCipher: unlock / encrypt the database with the wallet passphrase.
         conn.pragma_update(None, "key", &passphrase)?;
-        let db = Self { conn, wrap_key };
+        let mut db = Self {
+            conn,
+            wrap_key: [0u8; 32],
+        };
         db.initialize()?;
-        // Persist wrap key inside encrypted wallet_meta (passphrase-wrapped).
-        if db.get_meta(crate::secret_wrap::META_WRAP_KEY)?.is_none() {
-            crate::secret_wrap::store_wrap_key_in_meta(
-                |k, v| db.set_meta(k, v).map_err(|e| e.to_string()),
-                &db.wrap_key,
-                &passphrase,
-            )
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        // The wrap key lives inside the encrypted DB. A legacy `{path}.wrapkey`
+        // file is imported once, then removed so the key is not sitting beside
+        // the ciphertext.
+        if let Some(stored) = db.get_meta(crate::secret_wrap::META_WRAP_KEY)? {
+            db.wrap_key = crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            crate::secret_wrap::delete_legacy_wrap_key(path);
+            return Ok(db);
         }
+        let wrap_key = match crate::secret_wrap::read_legacy_wrap_key(path)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+        {
+            Some(key) => key,
+            None => crate::secret_wrap::random_wrap_key(),
+        };
+        crate::secret_wrap::store_wrap_key_in_meta(
+            |k, v| db.set_meta(k, v).map_err(|e| e.to_string()),
+            &wrap_key,
+            &passphrase,
+        )
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        // Confirm the meta copy unwraps before deleting the sidecar.
+        let stored = db
+            .get_meta(crate::secret_wrap::META_WRAP_KEY)?
+            .ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    "wrap key missing from wallet_meta after store".into(),
+                )
+            })?;
+        let check = crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        if check != wrap_key {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                "wrap key round-trip mismatch".into(),
+            ));
+        }
+        db.wrap_key = wrap_key;
+        crate::secret_wrap::delete_legacy_wrap_key(path);
         Ok(db)
     }
 
@@ -371,6 +401,11 @@ impl WalletDb {
         let _ = self
             .conn
             .execute("ALTER TABLE notes ADD COLUMN spend_hook_bytes BLOB", []);
+        // Height at which the nullifier was observed. Absent on rows spent
+        // before this column existed; those stay spent across a reorg.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE notes ADD COLUMN spent_height INTEGER", []);
         Ok(())
     }
 
@@ -642,9 +677,25 @@ impl WalletDb {
 
     /// Mark a note as spent when its **nullifier** appears on-chain.
     pub fn mark_note_spent(&self, nullifier: &[u8]) -> SqlResult<usize> {
+        self.mark_note_spent_at(nullifier, None)
+    }
+
+    /// Mark a note spent, recording the block height of the nullifier.
+    ///
+    /// A later sync that learns the height fills `spent_height` on a row that
+    /// was reserved at broadcast time with a null height. Reorg recovery
+    /// unspends only rows whose `spent_height` is above the fork.
+    pub fn mark_note_spent_at(
+        &self,
+        nullifier: &[u8],
+        spent_height: Option<u32>,
+    ) -> SqlResult<usize> {
         let rows = self.conn.execute(
-            "UPDATE notes SET spent = 1 WHERE nullifier = ?1 AND spent = 0",
-            params![nullifier],
+            "UPDATE notes SET spent = 1, \
+             spent_height = CASE WHEN ?2 IS NULL THEN spent_height ELSE COALESCE(spent_height, ?2) END \
+             WHERE nullifier = ?1 \
+             AND (spent = 0 OR (?2 IS NOT NULL AND spent_height IS NULL))",
+            params![nullifier, spent_height],
         )?;
         Ok(rows)
     }
@@ -762,12 +813,19 @@ impl WalletDb {
             "DELETE FROM transactions WHERE block_height > ?1",
             params![height],
         )?;
-        // Re-compute spent status: notes that were marked spent by now-orphaned
-        // transactions need to be un-spent.
+        // Unspend only notes whose nullifier was in a block above the fork.
+        // `block_height` is the note's creation height, not its spend height.
+        // Rows with a null `spent_height` (legacy, or reserved at broadcast)
+        // stay spent so a reorg cannot resurrect historically spent coins.
         self.conn.execute(
-            "UPDATE notes SET spent = 0 WHERE spent = 1 AND block_height <= ?1",
+            "UPDATE notes SET spent = 0, spent_height = NULL \
+             WHERE spent = 1 AND spent_height IS NOT NULL AND spent_height > ?1",
             params![height],
         )?;
+        // The Merkle frontier included the orphaned blocks. Drop it so the
+        // next sync rebuilds from the fork instead of appending onto it.
+        self.conn
+            .execute("DELETE FROM wallet_meta WHERE key = 'tree_state'", [])?;
         self.set_sync_height(height)?;
         Ok((notes_deleted as u32, txs_deleted as u32))
     }
@@ -1327,12 +1385,40 @@ mod tests {
             Some(&[9u8; 32]),
         )
         .unwrap();
-        db.mark_note_spent(&[1]).unwrap();
-        db.mark_note_spent(&[2]).unwrap();
+        // Spent in a block that the rewind keeps (height 80).
+        db.mark_note_spent_at(&[1], Some(80)).unwrap();
+        // Spent in a block the rewind orphans (height 200).
+        db.mark_note_spent_at(&[2], Some(200)).unwrap();
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
 
         db.invalidate_above_height(150).unwrap();
-        assert_eq!(db.confirmed_balance("DRK").unwrap(), 500);
+        // The height-200 note is deleted. The height-100 note was spent at 80,
+        // which is still canonical, so it stays spent.
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
+
+        db.insert_note(
+            "tx_reorg_spend",
+            0,
+            700,
+            "DRK",
+            &[3],
+            120,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[3]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.mark_note_spent_at(&[3], Some(180)).unwrap();
+        db.invalidate_above_height(150).unwrap();
+        // Spend was above the fork, so the coin is unspent again.
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 700);
     }
 
     #[test]

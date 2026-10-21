@@ -113,6 +113,32 @@ pub struct BuiltTransfer {
     pub tx: Transaction,
     pub spent_commitments: Vec<Vec<u8>>,
     pub spent_nullifiers: Vec<Vec<u8>>,
+    /// Compact-block output indexes of change that decrypts to this wallet.
+    /// Index 0 is the payment output and is covered by the recipient clue.
+    pub self_output_indices: Vec<u32>,
+}
+
+/// Compact output indexes (skipping tx-local coins) that belong to `secret`.
+fn self_output_indices(
+    outputs: &[darkfi_money_contract::model::Output],
+    secret: &SecretKey,
+    include_fee_change: bool,
+) -> Vec<u32> {
+    let mut idx = 0u32;
+    let mut ours = Vec::new();
+    for output in outputs {
+        if output.tx_local {
+            continue;
+        }
+        if output.note.decrypt::<MoneyNote>(secret).is_ok() {
+            ours.push(idx);
+        }
+        idx += 1;
+    }
+    if include_fee_change {
+        ours.push(idx);
+    }
+    ours
 }
 
 fn own_coin_commitment(coin: &OwnCoin) -> Vec<u8> {
@@ -437,10 +463,12 @@ pub async fn build_transaction(
         tx.signatures.push(sigs);
         let fee_sigs = tx.create_sigs(&[signature_secret])?;
         tx.signatures.push(fee_sigs);
+        let self_output_indices = self_output_indices(&params.outputs, &keypair.secret, true);
         Ok(BuiltTransfer {
             tx,
             spent_commitments,
             spent_nullifiers,
+            self_output_indices,
         })
     } else {
         // No fee call — build transaction with just the transfer call.
@@ -448,10 +476,12 @@ pub async fn build_transaction(
         let mut tx = tx_builder.build()?;
         let sigs = tx.create_sigs(&secrets.signature_secrets)?;
         tx.signatures.push(sigs);
+        let self_output_indices = self_output_indices(&params.outputs, &keypair.secret, false);
         Ok(BuiltTransfer {
             tx,
             spent_commitments,
             spent_nullifiers,
+            self_output_indices,
         })
     }
 }
