@@ -440,8 +440,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     return Ok(());
                 }
 
-                // Select inputs (greedy coin selection)
-                let unspent = w.db.list_unspent()?;
+                // Largest coin first so a payment that fits in one input does not
+                // pull a second one. darkfid currently rejects those two-input proofs.
+                let mut unspent = w.db.list_unspent()?;
+                unspent.sort_by(|a, b| b.2.cmp(&a.2));
                 let mut selected_inputs = Vec::new();
                 let mut input_total = 0u64;
 
@@ -736,6 +738,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         leaf_position: (lpos as u64).into(),
                     });
                 }
+                // Largest first so a payment that fits in one coin does not
+                // pull in an extra input. Two-input proofs are currently
+                // rejected by darkfid as invalid.
+                all_coins.sort_by(|a, b| b.note.value.cmp(&a.note.value));
 
                 // Filter to requested token (DRK aliases native token hex).
                 let want_drk = crate::db::WalletDb::is_drk_token(&token);
