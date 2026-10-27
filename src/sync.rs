@@ -54,7 +54,10 @@ use tokio::time::Duration;
 /// Maximum blocks to request in a single range RPC.
 /// Must stay ≤ lightwalletd `max_range_per_request` (10_000) **after**
 /// power-of-2 privacy padding (padding can nearly double the window).
-const MAX_BLOCKS_PER_REQUEST: u32 = 4096;
+pub const MAX_BLOCKS_PER_REQUEST: u32 = 4096;
+
+/// Server cap for one padded commitment, nullifier, or digest window.
+const MAX_RANGE_PER_REQUEST: u32 = 10_000;
 
 /// Minimum padding bucket size (blocks) — matches mobile lightwallet_client.
 const MIN_BUCKET_SIZE: u32 = 1024;
@@ -84,7 +87,6 @@ fn genesis_money_tree() -> MerkleTree {
 
 /// Canonical checkpoint digest: blake3(height LE || tree_data || nullifier_index).
 /// Must stay lockstep with darkfi-mobile-ffi and darkfi-lightwalletd.
-#[allow(dead_code)]
 pub fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&height.to_le_bytes());
@@ -198,6 +200,19 @@ impl SyncEngine {
             });
         }
 
+        // First sync (cursor 0): install the greatest snapshot <= birthday, or
+        // the latest snapshot when the wallet has no birthday. NOT_FOUND and a
+        // tip-only server fall through to commitment replay. A birthday of 0
+        // sets the note cursor to the snapshot so 0..snapshot is not replayed.
+        if last_synced == 0 && !self.db.merkle_from_genesis() && tip_height > 0 {
+            if let Some(height) = self.try_install_checkpoint(&mut client, birthday).await? {
+                if birthday == 0 {
+                    self.db.set_sync_height(height)?;
+                }
+            }
+        }
+        let (last_synced, birthday) = self.db.get_sync_state()?;
+
         if last_synced >= tip_height {
             if !self.db.merkle_from_genesis() {
                 eprintln!(
@@ -215,12 +230,22 @@ impl SyncEngine {
         }
 
         // last_synced == 0 means never synced (or rescan-to-genesis), not
-        // "already applied height 0". Include genesis mint coins.
-        let scan_start = if last_synced == 0 {
-            birthday
-        } else {
-            (last_synced + 1).max(birthday)
-        };
+        // "already applied height 0", unless a snapshot already installed the tree.
+        let scan_start = scan_start_for_sync(
+            last_synced,
+            birthday,
+            self.db.merkle_from_genesis(),
+            self.tree_applied_height(),
+        );
+        if scan_start > tip_height {
+            self.db.set_sync_height(tip_height)?;
+            return Ok(SyncResult {
+                blocks_scanned: 0,
+                notes_found: 0,
+                notes_spent: 0,
+                tip_height,
+            });
+        }
         // May be clamped down below if the server truncates the OMR digest at its
         // DoS cap; the dropped tail is then re-scanned on the next cycle.
         let mut scan_end = tip_height.min(scan_start + MAX_BLOCKS_PER_REQUEST - 1);
@@ -304,9 +329,12 @@ impl SyncEngine {
                  (UnifOMR fallback / --force-trial)"
             );
             let blocks = self
-                .fetch_window_range(&mut client, scan_start, scan_end)
+                .fetch_padded_window_blocks(&mut client, scan_start, scan_end, tip_height)
                 .await?;
             for block in &blocks {
+                if !height_in_scan_window(block.height, scan_start, scan_end) {
+                    continue;
+                }
                 notes_found += self.trial_decrypt_block(block)?;
             }
         } else if !heights_to_fetch.is_empty() {
@@ -332,6 +360,9 @@ impl SyncEngine {
                 }
             }
             for block in &blocks {
+                if !height_in_scan_window(block.height, scan_start, scan_end) {
+                    continue;
+                }
                 notes_found += self.trial_decrypt_block(block)?;
             }
         }
@@ -340,16 +371,29 @@ impl SyncEngine {
         //    Trial decrypt has already inserted owned coins so they can be marked.
         //    Pre-birthday heights are backfilled first; never append birthday..tip
         //    onto a dummy-only tree (that is Money Custom(5) on spend).
-        self.ensure_genesis_merkle(&mut client, scan_start).await?;
-        self.apply_note_commitments(&mut client, scan_start, scan_end)
+        // A snapshot installed above skips 0..=snapshot. The suffix up to the
+        // birthday is the only pre-scan replay.
+        // Wallets synced before `tree_applied_height` existed already hold a
+        // tree through `last_synced`. Stamp that cursor so a backfill does not
+        // append those leaves a second time.
+        if self.db.merkle_from_genesis()
+            && self.tree_applied_recorded().is_none()
+            && last_synced > 0
+        {
+            self.set_tree_applied_height(last_synced)?;
+        }
+        self.ensure_genesis_merkle(&mut client, scan_start, tip_height)
             .await?;
-        if scan_start == 0 {
+        self.apply_note_commitments(&mut client, scan_start, scan_end, tip_height)
+            .await?;
+        if scan_start == 0 || self.db.merkle_from_genesis() {
             self.db.set_merkle_from_genesis(true)?;
         }
+        self.set_tree_applied_height(scan_end)?;
 
-        // 3) Nullifiers → mark spent (full scan range)
+        // 3) Nullifiers → mark spent (full scan range, padded on the wire)
         let notes_spent = self
-            .apply_nullifiers_range(&mut client, scan_start, scan_end)
+            .apply_nullifiers_range(&mut client, scan_start, scan_end, tip_height)
             .await?;
 
         // Tip advance: commitments + nullifiers done; sparse fetches succeeded.
@@ -373,8 +417,19 @@ impl SyncEngine {
         client: &mut LightwalletClient,
         scan_start: u32,
         scan_end: u32,
+        tip: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let owned = self.owned_commitment_set()?;
+        // A crash after a mid-window flush left the tree ahead of the note
+        // cursor. Resume at the next unapplied height instead of appending
+        // the same coins again.
+        let start = match self.tree_applied_recorded() {
+            Some(applied) if applied >= scan_start => applied.saturating_add(1),
+            _ => scan_start,
+        };
+        if start > scan_end {
+            return Ok(());
+        }
         let tree_bytes = self.db.get_meta("tree_state")?.unwrap_or_else(|| {
             let mut out = Vec::new();
             darkfi_serial::Encodable::encode(&genesis_money_tree(), &mut out).unwrap_or(0);
@@ -386,7 +441,7 @@ impl SyncEngine {
                 .map_err(|e| format!("Failed to decode MerkleTree: {}", e))?;
 
         let total_marked = self
-            .append_note_commitments_range(client, &mut tree, &owned, scan_start, scan_end)
+            .append_note_commitments_range(client, &mut tree, &owned, start, scan_end, tip)
             .await?;
 
         if total_marked > 0 {
@@ -423,7 +478,10 @@ impl SyncEngine {
             .collect())
     }
 
-    /// Stream `GetNoteCommitments(start..=end)` and append every coin.
+    /// Stream padded `GetNoteCommitments` and append coins inside `[start, end]`.
+    ///
+    /// Heights outside the scan window are dropped so a power-of-two bucket
+    /// does not append leaves the previous cycle already applied.
     async fn append_note_commitments_range(
         &self,
         client: &mut LightwalletClient,
@@ -431,14 +489,32 @@ impl SyncEngine {
         owned_commitments: &std::collections::HashSet<[u8; 32]>,
         start: u32,
         end: u32,
+        tip: u32,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         if start > end {
             return Ok(0);
         }
-        let mut nc_stream = client.get_note_commitments(start, end).await?;
+        let (pad_start, pad_end) = require_padded_range(start, end, tip)?;
+        let mut nc_stream = client.get_note_commitments(pad_start, pad_end).await?;
         let mut total_marked = 0u64;
+        let mut heights_in_batch = 0u32;
+        let mut prev_height: Option<u32> = None;
         while let Some(nc_result) = nc_stream.next().await {
             let nc = nc_result?;
+            if !height_in_scan_window(nc.height, start, end) {
+                continue;
+            }
+            if prev_height.is_some() && prev_height != Some(nc.height) {
+                heights_in_batch += 1;
+                if heights_in_batch >= 256 {
+                    if let Some(done) = prev_height {
+                        self.persist_money_tree(tree)?;
+                        self.set_tree_applied_height(done)?;
+                    }
+                    heights_in_batch = 0;
+                }
+            }
+            prev_height = Some(nc.height);
             for coin in nc.coins {
                 if coin.len() != 32 {
                     continue;
@@ -467,26 +543,40 @@ impl SyncEngine {
         &self,
         client: &mut LightwalletClient,
         scan_start: u32,
+        tip: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.db.merkle_from_genesis() {
-            return Ok(());
-        }
         if scan_start == 0 {
             return Ok(());
         }
+        let applied = self.tree_applied_height();
+        if self.db.merkle_from_genesis() && applied.saturating_add(1) >= scan_start {
+            return Ok(());
+        }
         let end = scan_start - 1;
+        let start_from = if self.db.merkle_from_genesis() {
+            applied.saturating_add(1)
+        } else {
+            0
+        };
+        if start_from > end {
+            return Ok(());
+        }
         eprintln!(
-            "Backfilling Money Merkle tree for heights 0..={end} \
+            "Backfilling Money Merkle tree for heights {start_from}..={end} \
              (note scan starts at {scan_start}; pre-history must still be in the tree)..."
         );
         let owned = self.owned_commitment_set()?;
-        let mut tree = genesis_money_tree();
-        let mut start = 0u32;
+        let mut tree = if self.db.merkle_from_genesis() {
+            self.load_money_tree()?
+        } else {
+            genesis_money_tree()
+        };
+        let mut start = start_from;
         let mut marked = 0u64;
         while start <= end {
             let chunk_end = start.saturating_add(MAX_BLOCKS_PER_REQUEST - 1).min(end);
             marked += self
-                .append_note_commitments_range(client, &mut tree, &owned, start, chunk_end)
+                .append_note_commitments_range(client, &mut tree, &owned, start, chunk_end, tip)
                 .await?;
             eprintln!("  merkle backfill {chunk_end}/{end}");
             start = chunk_end.saturating_add(1);
@@ -502,7 +592,112 @@ impl SyncEngine {
             .map_err(|e| format!("Failed to encode MerkleTree: {e}"))?;
         self.db.set_meta("tree_state", &out)?;
         self.db.set_merkle_from_genesis(true)?;
+        self.set_tree_applied_height(end)?;
         Ok(())
+    }
+
+    fn tree_applied_recorded(&self) -> Option<u32> {
+        match self.db.get_meta("tree_applied_height") {
+            Ok(Some(bytes)) if bytes.len() == 4 => Some(u32::from_le_bytes(
+                bytes.as_slice().try_into().unwrap_or([0; 4]),
+            )),
+            _ => None,
+        }
+    }
+
+    fn tree_applied_height(&self) -> u32 {
+        self.tree_applied_recorded().unwrap_or(0)
+    }
+
+    fn persist_money_tree(&self, tree: &MerkleTree) -> Result<(), Box<dyn std::error::Error>> {
+        let mut out = Vec::new();
+        darkfi_serial::Encodable::encode(tree, &mut out).map_err(
+            |e| -> Box<dyn std::error::Error> {
+                format!("Failed to encode MerkleTree: {e}").into()
+            },
+        )?;
+        self.db.set_meta("tree_state", &out)?;
+        Ok(())
+    }
+
+    fn set_tree_applied_height(&self, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+        self.db
+            .set_meta("tree_applied_height", &height.to_le_bytes())
+            .map_err(|e| format!("set tree_applied_height: {e}").into())
+    }
+
+    fn load_money_tree(&self) -> Result<MerkleTree, Box<dyn std::error::Error>> {
+        let bytes = self
+            .db
+            .get_meta("tree_state")?
+            .ok_or("money tree missing after checkpoint")?;
+        darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(bytes))
+            .map_err(|e| format!("decode money tree: {e}").into())
+    }
+
+    /// Install a server Money-tree snapshot.
+    ///
+    /// `birthday > 0` requests that height and accepts only a snapshot `<=` it.
+    /// `birthday == 0` requests the latest snapshot. `Ok(None)` means replay
+    /// commitments (NOT_FOUND, a tip-only server, or a snapshot the client will
+    /// not install). The tree is written only after the hash and decode succeed.
+    async fn try_install_checkpoint(
+        &self,
+        client: &mut LightwalletClient,
+        birthday: u32,
+    ) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+        let preferred = preferred_checkpoint_height(birthday);
+        let chunks = match client.get_checkpoint_snapshot(preferred).await {
+            Ok(chunks) => chunks,
+            Err(e) if checkpoint_status_falls_back(e.as_ref()) => {
+                tracing::warn!(
+                    "checkpoint unavailable ({}); replaying commitments",
+                    redact_sync_error(&e.to_string())
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let Some(first) = chunks.first() else {
+            tracing::warn!("empty checkpoint snapshot; replaying commitments");
+            return Ok(None);
+        };
+        let height = first.height;
+        if chunks.iter().any(|chunk| chunk.height != height) {
+            tracing::warn!("checkpoint chunks disagree on height; replaying commitments");
+            return Ok(None);
+        }
+        if !checkpoint_snapshot_accepted(height, birthday) {
+            tracing::warn!(
+                "checkpoint height {height} is above birthday {birthday}; replaying commitments"
+            );
+            return Ok(None);
+        }
+        let mut tree_data = Vec::new();
+        for chunk in &chunks {
+            tree_data.extend_from_slice(&chunk.tree_data);
+        }
+        let digest = snapshot_integrity_hash(height, &tree_data, &first.nullifier_index);
+        if digest.as_slice() != first.snapshot_hash.as_slice() {
+            tracing::warn!("checkpoint integrity check failed at {height}; replaying commitments");
+            return Ok(None);
+        }
+        let tree: MerkleTree =
+            darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(&tree_data)).map_err(
+                |e| -> Box<dyn std::error::Error> { format!("checkpoint tree decode: {e}").into() },
+            )?;
+        let mut out = Vec::new();
+        darkfi_serial::Encodable::encode(&tree, &mut out).map_err(
+            |e| -> Box<dyn std::error::Error> { format!("checkpoint tree encode: {e}").into() },
+        )?;
+        self.db.set_meta("tree_state", &out)?;
+        self.db.set_merkle_from_genesis(true)?;
+        self.set_tree_applied_height(height)?;
+        eprintln!(
+            "Installed Money tree snapshot at height {height} (birthday {birthday}); \
+             commitments at or below the snapshot are not replayed"
+        );
+        Ok(Some(height))
     }
 
     /// Rewrite unspent note commitments from compact-block `output.coin`.
@@ -523,7 +718,8 @@ impl SyncEngine {
         let max_h = locs.iter().map(|l| l.2).max().unwrap_or(0);
         // Pad the window so the server does not learn the exact heights of
         // unspent notes. A sparse height list would reveal those heights.
-        let (pad_start, pad_end) = pad_block_range(min_h, max_h, max_h);
+        let tip = client.get_chain_tip().await?.height.max(max_h);
+        let (pad_start, pad_end) = require_padded_range(min_h.min(tip), max_h.min(tip), tip)?;
         eprintln!(
             "  fetching compact blocks {pad_start}..={pad_end} to restore coin commitments..."
         );
@@ -729,11 +925,15 @@ impl SyncEngine {
         const CHUNK: u32 = 4096;
         while start <= tip {
             let end = start.saturating_add(CHUNK - 1).min(tip);
-            let mut stream = client.get_note_commitments(start, end).await?;
+            let (pad_start, pad_end) = require_padded_range(start, end, tip)?;
+            let mut stream = client.get_note_commitments(pad_start, pad_end).await?;
             let mut by_h: std::collections::BTreeMap<u32, Vec<Vec<u8>>> =
                 std::collections::BTreeMap::new();
             while let Some(nc_result) = stream.next().await {
                 let nc = nc_result?;
+                if !height_in_scan_window(nc.height, start, end) {
+                    continue;
+                }
                 by_h.entry(nc.height).or_default().extend(nc.coins);
             }
             for (_h, coins) in by_h {
@@ -846,7 +1046,7 @@ impl SyncEngine {
                 "  catching up Merkle {}..={now} (blocks mined during rebuild)",
                 tip + 1
             );
-            self.apply_note_commitments(&mut client, tip + 1, now)
+            self.apply_note_commitments(&mut client, tip + 1, now, now)
                 .await?;
             now
         } else {
@@ -855,11 +1055,15 @@ impl SyncEngine {
         // Prevent the following `sync_once` from re-appending heights already
         // included in this rebuild (that would duplicate leaves and break spends).
         self.db.set_sync_height(final_tip)?;
+        self.set_tree_applied_height(final_tip)?;
         match self.db.recompute_owned_nullifiers() {
             Ok(n) => eprintln!("  recomputed nullifiers for {n} unspent notes"),
             Err(e) => eprintln!("  warning: recompute nullifiers failed: {e}"),
         }
-        match self.apply_nullifiers_range(&mut client, 0, final_tip).await {
+        match self
+            .apply_nullifiers_range(&mut client, 0, final_tip, final_tip)
+            .await
+        {
             Ok(spent) => {
                 if spent > 0 {
                     eprintln!("  marked {spent} notes spent from chain nullifiers");
@@ -895,22 +1099,27 @@ impl SyncEngine {
     /// Mark wallet notes spent when their nullifiers appear in `[start, end]`.
     ///
     /// Recomputes `poseidon(secret, coin)` first so rows inserted before that
-    /// column was populated still match the LWD stream. Chunks at 10000 to
-    /// stay under the gRPC range cap.
+    /// column was populated still match the LWD stream. Chunks stay inside a
+    /// 4096-block window so padding cannot exceed the server range cap.
     async fn apply_nullifiers_range(
         &self,
         client: &mut LightwalletClient,
         start: u32,
         end: u32,
+        tip: u32,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         let _ = self.db.recompute_owned_nullifiers()?;
         let mut notes_spent = 0u32;
         let mut s = start;
         while s <= end {
-            let e = s.saturating_add(9999).min(end);
-            let mut nf_stream = client.get_nullifiers(s, e).await?;
+            let e = s.saturating_add(MAX_BLOCKS_PER_REQUEST - 1).min(end);
+            let (pad_start, pad_end) = require_padded_range(s, e, tip)?;
+            let mut nf_stream = client.get_nullifiers(pad_start, pad_end).await?;
             while let Some(nf_result) = nf_stream.next().await {
                 let nf = nf_result?;
+                if !height_in_scan_window(nf.height, s, e) {
+                    continue;
+                }
                 for nullifier in nf.nullifiers {
                     let marked = self.db.mark_note_spent_at(&nullifier, Some(nf.height))?;
                     if marked > 0 {
@@ -944,30 +1153,42 @@ impl SyncEngine {
     ) -> Result<Vec<crate::client::proto::CompactBlock>, Box<dyn std::error::Error>> {
         let caps = client.get_omr_capabilities().await?;
         if !self.force_trial && caps.enabled && caps.scheme.contains("unifomr") {
-            match self
-                .fetch_matching_blocks_pir(client, window_start, window_end, matching_heights)
-                .await
-            {
-                Ok(blocks) => {
-                    tracing::debug!(
-                        "UnifOMR Round 2: retrieved {} compact blocks via batch PIR",
-                        blocks.len()
-                    );
-                    return Ok(blocks);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "UnifOMR Round 2 PIR failed ({}); falling back to full-window range fetch \
-                         (privacy-preserving — does not reveal matched heights)",
-                        redact_sync_error(&e.to_string())
-                    );
+            let mut last_err: Option<String> = None;
+            for attempt in 1..=3 {
+                match self
+                    .fetch_matching_blocks_pir(client, window_start, window_end, matching_heights)
+                    .await
+                {
+                    Ok(blocks) => {
+                        tracing::debug!(
+                            "UnifOMR Round 2: retrieved {} compact blocks via batch PIR",
+                            blocks.len()
+                        );
+                        return Ok(blocks);
+                    }
+                    Err(e) => {
+                        last_err = Some(redact_sync_error(&e.to_string()));
+                        if attempt < 3 {
+                            tracing::warn!(
+                                "UnifOMR Round 2 PIR attempt {attempt}/3 failed ({}); retrying",
+                                last_err.as_deref().unwrap_or("error")
+                            );
+                            jittered_sleep(1).await;
+                        }
+                    }
                 }
             }
+            tracing::warn!(
+                "UnifOMR Round 2 PIR failed ({}); falling back to full-window range fetch \
+                 (privacy-preserving — does not reveal matched heights)",
+                last_err.unwrap_or_else(|| "error".into())
+            );
         }
 
-        // Privacy-preserving fallback: stream the whole padded window. The
-        // server only sees the (already-known) window, not the match set.
-        self.fetch_window_range(client, window_start, window_end)
+        // Privacy-preserving fallback: the padded window, never the match set.
+        // Prefer compact output bodies; GetBlockRange covers servers that do
+        // not implement that RPC yet. The range stays padded either way.
+        self.fetch_padded_window_blocks(client, window_start, window_end, window_end)
             .await
     }
 
@@ -1339,8 +1560,14 @@ impl SyncEngine {
                 None => true,
             };
             if flush {
-                let digest = client
-                    .get_unif_omr_digest(std::mem::take(&mut chunk_keys), start, end)
+                let digest = self
+                    .pooled_unif_omr_digest(
+                        client,
+                        &chunk_clients,
+                        std::mem::take(&mut chunk_keys),
+                        start,
+                        end,
+                    )
                     .await?;
                 let slot_heights =
                     darkfi_lightwalletd::unifomr::unpack_slot_heights(&digest.slot_heights)?;
@@ -1379,6 +1606,127 @@ impl SyncEngine {
             total_keys
         );
         Ok((heights, covered_end))
+    }
+
+    /// PIR-failure and trial-decrypt download. Requests a padded range and
+    /// prefers `GetCompactOutputBodies`. Servers that do not implement that
+    /// RPC yet fall back to padded `GetBlockRange` (same window, full blocks).
+    async fn fetch_padded_window_blocks(
+        &self,
+        client: &mut LightwalletClient,
+        window_start: u32,
+        window_end: u32,
+        tip: u32,
+    ) -> Result<Vec<crate::client::proto::CompactBlock>, Box<dyn std::error::Error>> {
+        let (pad_start, pad_end) = require_padded_range(window_start, window_end, tip)?;
+        match client.get_compact_output_bodies(pad_start, pad_end).await {
+            Ok(mut stream) => {
+                let mut bodies = Vec::new();
+                while let Some(body) = stream.next().await {
+                    bodies.push(body?);
+                }
+                Ok(compact_blocks_from_output_bodies(bodies))
+            }
+            Err(e) if compact_bodies_unavailable(e.as_ref()) => {
+                tracing::warn!(
+                    "GetCompactOutputBodies unavailable ({}); padded GetBlockRange. \
+                     Gap: this server has no compact-output RPC yet.",
+                    redact_sync_error(&e.to_string())
+                );
+                self.fetch_window_range(client, pad_start, pad_end).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Register the detection key once per process, then ask for a pooled digest.
+    /// `NOT_FOUND` drops the handle, builds a fresh key, and registers again.
+    /// The handle is never logged.
+    async fn pooled_unif_omr_digest(
+        &self,
+        client: &mut LightwalletClient,
+        omr_clients: &[darkfi_lightwalletd::unifomr::UnifOmrClient],
+        detection_keys: Vec<Vec<u8>>,
+        start: u32,
+        end: u32,
+    ) -> Result<crate::client::proto::OmrDigestResponse, Box<dyn std::error::Error>> {
+        match self
+            .digest_from_pool_or_register(client, &detection_keys, start, end)
+            .await
+        {
+            Ok(digest) => Ok(digest),
+            Err(e) if grpc_code_is(e.as_ref(), tonic::Code::NotFound) => {
+                clear_detection_pool();
+                let fresh = rebuild_detection_keys(omr_clients, self.network_byte)?;
+                self.digest_from_pool_or_register(client, &fresh, start, end)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn digest_from_pool_or_register(
+        &self,
+        client: &mut LightwalletClient,
+        detection_keys: &[Vec<u8>],
+        start: u32,
+        end: u32,
+    ) -> Result<crate::client::proto::OmrDigestResponse, Box<dyn std::error::Error>> {
+        if let Some(handle) = detection_pool_handle(&self.server_url, self.network_byte) {
+            match client
+                .get_unif_omr_digest_from_pool(&handle, start, end)
+                .await
+            {
+                Ok(digest) => return Ok(digest),
+                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::NotFound) => {
+                    clear_detection_pool();
+                    return Err(e);
+                }
+                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
+                    return client
+                        .get_unif_omr_digest(detection_keys.to_vec(), start, end)
+                        .await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        match client.register_detection_key(detection_keys.to_vec()).await {
+            Ok(registered) => {
+                let handle = registered.handle;
+                if handle.is_empty() {
+                    return Err("RegisterDetectionKey returned an empty handle".into());
+                }
+                store_detection_pool(
+                    &self.server_url,
+                    self.network_byte,
+                    handle.clone(),
+                    registered.expires_unix,
+                );
+                match client
+                    .get_unif_omr_digest_from_pool(&handle, start, end)
+                    .await
+                {
+                    Ok(digest) => Ok(digest),
+                    Err(e) if grpc_code_is(e.as_ref(), tonic::Code::NotFound) => {
+                        clear_detection_pool();
+                        Err(e)
+                    }
+                    Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
+                        clear_detection_pool();
+                        client
+                            .get_unif_omr_digest(detection_keys.to_vec(), start, end)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
+                client
+                    .get_unif_omr_digest(detection_keys.to_vec(), start, end)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1432,6 +1780,11 @@ fn decrypt_unif_omr_heights(
     Ok(heights.into_iter().collect())
 }
 
+/// True when `height` is inside the inclusive scan window.
+pub fn height_in_scan_window(height: u32, start: u32, end: u32) -> bool {
+    height >= start && height <= end
+}
+
 /// Pad a block range to a power-of-2 bucket boundary (P6 — mobile parity).
 ///
 /// Rounds the range to the next power-of-2 bucket size (minimum 1024 blocks)
@@ -1453,6 +1806,222 @@ pub fn pad_block_range(start: u32, end: u32, tip: u32) -> (u32, u32) {
     }
 
     (aligned_start, aligned_end.min(tip))
+}
+
+/// A wire range lightwalletd accepts for commitments, nullifiers, and compact
+/// output bodies, i.e. any shape [`pad_block_range`] emits, with a span of at
+/// most [`MAX_RANGE_PER_REQUEST`]. `start` sits on a multiple of
+/// `max(next_pow2(span) / 2, MIN_BUCKET_SIZE)`, and the span is either a power
+/// of two of at least [`MIN_BUCKET_SIZE`] or a bucket cut short at `tip`. The
+/// server also takes unaligned power-of-two spans; refusing them here keeps a
+/// raw chunk start off the wire.
+pub fn padded_range_accepted(start: u32, end: u32, tip: u32) -> bool {
+    if start > end || end > tip {
+        return false;
+    }
+    let span = u64::from(end - start) + 1;
+    if span > u64::from(MAX_RANGE_PER_REQUEST) {
+        return false;
+    }
+    let full = span.max(u64::from(MIN_BUCKET_SIZE)).next_power_of_two();
+    let align = (full / 2).max(u64::from(MIN_BUCKET_SIZE));
+    if u64::from(start) % align != 0 {
+        return false;
+    }
+    span == full || end == tip
+}
+
+/// Pad `[start, end]` and refuse to return a range the server would reject.
+pub fn require_padded_range(start: u32, end: u32, tip: u32) -> Result<(u32, u32), String> {
+    if start > end {
+        return Err(format!("invalid block range {start}..={end}"));
+    }
+    if start > tip {
+        return Err(format!(
+            "block range {start}..={end} starts above tip {tip}"
+        ));
+    }
+    let end = end.min(tip);
+    // Re-padding a two-bucket window can widen it, so keep one already padded.
+    if padded_range_accepted(start, end, tip) {
+        return Ok((start, end));
+    }
+    let (padded_start, padded_end) = pad_block_range(start, end, tip);
+    if !padded_range_accepted(padded_start, padded_end, tip) {
+        return Err(format!(
+            "refusing unpadded or oversized range {padded_start}..={padded_end} (tip {tip})"
+        ));
+    }
+    Ok((padded_start, padded_end))
+}
+
+/// First height to scan after optional checkpoint state.
+///
+/// A missing tree with cursor 0 starts at the birthday. An installed snapshot
+/// starts at `max(snapshot + 1, birthday)` so leaves at or below the snapshot
+/// are not appended again.
+pub fn scan_start_for_sync(
+    last_synced: u32,
+    birthday: u32,
+    merkle_from_genesis: bool,
+    tree_applied: u32,
+) -> u32 {
+    if merkle_from_genesis {
+        let after_tree = tree_applied.saturating_add(1);
+        if last_synced == 0 {
+            after_tree.max(birthday)
+        } else {
+            last_synced.saturating_add(1).max(birthday).max(after_tree)
+        }
+    } else if last_synced == 0 {
+        birthday
+    } else {
+        last_synced.saturating_add(1).max(birthday)
+    }
+}
+
+/// `birthday == 0` asks for the latest snapshot. Any other birthday is the
+/// preferred height (greatest snapshot `<=` birthday).
+pub fn preferred_checkpoint_height(birthday: u32) -> u32 {
+    birthday
+}
+
+/// Accept the greatest snapshot at or below the birthday. A birthday of 0
+/// means "latest", so any returned height is acceptable.
+pub fn checkpoint_snapshot_accepted(snapshot_height: u32, birthday: u32) -> bool {
+    birthday == 0 || snapshot_height <= birthday
+}
+
+/// `expires_unix == 0` means the server did not set an expiry.
+pub fn pool_handle_usable(expires_unix: u64, now_unix: u64) -> bool {
+    expires_unix == 0 || now_unix < expires_unix
+}
+
+fn grpc_code_is(err: &(dyn std::error::Error + 'static), code: tonic::Code) -> bool {
+    err.downcast_ref::<tonic::Status>()
+        .is_some_and(|status| status.code() == code)
+}
+
+fn checkpoint_status_falls_back(err: &(dyn std::error::Error + 'static)) -> bool {
+    grpc_code_is(err, tonic::Code::NotFound)
+        || grpc_code_is(err, tonic::Code::Unimplemented)
+        || grpc_code_is(err, tonic::Code::FailedPrecondition)
+}
+
+fn compact_bodies_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
+    grpc_code_is(err, tonic::Code::Unimplemented) || grpc_code_is(err, tonic::Code::NotFound)
+}
+
+fn rebuild_detection_keys(
+    clients: &[darkfi_lightwalletd::unifomr::UnifOmrClient],
+    network: u8,
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut keys = Vec::with_capacity(clients.len());
+    for client in clients {
+        keys.push(client.build_detection_key(network)?);
+    }
+    if keys.is_empty() {
+        return Err("no detection key to re-register".into());
+    }
+    Ok(keys)
+}
+
+struct ProcessDetectionPool {
+    server: String,
+    network: u8,
+    handle: Vec<u8>,
+    expires_unix: u64,
+}
+
+fn detection_pool() -> &'static std::sync::Mutex<Option<ProcessDetectionPool>> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<Option<ProcessDetectionPool>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn detection_pool_handle(server: &str, network: u8) -> Option<Vec<u8>> {
+    let mut slot = detection_pool().lock().unwrap_or_else(|e| e.into_inner());
+    let now = unix_now();
+    let usable = slot.as_ref().is_some_and(|state| {
+        state.server == server
+            && state.network == network
+            && pool_handle_usable(state.expires_unix, now)
+    });
+    if !usable {
+        if slot.is_some() {
+            *slot = None;
+        }
+        return None;
+    }
+    slot.as_ref().map(|state| state.handle.clone())
+}
+
+fn store_detection_pool(server: &str, network: u8, handle: Vec<u8>, expires_unix: u64) {
+    *detection_pool().lock().unwrap_or_else(|e| e.into_inner()) = Some(ProcessDetectionPool {
+        server: server.to_string(),
+        network,
+        handle,
+        expires_unix,
+    });
+}
+
+fn clear_detection_pool() {
+    *detection_pool().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn compact_blocks_from_output_bodies(
+    bodies: Vec<crate::client::proto::CompactOutputBody>,
+) -> Vec<crate::client::proto::CompactBlock> {
+    use std::collections::BTreeMap;
+    struct HeightAcc {
+        hash: Vec<u8>,
+        prev_hash: Vec<u8>,
+        txs: BTreeMap<Vec<u8>, Vec<crate::client::proto::CompactOutput>>,
+    }
+    let mut by_height: BTreeMap<u32, HeightAcc> = BTreeMap::new();
+    for body in bodies {
+        let entry = by_height.entry(body.height).or_insert_with(|| HeightAcc {
+            hash: body.hash.clone(),
+            prev_hash: body.prev_hash.clone(),
+            txs: BTreeMap::new(),
+        });
+        entry.txs.entry(body.tx_hash.clone()).or_default().push(
+            crate::client::proto::CompactOutput {
+                coin: body.coin,
+                encrypted_note: body.encrypted_note,
+                value_commit: Vec::new(),
+                token_commit: Vec::new(),
+                omr_clue: body.omr_clue,
+                omr_metadata_enc: body.omr_metadata_enc,
+            },
+        );
+    }
+    by_height
+        .into_iter()
+        .map(|(height, acc)| crate::client::proto::CompactBlock {
+            height,
+            hash: acc.hash,
+            prev_hash: acc.prev_hash,
+            timestamp: 0,
+            txs: acc
+                .txs
+                .into_iter()
+                .map(|(tx_hash, outputs)| crate::client::proto::CompactTx {
+                    tx_hash,
+                    outputs,
+                    nullifiers: Vec::new(),
+                    fee: 0,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// Jittered sleep for anti-fingerprinting.
@@ -1782,6 +2351,96 @@ pub fn compute_supplemental_heights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_cursor_range_is_rejected() {
+        assert!(!padded_range_accepted(42000, 42100, 50_000));
+        assert!(!padded_range_accepted(100, 100, 50_000));
+        assert!(!padded_range_accepted(0, 9999, 50_000));
+        assert!(require_padded_range(100, 100, 50_000).unwrap() != (100, 100));
+    }
+
+    #[test]
+    fn padded_power_of_two_bucket_is_accepted() {
+        let (start, end) = require_padded_range(42000, 42100, 50_000).unwrap();
+        assert!(padded_range_accepted(start, end, 50_000));
+        assert!(start <= 42000 && end >= 42100);
+        let span = end - start + 1;
+        assert!(span >= 1024);
+        assert!(span.is_power_of_two());
+        assert!(span <= 10_000);
+        assert_eq!(
+            require_padded_range(start, end, 50_000).unwrap(),
+            (start, end)
+        );
+    }
+
+    #[test]
+    fn tip_clamped_bucket_is_accepted_and_oversized_bucket_is_rejected() {
+        let (start, end) = require_padded_range(49900, 50000, 50_000).unwrap();
+        assert!(padded_range_accepted(start, end, 50_000));
+        assert_eq!(end, 50_000);
+        assert!(start <= 49900);
+        assert!(!padded_range_accepted(0, 16_383, 100_000));
+        assert!(require_padded_range(0, 9999, 100_000).is_err());
+    }
+
+    #[test]
+    fn two_bucket_windows_are_accepted_and_not_widened() {
+        // 1500..=2500 crosses the 2048 boundary: two 1024 buckets.
+        let (start, end) = require_padded_range(1500, 2500, 50_000).unwrap();
+        assert_eq!((start, end), (1024, 3071));
+        assert!(padded_range_accepted(start, end, 50_000));
+        assert_eq!(require_padded_range(start, end, end).unwrap(), (start, end));
+        // The same window cut at the tip.
+        let (start, end) = require_padded_range(1500, 2500, 2600).unwrap();
+        assert_eq!((start, end), (1024, 2600));
+        assert_eq!(require_padded_range(start, end, 2600).unwrap(), (start, end));
+        // A raw power-of-two chunk off the bucket grid is still padded.
+        assert!(!padded_range_accepted(1500, 5595, 50_000));
+        // A chain shorter than one bucket is served whole from genesis.
+        assert_eq!(require_padded_range(0, 10, 10).unwrap(), (0, 10));
+        assert!(!padded_range_accepted(5, 10, 10));
+    }
+
+    #[test]
+    fn checkpoint_accepts_snapshot_at_or_below_birthday() {
+        assert_eq!(preferred_checkpoint_height(0), 0);
+        assert_eq!(preferred_checkpoint_height(5000), 5000);
+        assert!(checkpoint_snapshot_accepted(4096, 5000));
+        assert!(checkpoint_snapshot_accepted(5000, 5000));
+        assert!(!checkpoint_snapshot_accepted(5001, 5000));
+        assert!(checkpoint_snapshot_accepted(80_000, 0));
+    }
+
+    #[test]
+    fn scan_start_skips_snapshot_prefix() {
+        assert_eq!(scan_start_for_sync(0, 5000, false, 0), 5000);
+        assert_eq!(scan_start_for_sync(0, 5000, true, 4096), 5000);
+        assert_eq!(scan_start_for_sync(0, 5000, true, 5000), 5001);
+        assert_eq!(scan_start_for_sync(5000, 0, true, 5000), 5001);
+        assert_eq!(scan_start_for_sync(0, 0, false, 0), 0);
+    }
+
+    #[test]
+    fn pool_handle_expiry() {
+        assert!(pool_handle_usable(0, 1_000));
+        assert!(pool_handle_usable(2_000, 1_999));
+        assert!(!pool_handle_usable(2_000, 2_000));
+    }
+
+    #[test]
+    fn padded_commitment_window_drops_heights_outside_scan() {
+        let (pad_start, pad_end) = pad_block_range(42000, 42100, 50_000);
+        assert!(pad_start < 42000);
+        assert!(pad_end > 42100);
+        let returned = [pad_start, 41999, 42000, 42100, pad_end];
+        let kept: Vec<u32> = returned
+            .into_iter()
+            .filter(|h| height_in_scan_window(*h, 42000, 42100))
+            .collect();
+        assert_eq!(kept, vec![42000, 42100]);
+    }
 
     #[test]
     fn test_pre_birthday_commitment_range() {

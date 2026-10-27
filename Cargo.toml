@@ -1,6 +1,6 @@
 [package]
 name = "moonshine"
-version = "3.0.17"
+version = "3.0.18"
 description = "Moonshine: A lightweight, private CLI wallet for DarkFi utilizing OMR/OMD"
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 edition = "2021"
@@ -9,7 +9,7 @@ build = "build.rs"
 
 [dependencies]
 # DarkFi Dependencies (relative path to darkfi repository)
-# Pin the nighthawk24 `nighthawk-testnet` tree (Arti 0.45 + keccak + kvdb), not upstream master.
+# Pin the nighthawk24 `nighthawk-testnet` tree (Arti 0.47 + keccak + kvdb), not upstream master.
 darkfi = { path = "../darkfi-nighthawk-testnet", features = ["async-daemonize", "bs58", "rpc", "tx"] }
 darkfi_money_contract = { path = "../darkfi-nighthawk-testnet/src/contract/money", features = ["no-entrypoint", "client"] }
 darkfi-sdk = { path = "../darkfi-nighthawk-testnet/src/sdk", features = ["async"] }
@@ -62,8 +62,8 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 darkfi-lightwalletd = { path = "../darkfi-lightwalletd", default-features = true }
 
 # Embedded Tor (arti) — lightwalletd gRPC routed through Tor by default
-arti-client = { version = "0.45.0", default-features = false, features = ["tokio", "rustls", "compression", "error_detail"] }
-tor-rtcompat = { version = "0.45.0", features = ["tokio", "rustls"] }
+arti-client = { version = "0.47.0", default-features = false, features = ["tokio", "rustls", "compression", "error_detail"] }
+tor-rtcompat = { version = "0.47.0", features = ["tokio", "rustls"] }
 async-stream = "0.3.6"
 
 [patch.crates-io]

@@ -27,6 +27,21 @@ pub mod proto {
 
 use proto::dark_fi_light_wallet_client::DarkFiLightWalletClient;
 
+/// Moonshine's lightwallet proto. Major mismatches are fatal: a 1.x server
+/// cannot parse RegisterDetectionKey, pooled digests, or ChainTip.prev_hash.
+pub const CLIENT_PROTO_VERSION: &str = "2.0.0";
+
+/// True when the server advertised a proto version and its major differs.
+/// An empty server version is not a mismatch (the field was absent).
+pub fn proto_major_mismatch(server: &str, client: &str) -> bool {
+    if server.is_empty() {
+        return false;
+    }
+    let server_major = server.split('.').next().unwrap_or("0");
+    let client_major = client.split('.').next().unwrap_or("0");
+    server_major != client_major
+}
+
 /// Param2 UnifOMR detection keys are ~120 MiB on the wire (D=4096, n=1024,
 /// 3×40-bit moduli).  Keep headroom for digest responses.
 const MAX_GRPC_MESSAGE_BYTES: usize = 160 * 1024 * 1024;
@@ -55,6 +70,53 @@ fn host_is_loopback(server_url: &str) -> bool {
     };
     matches!(host, "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1")
         || host.eq_ignore_ascii_case("localhost")
+}
+
+/// Chunk detection-key bytes the way `GetUnifOmrDigest` and
+/// `RegisterDetectionKey` both expect. `start`/`end` are meaningful only for
+/// the digest RPC; registration ignores them.
+fn detection_key_chunks(
+    detection_keys: Vec<Vec<u8>>,
+    start: u32,
+    end: u32,
+) -> impl futures::Stream<Item = proto::DetectionKeyChunk> {
+    let chunk_size = 1024 * 1024;
+    let num_keys = detection_keys.len() as u32;
+    async_stream::stream! {
+        yield proto::DetectionKeyChunk {
+            start_height: start,
+            end_height: end,
+            num_keys,
+            data: vec![],
+            key_done: false,
+        };
+
+        for key in detection_keys {
+            let mut offset = 0;
+            while offset < key.len() {
+                let end_offset = std::cmp::min(offset + chunk_size, key.len());
+                let chunk_data = key[offset..end_offset].to_vec();
+                offset = end_offset;
+                let is_last = offset == key.len();
+                yield proto::DetectionKeyChunk {
+                    start_height: 0,
+                    end_height: 0,
+                    num_keys: 0,
+                    data: chunk_data,
+                    key_done: is_last,
+                };
+            }
+            if key.is_empty() {
+                yield proto::DetectionKeyChunk {
+                    start_height: 0,
+                    end_height: 0,
+                    num_keys: 0,
+                    data: vec![],
+                    key_done: true,
+                };
+            }
+        }
+    }
 }
 
 fn with_large_messages(
@@ -332,14 +394,12 @@ impl LightwalletClient {
         let mut client = self.client.clone().unwrap();
         let response = client.get_light_info(proto::Empty {}).await?;
         let info = response.into_inner();
-        if !info.proto_version.is_empty() {
-            let major = info.proto_version.split('.').next().unwrap_or("0");
-            if major != "1" {
-                eprintln!(
-                    "  warning: lightwalletd proto_version '{}' major mismatch (expected 1.x.x)",
-                    info.proto_version
-                );
-            }
+        if proto_major_mismatch(&info.proto_version, CLIENT_PROTO_VERSION) {
+            return Err(format!(
+                "lightwalletd proto_version '{}' major mismatch (Moonshine client {})",
+                info.proto_version, CLIENT_PROTO_VERSION
+            )
+            .into());
         }
         Ok(info)
     }
@@ -349,6 +409,20 @@ impl LightwalletClient {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
         let response = client.get_chain_tip(proto::Empty {}).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Subscribe to chain-tip notices. Moonshine's `sync` command catches up
+    /// and exits; it does not park on this stream. The RPC is here so a later
+    /// idle loop can wait on `ChainTip` (including `prev_hash`) instead of
+    /// compact blocks.
+    #[allow(dead_code)]
+    pub async fn subscribe_blocks(
+        &mut self,
+    ) -> Result<tonic::Streaming<proto::ChainTip>, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let response = client.subscribe_blocks(proto::Empty {}).await?;
         Ok(response.into_inner())
     }
 
@@ -535,8 +609,9 @@ impl LightwalletClient {
 
     /// UnifOMR Round 1: linear AHE partial-decrypt digest (ePrint 2026/910).
     ///
-    /// Pass one or more detection keys (cap 16 on server). The first key is also
-    /// sent in the primary `detection_key` field for older servers.
+    /// Pass one or more detection keys (cap 16 on server). Used when the
+    /// process has no pooled handle, and again after the server returns
+    /// `NOT_FOUND` for that handle.
     pub async fn get_unif_omr_digest(
         &mut self,
         detection_keys: Vec<Vec<u8>>,
@@ -545,50 +620,44 @@ impl LightwalletClient {
     ) -> Result<proto::OmrDigestResponse, Box<dyn Error>> {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
-
-        let chunk_size = 1024 * 1024; // 1 MiB chunks
-        let num_keys = detection_keys.len() as u32;
-
-        let stream = async_stream::stream! {
-            // First chunk MUST have header info
-            yield proto::DetectionKeyChunk {
-                start_height: start,
-                end_height: end,
-                num_keys,
-                data: vec![],
-                key_done: false,
-            };
-
-            for key in detection_keys {
-                let mut offset = 0;
-                while offset < key.len() {
-                    let end_offset = std::cmp::min(offset + chunk_size, key.len());
-                    let chunk_data = key[offset..end_offset].to_vec();
-                    offset = end_offset;
-                    let is_last = offset == key.len();
-
-                    yield proto::DetectionKeyChunk {
-                        start_height: 0,
-                        end_height: 0,
-                        num_keys: 0,
-                        data: chunk_data,
-                        key_done: is_last,
-                    };
-                }
-                if key.is_empty() {
-                     yield proto::DetectionKeyChunk {
-                        start_height: 0,
-                        end_height: 0,
-                        num_keys: 0,
-                        data: vec![],
-                        key_done: true,
-                    };
-                }
-            }
-        };
-
+        let stream = detection_key_chunks(detection_keys, start, end);
         let response = client
             .get_unif_omr_digest(tonic::Request::new(stream))
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Upload detection key(s) once per process. Height fields on the chunks
+    /// are zero; the scan range is sent later on `PoolDigestRequest`.
+    /// The handle is returned to the caller and must not be logged.
+    pub async fn register_detection_key(
+        &mut self,
+        detection_keys: Vec<Vec<u8>>,
+    ) -> Result<proto::DetectionKeyHandle, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let stream = detection_key_chunks(detection_keys, 0, 0);
+        let response = client
+            .register_detection_key(tonic::Request::new(stream))
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// Digest over a padded window using a previously registered handle.
+    pub async fn get_unif_omr_digest_from_pool(
+        &mut self,
+        handle: &[u8],
+        start: u32,
+        end: u32,
+    ) -> Result<proto::OmrDigestResponse, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let response = client
+            .get_unif_omr_digest_from_pool(proto::PoolDigestRequest {
+                handle: handle.to_vec(),
+                start_height: start,
+                end_height: end,
+            })
             .await?;
         Ok(response.into_inner())
     }
@@ -610,6 +679,22 @@ impl LightwalletClient {
             limb_index,
         };
         let response = client.fetch_pir_batch(req).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Stream compact output bodies for a padded block range (PIR fallback).
+    pub async fn get_compact_output_bodies(
+        &mut self,
+        start: u32,
+        end: u32,
+    ) -> Result<tonic::Streaming<proto::CompactOutputBody>, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let req = proto::BlockRange {
+            start_height: start,
+            end_height: end,
+        };
+        let response = client.get_compact_output_bodies(req).await?;
         Ok(response.into_inner())
     }
 
@@ -657,6 +742,16 @@ impl LightwalletClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proto_version_major_lockstep() {
+        assert!(!proto_major_mismatch("2.0.0", CLIENT_PROTO_VERSION));
+        assert!(!proto_major_mismatch("2.1.4", CLIENT_PROTO_VERSION));
+        assert!(!proto_major_mismatch("", CLIENT_PROTO_VERSION));
+        assert!(proto_major_mismatch("1.0.0", CLIENT_PROTO_VERSION));
+        assert!(proto_major_mismatch("3.0.0", CLIENT_PROTO_VERSION));
+        assert_eq!(CLIENT_PROTO_VERSION, "2.0.0");
+    }
 
     #[test]
     fn localhost_is_exact_host_not_substring() {

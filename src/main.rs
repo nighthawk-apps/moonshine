@@ -440,32 +440,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     return Ok(());
                 }
 
-                // Largest coin first so a payment that fits in one input does not
-                // pull a second one. darkfid currently rejects those two-input proofs.
+                // One input only. darkfid rejects two-input transfer proofs, and a
+                // pile of small coins cannot pay the fee once change is still unconfirmed.
                 let mut unspent = w.db.list_unspent()?;
                 unspent.sort_by(|a, b| b.2.cmp(&a.2));
                 let mut selected_inputs = Vec::new();
                 let mut input_total = 0u64;
 
                 for (tx_hash, idx, value, ref token_id) in &unspent {
-                    if crate::db::WalletDb::is_drk_token(&token)
-                        && crate::db::WalletDb::is_drk_token(token_id)
-                        || token_id == &token
-                    {
+                    let token_ok = (crate::db::WalletDb::is_drk_token(&token)
+                        && crate::db::WalletDb::is_drk_token(token_id))
+                        || token_id == &token;
+                    if token_ok && (*value as u64) >= total_needed {
                         selected_inputs.push((tx_hash.clone(), *idx, *value));
-                        input_total += *value as u64;
-                        if input_total >= total_needed {
-                            break;
-                        }
+                        input_total = *value as u64;
+                        break;
                     }
                 }
 
-                if input_total < total_needed {
+                if selected_inputs.is_empty() {
                     eprintln!(
-                        "Error: Cannot select enough coins. Selected {} from {} UTXOs, need {}.",
-                        input_total,
-                        selected_inputs.len(),
-                        total_needed
+                        "Error: No single coin covers {total_needed} atomic \
+                         (amount {amount_atomic} + fee {fee_atomic}). \
+                         Moonshine spends one input per transaction; darkfid rejects \
+                         two-input proofs. If change from the last send is missing, \
+                         run `moonshine sync --force-trial` after that change is in a block."
                     );
                     return Ok(());
                 }
@@ -1928,10 +1927,16 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
     let mut seen = 0u32;
     let mut found = 0u32;
     while start <= tip {
-        let end = start.saturating_add(9999).min(tip);
-        let mut stream = client.get_nullifiers(start, end).await?;
+        let end = start
+            .saturating_add(sync::MAX_BLOCKS_PER_REQUEST - 1)
+            .min(tip);
+        let (pad_start, pad_end) = sync::require_padded_range(start, end, tip)?;
+        let mut stream = client.get_nullifiers(pad_start, pad_end).await?;
         while let Some(item) = stream.next().await {
             let upd = item?;
+            if !sync::height_in_scan_window(upd.height, start, end) {
+                continue;
+            }
             seen += upd.nullifiers.len() as u32;
             for n in upd.nullifiers {
                 if nf_watch.contains(&n) {
