@@ -341,10 +341,7 @@ pub async fn build_transaction(
         data,
     };
 
-    let transfer_leaf = ContractCallLeaf {
-        call,
-        proofs: secrets.proofs,
-    };
+    let transfer_leaf = ContractCallLeaf::new(call, secrets.proofs, secrets.signature_secrets);
 
     // Fee call — only when fee > 0 (skip_fees mode on darkfid doesn't
     // require or support Fee calls).
@@ -451,18 +448,11 @@ pub async fn build_transaction(
         // before Transfer apply and miss the tx-local Merkle root.
         let mut tx_builder = TransactionBuilder::new(transfer_leaf, vec![])?;
         tx_builder.append(
-            ContractCallLeaf {
-                call: fee_call,
-                proofs: vec![fee_proof],
-            },
+            ContractCallLeaf::new(fee_call, vec![fee_proof], vec![signature_secret]),
             vec![],
         )?;
 
-        let mut tx = tx_builder.build()?;
-        let sigs = tx.create_sigs(&secrets.signature_secrets)?;
-        tx.signatures.push(sigs);
-        let fee_sigs = tx.create_sigs(&[signature_secret])?;
-        tx.signatures.push(fee_sigs);
+        let tx = tx_builder.build_signed()?;
         let self_output_indices = self_output_indices(&params.outputs, &keypair.secret, true);
         Ok(BuiltTransfer {
             tx,
@@ -473,9 +463,7 @@ pub async fn build_transaction(
     } else {
         // No fee call — build transaction with just the transfer call.
         let mut tx_builder = TransactionBuilder::new(transfer_leaf, vec![])?;
-        let mut tx = tx_builder.build()?;
-        let sigs = tx.create_sigs(&secrets.signature_secrets)?;
-        tx.signatures.push(sigs);
+        let tx = tx_builder.build_signed()?;
         let self_output_indices = self_output_indices(&params.outputs, &keypair.secret, false);
         Ok(BuiltTransfer {
             tx,
