@@ -18,6 +18,7 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 - [Features](#features)
 - [Related projects](#related-projects)
 - [License](#license)
+- [Create a token and a DAO](docs/deploy-a-dao.md)
 
 ---
 
