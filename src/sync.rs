@@ -147,6 +147,11 @@ impl SyncEngine {
             .with_tor(self.use_tor);
 
         let info = client.get_light_info().await?;
+        crate::wallet::check_directory_attest_pin(
+            &self.db,
+            &self.server_url,
+            &info.directory_attest_pubkey,
+        )?;
         ensure_chain_matches_network(&info.chain_name, self.network_byte)?;
 
         let tip = client.get_chain_tip().await?;
@@ -212,8 +217,15 @@ impl SyncEngine {
             }
         }
         let (last_synced, birthday) = self.db.get_sync_state()?;
+        // `--force-trial` keeps its own cursor. A strict sync records heights
+        // as scanned without decrypting clue-less payments, and a later
+        // `--force-trial` must walk those heights again. The Money tree cursor
+        // stays where it is so the replay does not append the same leaves twice.
+        let trial_cursor = self.trial_cursor();
+        let force_backfill =
+            self.force_trial && trial_cursor.unwrap_or(birthday.saturating_sub(1)) < tip_height;
 
-        if last_synced >= tip_height {
+        if last_synced >= tip_height && !force_backfill {
             if !self.db.merkle_from_genesis() {
                 eprintln!(
                     "Money Merkle tree is missing pre-birthday / height-0 leaves; \
@@ -231,7 +243,9 @@ impl SyncEngine {
 
         // last_synced == 0 means never synced (or rescan-to-genesis), not
         // "already applied height 0", unless a snapshot already installed the tree.
-        let scan_start = scan_start_for_sync(
+        let scan_start = note_scan_start(
+            self.force_trial,
+            trial_cursor,
             last_synced,
             birthday,
             self.db.merkle_from_genesis(),
@@ -389,7 +403,9 @@ impl SyncEngine {
         if scan_start == 0 || self.db.merkle_from_genesis() {
             self.db.set_merkle_from_genesis(true)?;
         }
-        self.set_tree_applied_height(scan_end)?;
+        if scan_end > self.tree_applied_height() || self.tree_applied_recorded().is_none() {
+            self.set_tree_applied_height(scan_end)?;
+        }
 
         // 3) Nullifiers → mark spent (full scan range, padded on the wire)
         let notes_spent = self
@@ -397,7 +413,13 @@ impl SyncEngine {
             .await?;
 
         // Tip advance: commitments + nullifiers done; sparse fetches succeeded.
-        self.db.set_sync_height(scan_end)?;
+        // A force-trial backfill must not rewind a cursor that is already at the tip.
+        if scan_end > last_synced {
+            self.db.set_sync_height(scan_end)?;
+        }
+        if self.force_trial {
+            self.set_trial_cursor(scan_end)?;
+        }
         if let Some(cache) = &self.block_cache {
             if let Err(e) = cache.prune_for_sync_height(scan_end) {
                 tracing::warn!("block cache prune failed: {e}");
@@ -594,6 +616,21 @@ impl SyncEngine {
         self.db.set_merkle_from_genesis(true)?;
         self.set_tree_applied_height(end)?;
         Ok(())
+    }
+
+    fn trial_cursor(&self) -> Option<u32> {
+        match self.db.get_meta("trial_synced_height") {
+            Ok(Some(bytes)) if bytes.len() == 4 => Some(u32::from_le_bytes(
+                bytes.as_slice().try_into().unwrap_or([0; 4]),
+            )),
+            _ => None,
+        }
+    }
+
+    fn set_trial_cursor(&self, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+        self.db
+            .set_meta("trial_synced_height", &height.to_le_bytes())
+            .map_err(|e| format!("set trial_synced_height: {e}").into())
     }
 
     fn tree_applied_recorded(&self) -> Option<u32> {
@@ -1855,6 +1892,29 @@ pub fn require_padded_range(start: u32, end: u32, tip: u32) -> Result<(u32, u32)
     Ok((padded_start, padded_end))
 }
 
+/// Where note discovery starts.
+///
+/// `--force-trial` follows `trial_synced_height` (missing means "start at the
+/// birthday") so clue-less payments hidden by an earlier strict scan are
+/// decrypted. The Money tree cursor is intentionally not part of that start:
+/// commitments already applied are skipped in `apply_note_commitments`.
+pub fn note_scan_start(
+    force_trial: bool,
+    trial_cursor: Option<u32>,
+    last_synced: u32,
+    birthday: u32,
+    merkle_from_genesis: bool,
+    tree_applied: u32,
+) -> u32 {
+    if force_trial {
+        return match trial_cursor {
+            Some(covered) => covered.saturating_add(1).max(birthday),
+            None => birthday,
+        };
+    }
+    scan_start_for_sync(last_synced, birthday, merkle_from_genesis, tree_applied)
+}
+
 /// First height to scan after optional checkpoint state.
 ///
 /// A missing tree with cursor 0 starts at the birthday. An installed snapshot
@@ -2395,7 +2455,10 @@ mod tests {
         // The same window cut at the tip.
         let (start, end) = require_padded_range(1500, 2500, 2600).unwrap();
         assert_eq!((start, end), (1024, 2600));
-        assert_eq!(require_padded_range(start, end, 2600).unwrap(), (start, end));
+        assert_eq!(
+            require_padded_range(start, end, 2600).unwrap(),
+            (start, end)
+        );
         // A raw power-of-two chunk off the bucket grid is still padded.
         assert!(!padded_range_accepted(1500, 5595, 50_000));
         // A chain shorter than one bucket is served whole from genesis.
@@ -2420,6 +2483,17 @@ mod tests {
         assert_eq!(scan_start_for_sync(0, 5000, true, 5000), 5001);
         assert_eq!(scan_start_for_sync(5000, 0, true, 5000), 5001);
         assert_eq!(scan_start_for_sync(0, 0, false, 0), 0);
+    }
+
+    #[test]
+    fn force_trial_ignores_a_strict_cursor_already_at_the_tip() {
+        // Strict sync left last_synced and the Money tree at the tip.
+        // force-trial with no trial cursor starts at the birthday.
+        assert_eq!(note_scan_start(true, None, 6000, 0, true, 6000), 0);
+        // A recorded trial cursor continues after that height, not after the tree.
+        assert_eq!(note_scan_start(true, Some(100), 6000, 0, true, 6000), 101);
+        // Strict sync still starts after the tree.
+        assert_eq!(note_scan_start(false, None, 6000, 0, true, 6000), 6001);
     }
 
     #[test]

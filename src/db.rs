@@ -798,6 +798,10 @@ impl WalletDb {
             params![Self::META_MERKLE_FROM_GENESIS],
         )?;
         self.set_sync_height(height)?;
+        self.conn.execute(
+            "DELETE FROM wallet_meta WHERE key = 'trial_synced_height'",
+            [],
+        )?;
         Ok(())
     }
 
@@ -826,8 +830,31 @@ impl WalletDb {
         // next sync rebuilds from the fork instead of appending onto it.
         self.conn
             .execute("DELETE FROM wallet_meta WHERE key = 'tree_state'", [])?;
+        self.clamp_height_meta("trial_synced_height", height)?;
+        self.clamp_height_meta("tree_applied_height", height)?;
         self.set_sync_height(height)?;
         Ok((notes_deleted as u32, txs_deleted as u32))
+    }
+
+    /// If `key` stores a height above `height`, lower it to `height`.
+    fn clamp_height_meta(&self, key: &str, height: u32) -> SqlResult<()> {
+        let Some(bytes) = self.get_meta(key)? else {
+            return Ok(());
+        };
+        if bytes.len() != 4 {
+            return Ok(());
+        }
+        let current = u32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 4]));
+        if current > height {
+            self.set_meta(key, &height.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_meta(&self, key: &str) -> SqlResult<()> {
+        self.conn
+            .execute("DELETE FROM wallet_meta WHERE key = ?1", params![key])?;
+        Ok(())
     }
 
     /// List unspent notes.
@@ -1498,9 +1525,12 @@ mod tests {
         db.set_meta("tree_state", &[0xFF; 64]).unwrap();
         db.set_sync_height(100).unwrap();
 
+        db.set_meta("trial_synced_height", &500u32.to_le_bytes())
+            .unwrap();
         db.reset_for_rescan(0).unwrap();
 
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
+        assert_eq!(db.get_meta("trial_synced_height").unwrap(), None);
         assert!(db.list_transactions(100).unwrap().is_empty());
         assert_eq!(db.get_meta("tree_state").unwrap(), None);
         assert!(!db.merkle_from_genesis());
@@ -1518,6 +1548,29 @@ mod tests {
         db.reset_for_rescan(52999).unwrap();
         assert!(!db.merkle_from_genesis());
         assert_eq!(db.get_meta("tree_state").unwrap(), None);
+    }
+
+    #[test]
+    fn test_invalidate_clamps_scan_cursors() {
+        let db = WalletDb::in_memory().unwrap();
+        db.set_meta("trial_synced_height", &6_000u32.to_le_bytes())
+            .unwrap();
+        db.set_meta("tree_applied_height", &6_000u32.to_le_bytes())
+            .unwrap();
+        db.invalidate_above_height(100).unwrap();
+        assert_eq!(
+            db.get_meta("trial_synced_height").unwrap().unwrap(),
+            100u32.to_le_bytes()
+        );
+        assert_eq!(
+            db.get_meta("tree_applied_height").unwrap().unwrap(),
+            100u32.to_le_bytes()
+        );
+        db.invalidate_above_height(150).unwrap();
+        assert_eq!(
+            db.get_meta("tree_applied_height").unwrap().unwrap(),
+            100u32.to_le_bytes()
+        );
     }
 
     #[test]

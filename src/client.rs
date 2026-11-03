@@ -701,7 +701,7 @@ impl LightwalletClient {
     /// Publish this wallet's UnifOMR clue public key for senders.
     ///
     /// `ownership_proof` is a Schnorr signature (darkfi-serial) over
-    /// `b"DarkFi-UnifOMR-CluePK-v2" || network || key_version (u64 LE)`
+    /// `b"DarkFi-UnifOMR-CluePK" || network || key_version (u64 LE)`
     ///  || payment_pubkey || clue_public_key` under the payment
     /// [`darkfi_sdk::crypto::SecretKey`] (binds network + monotonic version
     /// against replay).

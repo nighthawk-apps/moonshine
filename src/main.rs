@@ -129,6 +129,9 @@ enum Command {
 
     /// Show version info
     Version,
+
+    /// Forget the pinned directory attestation key for the configured server.
+    ResetAttestPin,
 }
 
 #[derive(Subcommand, Debug)]
@@ -216,7 +219,14 @@ enum TxSubcommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     let args = Cli::parse();
     let mut config = config::Config::load();
     if let Some(ref s) = args.server {
@@ -398,8 +408,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let recipient_addr = match darkfi_sdk::crypto::keypair::Address::from_str(&to) {
                     Ok(addr) => addr,
                     Err(e) => {
-                        eprintln!("Error: Invalid DarkFi address '{to}': {e}");
-                        return Ok(());
+                        return Err(format!("Invalid DarkFi address '{to}': {e}").into());
                     }
                 };
                 let to_bytes = recipient_addr.public_key().to_bytes().to_vec();
@@ -407,12 +416,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let amount_atomic = match crate::amount::parse_drk_atomic(&amount) {
                     Ok(v) if v > 0 => v,
                     Ok(_) => {
-                        eprintln!("Error: Amount must be greater than 0.");
-                        return Ok(());
+                        return Err("Amount must be greater than 0.".into());
                     }
                     Err(e) => {
-                        eprintln!("Error: {e}");
-                        return Ok(());
+                        return Err(e.into());
                     }
                 };
                 let fee_atomic = fee;
@@ -420,11 +427,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 if token != "DRK"
                     && !token.eq_ignore_ascii_case(&crate::db::WalletDb::dark_token_id_hex())
                 {
-                    eprintln!(
-                        "Error: custom tokens are not supported yet (got '{token}'). \
+                    return Err(format!(
+                        "custom tokens are not supported yet (got '{token}'). \
                          Omit --token or pass DRK."
-                    );
-                    return Ok(());
+                    )
+                    .into());
                 }
 
                 // Check balance
@@ -433,11 +440,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "amount+fee overflow")
                 })?;
                 if (balance as u64) < total_needed {
-                    eprintln!(
-                        "Error: Insufficient funds. Have {} atomic, need {} ({} + {} fee).",
+                    return Err(format!(
+                        "Insufficient funds. Have {} atomic, need {} ({} + {} fee).",
                         balance, total_needed, amount_atomic, fee_atomic
-                    );
-                    return Ok(());
+                    )
+                    .into());
                 }
 
                 // One input only. darkfid rejects two-input transfer proofs, and a
@@ -459,14 +466,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
 
                 if selected_inputs.is_empty() {
-                    eprintln!(
-                        "Error: No single coin covers {total_needed} atomic \
+                    return Err(format!(
+                        "No single coin covers {total_needed} atomic \
                          (amount {amount_atomic} + fee {fee_atomic}). \
                          Moonshine spends one input per transaction; darkfid rejects \
                          two-input proofs. If change from the last send is missing, \
                          run `moonshine sync --force-trial` after that change is in a block."
-                    );
-                    return Ok(());
+                    )
+                    .into());
                 }
 
                 let change = input_total - total_needed;
@@ -491,13 +498,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let info = match lookup.get_light_info().await {
                         Ok(info) => info,
                         Err(e) => {
-                            eprintln!(
-                                "Error: GetLightInfo failed: {}",
+                            return Err(format!(
+                                "GetLightInfo failed: {}",
                                 sync::redact_sync_error(&e.to_string())
-                            );
-                            return Ok(());
+                            )
+                            .into());
                         }
                     };
+                    wallet::check_directory_attest_pin(
+                        &w.db,
+                        &config.server_url,
+                        &info.directory_attest_pubkey,
+                    )?;
                     match lookup.get_clue_public_key(recipient_pk.to_vec()).await {
                         Ok(resp) => match verified_unifomr_clue(
                             network_byte,
@@ -507,23 +519,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         ) {
                             Ok(clue) => clue,
                             Err(e) => {
-                                eprintln!(
-                                    "Error: UnifOMR clue rejected ({e}). \
+                                return Err(format!(
+                                    "UnifOMR clue rejected ({e}). \
                                      Recipient may be unregistered — moonshine \
                                      is strict UnifOMR (no trial-decrypt send). \
                                      Ask the recipient to register, use \
                                      `tx send --no-omr`, or they can \
                                      `moonshine sync --force-trial`."
-                                );
-                                return Ok(());
+                                )
+                                .into());
                             }
                         },
                         Err(e) => {
-                            eprintln!(
-                                "Error: UnifOMR clue PK lookup failed: {}",
+                            return Err(format!(
+                                "UnifOMR clue PK lookup failed: {}",
                                 sync::redact_sync_error(&e.to_string())
-                            );
-                            return Ok(());
+                            )
+                            .into());
                         }
                     }
                 };
@@ -756,16 +768,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     })
                     .collect();
                 if all_coins.is_empty() {
-                    eprintln!(
-                        "Error: no spendable coins for token '{token}'. \
+                    return Err(format!(
+                        "no spendable coins for token '{token}'. \
                          Unspent rows exist but lack owner_secret/leaf_position/commitment, \
                          or token_id does not match native DRK ({}). \
                          Run: moonshine -w {} --server {} sync --rebuild-merkle",
                         crate::db::WalletDb::dark_token_id_hex(),
                         args.wallet_name,
                         config.server_url
-                    );
-                    return Ok(());
+                    )
+                    .into());
                 }
 
                 let recipient_pubkey = darkfi_sdk::crypto::PublicKey::from_bytes({
@@ -1041,6 +1053,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         return Ok(());
                                     }
                                 };
+                                let w = wallet::Wallet::open(&args.wallet_name)?;
+                                wallet::check_directory_attest_pin(
+                                    &w.db,
+                                    &config.server_url,
+                                    &info.directory_attest_pubkey,
+                                )?;
                                 match client.get_clue_public_key(recipient_pk.to_vec()).await {
                                     Ok(resp) => {
                                         let network_byte =
@@ -1175,7 +1193,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_tor(config.use_tor);
             let mut ok = 0usize;
             let mut last_err: Option<String> = None;
-            let key_version = wallet::clue_key_version_now();
+            let key_version = wallet::CLUE_KEY_VERSION;
             for pk_pay in pay_pks {
                 if wallet::clue_already_registered(network_byte, &pk_pay, &clue_pk) {
                     ok += 1;
@@ -1233,12 +1251,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             };
 
-            if rebuild_merkle {
-                // Do not recompute commitments from (possibly stale) attributes
-                // before restore — that overwrites on-chain `output.coin`.
-                println!("Restoring on-chain coins + blinds, then rebuilding Money Merkle tree...");
-            }
-
             let engine = sync::SyncEngine::new(
                 w.db,
                 &config.server_url,
@@ -1283,7 +1295,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         total_spent += result.notes_spent;
                         let (last_synced, _) =
                             engine.db.get_sync_state().unwrap_or((result.tip_height, 0));
-                        if result.blocks_scanned == 0 || last_synced >= result.tip_height {
+                        // force-trial backfill keeps last_synced at the tip on purpose.
+                        // Stop only when a cycle finds nothing left to decrypt.
+                        let caught_up = if force_trial {
+                            result.blocks_scanned == 0
+                        } else {
+                            result.blocks_scanned == 0 || last_synced >= result.tip_height
+                        };
+                        if caught_up {
                             println!("Sync complete:");
                             println!("  Blocks scanned: {}", total_scanned);
                             println!("  Notes found:    {}", total_found);
@@ -1600,6 +1619,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("Moonshine CLI version {}", env!("CARGO_PKG_VERSION"));
             println!("  OMR Scheme:  UnifOMR (ePrint 2026/910, scheme 0x05)");
             println!("  Privacy:     Block range padding, jitter, error redaction");
+        }
+        Command::ResetAttestPin => {
+            let w = wallet::Wallet::open(&args.wallet_name)?;
+            wallet::reset_directory_attest_pin(&w.db, &config.server_url)?;
+            println!(
+                "Cleared the directory attestation pin for {}.",
+                config.server_url
+            );
         }
     }
     Ok(())

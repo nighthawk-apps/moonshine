@@ -15,7 +15,7 @@
 # Prerequisites:
 #   - Rust toolchain installed
 #   - darkfi repo at ../darkfi-nighthawk-testnet (relative to moonshine)
-#   - new-nighthawk-android-wallet at ../new-nighthawk-android-wallet
+#   - nighthawk-android-wallet at ../nighthawk-android-wallet
 #
 # Usage:
 #   ./scripts/e2e_testnet.sh [--skip-build] [--testnet-url tcp://...]
@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOONSHINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DARKFI_DIR="$(cd "$MOONSHINE_DIR/../darkfi-nighthawk-testnet" && pwd)"
 LIGHTWALLETD_DIR="$(cd "$MOONSHINE_DIR/../darkfi-lightwalletd" && pwd)"
-ANDROID_DIR="$(cd "$MOONSHINE_DIR/../new-nighthawk-android-wallet" && pwd)"
+ANDROID_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-android-wallet" && pwd)"
 IOS_FFI_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-ios-wallet/rust/darkfi-mobile-ffi" && pwd)"
 # Prefer an already-running testnet stack (do not kill external darkfid).
 KEEP_EXTERNAL_STACK=false

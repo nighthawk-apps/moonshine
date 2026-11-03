@@ -31,9 +31,9 @@ use std::error::Error;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-/// Domain separation for `RegisterCluePublicKey` ownership proofs (v2:
-/// binds network byte + monotonic key_version against replay).
-const CLUE_PK_OWNERSHIP_DOMAIN: &[u8] = b"DarkFi-UnifOMR-CluePK-v2";
+/// Domain separation for `RegisterCluePublicKey` ownership proofs.
+/// The signed message binds the network byte and `key_version`.
+const CLUE_PK_OWNERSHIP_DOMAIN: &[u8] = b"DarkFi-UnifOMR-CluePK";
 
 /// Sign `RegisterCluePublicKey` with the payment [`SecretKey`] (Schnorr + darkfi-serial).
 ///
@@ -59,13 +59,62 @@ pub fn sign_clue_pk_ownership(
     serialize(&sig)
 }
 
-/// Monotonic clue-key version for registrations (unix seconds).
-pub fn clue_key_version_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1)
+const DIRECTORY_ATTEST_PIN_PREFIX: &str = "directory_attest_pin:";
+
+fn directory_attest_pin_key(server_url: &str) -> String {
+    let url = server_url.trim().trim_end_matches('/');
+    format!("{DIRECTORY_ATTEST_PIN_PREFIX}{url}")
 }
+
+/// Pin `pubkey` for `server_url` on first use. A later different key is refused.
+pub fn check_directory_attest_pin(
+    db: &WalletDb,
+    server_url: &str,
+    pubkey: &[u8],
+) -> Result<(), String> {
+    let key = directory_attest_pin_key(server_url);
+    let pinned = db
+        .get_meta(&key)
+        .map_err(|e| format!("read directory attestation pin: {e}"))?;
+    if pubkey.len() != 32 {
+        if pinned.is_some() {
+            return Err(format!(
+                "Directory attestation key for {server_url} changed: this server omitted the 32-byte key. \
+                 Refusing to continue. If you intentionally reset that lightwalletd, run: \
+                 moonshine --server {server_url} reset-attest-pin"
+            ));
+        }
+        return Ok(());
+    }
+    match pinned {
+        None => {
+            db.set_meta(&key, pubkey)
+                .map_err(|e| format!("store directory attestation pin: {e}"))?;
+            Ok(())
+        }
+        Some(stored) if stored.as_slice() == pubkey => Ok(()),
+        Some(stored) => Err(format!(
+            "Directory attestation key for {server_url} changed (pinned {}, server now {}). \
+             This is not the server this wallet pinned, or its cache was reset. \
+             Refusing to continue. To accept the new key, run: \
+             moonshine --server {server_url} reset-attest-pin",
+            hex::encode(stored),
+            hex::encode(pubkey)
+        )),
+    }
+}
+
+pub fn reset_directory_attest_pin(db: &WalletDb, server_url: &str) -> Result<(), String> {
+    let key = directory_attest_pin_key(server_url);
+    db.delete_meta(&key)
+        .map_err(|e| format!("clear directory attestation pin: {e}"))
+}
+
+/// Clue-key version on every registration.
+///
+/// The clue key is derived from the wallet secret and does not rotate, so
+/// this stays 1. A timestamp would distinguish real directory rows from decoys.
+pub const CLUE_KEY_VERSION: u64 = 1;
 
 /// Session-scoped clue-registration ids. Oldest insert is dropped at `cap`.
 /// Updating an already-present id does not refresh FIFO position.
@@ -702,5 +751,21 @@ mod tests {
         let addr1 = wallet.generate_address().unwrap();
         let addr2 = wallet.generate_address().unwrap();
         assert_ne!(addr1, addr2, "Addresses must be unique");
+    }
+
+    #[test]
+    fn directory_attest_pin_is_tofu_per_server() {
+        let db = WalletDb::in_memory().unwrap();
+        let url = "https://lwd.example";
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        check_directory_attest_pin(&db, url, &first).unwrap();
+        check_directory_attest_pin(&db, url, &first).unwrap();
+        let err = check_directory_attest_pin(&db, url, &second).unwrap_err();
+        assert!(err.contains("changed"), "{err}");
+        assert!(err.contains("reset-attest-pin"), "{err}");
+        check_directory_attest_pin(&db, "https://other.example", &second).unwrap();
+        reset_directory_attest_pin(&db, url).unwrap();
+        check_directory_attest_pin(&db, url, &second).unwrap();
     }
 }
