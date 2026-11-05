@@ -10,7 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   # Sibling path in Cargo.toml; pin must match docs/darkfi-pin.md
-  DARKFI_PIN: e47d3f5f26b2786a2062f254d177d0ad3a6de13a
+  DARKFI_PIN: 742ca5458edc75b142a910fd6b4c3ed017f96e12
 
 # Path deps expect siblings:
 #   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not git.dark.fi master; do not use the GitHub mirror)
