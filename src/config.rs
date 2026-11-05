@@ -41,6 +41,11 @@ pub struct Config {
     /// Block explorer base URL (no trailing slash). Empty = network default.
     #[serde(default)]
     pub explorer_url: Option<String>,
+    /// Experimental UnifOMR. Off uses padded trial decryption, which finds
+    /// payments that have no clue. On requires both wallets to register on
+    /// this lightwalletd; unregistered or cross-server payments stay invisible.
+    #[serde(default)]
+    pub experimental_unifomr: bool,
 }
 
 fn default_use_tor() -> bool {
@@ -56,6 +61,7 @@ impl Default for Config {
             tls_pin_sha256: None,
             use_tor: default_use_tor(),
             explorer_url: None,
+            experimental_unifomr: false,
         }
     }
 }

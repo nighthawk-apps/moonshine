@@ -353,7 +353,7 @@ if [ -f "$MOONSHINE_BIN" ]; then
         SYNC_OUTPUT=$($MOONSHINE_BIN -w e2e_test -s "$LIGHTWALLETD_HTTP" sync 2>&1) || true
         echo "$SYNC_OUTPUT" | tail -20
         if echo "$SYNC_OUTPUT" | grep -qiE "Sync complete|Blocks scanned|notes found|Chain tip"; then
-            report PASS "moonshine sync (live lightwalletd / multi-pubkey OMR)"
+            report PASS "moonshine sync (live lightwalletd / trial decrypt)"
         elif echo "$SYNC_OUTPUT" | grep -qi "error\|failed\|panic"; then
             report FAIL "moonshine sync: $SYNC_OUTPUT"
         else

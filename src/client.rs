@@ -29,13 +29,12 @@ use proto::dark_fi_light_wallet_client::DarkFiLightWalletClient;
 
 /// Moonshine's lightwallet proto. Major mismatches are fatal: a 1.x server
 /// cannot parse RegisterDetectionKey, pooled digests, or ChainTip.prev_hash.
-pub const CLIENT_PROTO_VERSION: &str = "2.0.0";
+pub const CLIENT_PROTO_VERSION: &str = "2.1.0";
 
-/// True when the server advertised a proto version and its major differs.
-/// An empty server version is not a mismatch (the field was absent).
+/// True when the server version is missing or its major differs from this wallet.
 pub fn proto_major_mismatch(server: &str, client: &str) -> bool {
     if server.is_empty() {
-        return false;
+        return true;
     }
     let server_major = server.split('.').next().unwrap_or("0");
     let client_major = client.split('.').next().unwrap_or("0");
@@ -532,24 +531,7 @@ impl LightwalletClient {
                 }
                 Ok(blocks)
             }
-            Err(status) => {
-                let code = status.code();
-                let fallback = code == tonic::Code::Unimplemented
-                    || code == tonic::Code::NotFound
-                    || status.message().to_lowercase().contains("unknown");
-                if !fallback {
-                    return Err(status.into());
-                }
-                tracing::debug!(
-                    "GetCompactBlocksAtHeights unavailable ({}); falling back to N× GetBlock",
-                    status.message()
-                );
-                let mut blocks = Vec::with_capacity(unique.len());
-                for h in unique {
-                    blocks.push(self.get_block(h).await?);
-                }
-                Ok(blocks)
-            }
+            Err(status) => Err(status.into()),
         }
     }
 
@@ -698,6 +680,42 @@ impl LightwalletClient {
         Ok(response.into_inner())
     }
 
+    /// Money outputs whose function code matches. Proto 2.1 servers only.
+    pub async fn get_compact_outputs_by_func(
+        &mut self,
+        start: u32,
+        end: u32,
+        func_code: u32,
+    ) -> Result<tonic::Streaming<proto::CompactOutputBody>, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let response = client
+            .get_compact_outputs_by_func(proto::FuncBlockRange {
+                start_height: start,
+                end_height: end,
+                func_code,
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
+    /// DAO calls with proofs removed. Proto 2.1 servers only.
+    pub async fn get_compact_dao_calls(
+        &mut self,
+        start: u32,
+        end: u32,
+    ) -> Result<tonic::Streaming<proto::CompactDaoCall>, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let response = client
+            .get_compact_dao_calls(proto::BlockRange {
+                start_height: start,
+                end_height: end,
+            })
+            .await?;
+        Ok(response.into_inner())
+    }
+
     /// Publish this wallet's UnifOMR clue public key for senders.
     ///
     /// `ownership_proof` is a Schnorr signature (darkfi-serial) over
@@ -747,10 +765,10 @@ mod tests {
     fn proto_version_major_lockstep() {
         assert!(!proto_major_mismatch("2.0.0", CLIENT_PROTO_VERSION));
         assert!(!proto_major_mismatch("2.1.4", CLIENT_PROTO_VERSION));
-        assert!(!proto_major_mismatch("", CLIENT_PROTO_VERSION));
+        assert!(proto_major_mismatch("", CLIENT_PROTO_VERSION));
         assert!(proto_major_mismatch("1.0.0", CLIENT_PROTO_VERSION));
         assert!(proto_major_mismatch("3.0.0", CLIENT_PROTO_VERSION));
-        assert_eq!(CLIENT_PROTO_VERSION, "2.0.0");
+        assert_eq!(CLIENT_PROTO_VERSION, "2.1.0");
     }
 
     #[test]

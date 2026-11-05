@@ -86,19 +86,18 @@ enum Command {
 
     /// Synchronize wallet with lightwalletd
     Sync {
-        #[arg(long, help = "Force trial decryption, skip OMR")]
+        #[arg(long, help = "Force a full trial-decrypt pass even if already caught up")]
         force_trial: bool,
         #[arg(
             long,
-            help = "Permit trial-decrypt fallback (leaks the scan window to LWD). \
-                    Default is UnifOMR-strict: OMR failure does not advance the tip."
+            help = "Experimental UnifOMR. Both wallets must already be registered \
+                    on this lightwalletd. Unregistered or cross-server payments \
+                    stay invisible. Default is padded trial decryption."
         )]
+        unifomr: bool,
+        #[arg(long, hide = true, help = "Deprecated alias of trial decryption")]
         allow_trial: bool,
-        #[arg(
-            long,
-            hide = true,
-            help = "Deprecated: strict UnifOMR is now the default"
-        )]
+        #[arg(long, hide = true, help = "Deprecated alias of --unifomr")]
         strict_omr: bool,
         /// Rebuild the Money Merkle tree from LWD `GetNoteCommitments` (height 0..=tip).
         /// Sync/spend also do this automatically when a birthday rescan skipped
@@ -484,8 +483,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 recipient_pk.copy_from_slice(&to_bytes);
 
                 let network_byte = wallet::Wallet::network_byte(&config.network);
-                let omr_clue = if no_omr {
-                    println!("Sending without UnifOMR clue (recipient must trial-decrypt).");
+                let omr_clue = if no_omr || !config.experimental_unifomr {
+                    if config.experimental_unifomr {
+                        println!("Sending without UnifOMR clue (recipient must trial-decrypt).");
+                    }
                     Vec::new()
                 } else {
                     // Strict UnifOMR: fail closed unless GetClue ownership verifies
@@ -1041,7 +1042,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .with_tor(config.use_tor);
                 match hex::decode(&hex) {
                     Ok(raw_tx) => {
-                        let omr_clue = match parse_stub_recipient_pubkey(&raw_tx) {
+                        let omr_clue = if !config.experimental_unifomr {
+                            Vec::new()
+                        } else { match parse_stub_recipient_pubkey(&raw_tx) {
                             Some(recipient_pk) => {
                                 let info = match client.get_light_info().await {
                                     Ok(info) => info,
@@ -1101,7 +1104,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 );
                                 return Ok(());
                             }
-                        };
+                        } };
                         match client
                             .send_transaction(raw_tx, omr_clue, vec![], vec![])
                             .await
@@ -1144,24 +1147,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
         },
         Command::Sync {
             force_trial,
-            allow_trial,
-            strict_omr: _deprecated_strict,
+            unifomr,
+            allow_trial: _deprecated_allow,
+            strict_omr: deprecated_strict,
             rebuild_merkle,
         } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
             let secret_keys = w.db.get_all_secrets()?;
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
-            let strict_omr = !allow_trial && !force_trial;
-            if force_trial {
-                println!("Syncing with --force-trial (OMR skipped)...");
-            } else if strict_omr {
-                println!("Syncing UnifOMR-strict (no trial-decrypt fallback)...");
+            let strict_omr = (unifomr || deprecated_strict || config.experimental_unifomr)
+                && !force_trial;
+            if !strict_omr {
+                println!("Syncing with padded trial decryption...");
             } else {
-                println!("Syncing UnifOMR with --allow-trial fallback for non-OMR txs...");
+                println!(
+                    "Experimental UnifOMR. Funds are visible only when both wallets \
+                     are registered on this lightwalletd."
+                );
             }
             println!("Syncing with lightwalletd at {}...", config.server_url);
 
+            if strict_omr {
             // Publish UnifOMR clue PK for every payment address (wallet-level sk_clue).
             // Fail closed: if registration fails, senders would GetClue decoys.
             let clue_pk = w
@@ -1238,6 +1245,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .into());
             }
             println!("Registered UnifOMR clue public key for {ok} payment address(es).");
+            }
 
             let block_cache = {
                 let cache_path =
@@ -1287,9 +1295,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let mut total_scanned = 0u64;
             let mut total_found = 0u32;
             let mut total_spent = 0u32;
+            let mut rate_limit_pauses = 0u32;
             loop {
                 match engine.sync_once().await {
                     Ok(result) => {
+                        rate_limit_pauses = 0;
                         total_scanned += u64::from(result.blocks_scanned);
                         total_found += result.notes_found;
                         total_spent += result.notes_spent;
@@ -1316,7 +1326,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         );
                     }
                     Err(e) => {
-                        eprintln!("Sync failed: {}", sync::redact_sync_error(&e.to_string()));
+                        let msg = e.to_string();
+                        let limited =
+                            msg.contains("rate limit") || msg.contains("ResourceExhausted");
+                        if limited && rate_limit_pauses < 24 {
+                            rate_limit_pauses += 1;
+                            eprintln!(
+                                "Sync paused on rate limit ({rate_limit_pauses}/24): {}",
+                                sync::redact_sync_error(&msg)
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            continue;
+                        }
+                        eprintln!("Sync failed: {}", sync::redact_sync_error(&msg));
                         break;
                     }
                 }

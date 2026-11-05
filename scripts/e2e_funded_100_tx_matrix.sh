@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Funded 100-tx UnifOMR + trial-decrypt matrix on live DarkFi testnet.
+# Funded send matrix on live DarkFi testnet.
+# Default `moonshine sync` is trial decryption. `--force-trial` below forces a full pass.
 #
 # Sends from moonshine e2e_alice (funded) cycling recipients across published
 # Nighthawk client addresses + e2e_bob. Odd txs omit UnifOMR (--no-omr = TD);

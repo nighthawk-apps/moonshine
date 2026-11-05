@@ -26,12 +26,11 @@
 //!    pre-birthday leaves makes spend proofs use a root the contract never
 //!    stored (Money `Custom(5)`).
 //! 3. `GetNullifiers(scan_start..scan_end)` — mark spent notes
-//! 4. Round 2: Batch PIR for matching heights when UnifOMR is available;
-//!    else `GetCompactBlocksAtHeights` / N× `GetBlock`
-//! 5. Trial-decrypt only those blocks; insert notes + tx history
+//! 4. Round 2: Batch PIR for matching heights, otherwise compact output bodies
+//! 5. Trial-decrypt those notes; DAO calls and token mints come from the
+//!    same padded window
 //!
-//! Does **not** call `GetBlockRange` for the full scan window (except
-//! `--force-trial`, which opts into full-range trial decrypt without OMR).
+//! `--force-trial` trial-decrypts the window without UnifOMR.
 //!
 //! Tip advances only after commitments + nullifiers for the full range
 //! succeed **and** sparse block fetches for all matching heights succeed.
@@ -345,12 +344,14 @@ impl SyncEngine {
             let blocks = self
                 .fetch_padded_window_blocks(&mut client, scan_start, scan_end, tip_height)
                 .await?;
-            for block in &blocks {
-                if !height_in_scan_window(block.height, scan_start, scan_end) {
-                    continue;
-                }
-                notes_found += self.trial_decrypt_block(block)?;
-            }
+            let in_window: Vec<_> = blocks
+                .iter()
+                .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
+                .cloned()
+                .collect();
+            notes_found += self.trial_decrypt_blocks(&in_window)?;
+            self.store_contract_records(&mut client, padded_start, padded_end)
+                .await?;
         } else if !heights_to_fetch.is_empty() {
             // PIR only for pure OMR match set (privacy); supplements use sparse height RPC.
             let use_pir_only = heights_to_fetch == matching_heights && !matching_heights.is_empty();
@@ -373,12 +374,34 @@ impl SyncEngine {
                     }
                 }
             }
-            for block in &blocks {
-                if !height_in_scan_window(block.height, scan_start, scan_end) {
-                    continue;
-                }
-                notes_found += self.trial_decrypt_block(block)?;
-            }
+            let mut in_window: Vec<_> = blocks
+                .into_iter()
+                .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
+                .collect();
+            let extra = self
+                .fetch_outputs_by_func(
+                    &mut client,
+                    padded_start,
+                    padded_end,
+                    MONEY_FUNC_TOKEN_MINT,
+                )
+                .await?;
+            in_window.extend(extra);
+            self.store_contract_records(&mut client, padded_start, padded_end)
+                .await?;
+            notes_found += self.trial_decrypt_blocks(&in_window)?;
+        } else {
+            let extra = self
+                .fetch_outputs_by_func(
+                    &mut client,
+                    padded_start,
+                    padded_end,
+                    MONEY_FUNC_TOKEN_MINT,
+                )
+                .await?;
+            notes_found += self.trial_decrypt_blocks(&extra)?;
+            self.store_contract_records(&mut client, padded_start, padded_end)
+                .await?;
         }
 
         // 2) Note commitments → Merkle tree.
@@ -1389,17 +1412,97 @@ impl SyncEngine {
         Ok(blocks)
     }
 
+    async fn fetch_outputs_by_func(
+        &self,
+        client: &mut LightwalletClient,
+        start: u32,
+        end: u32,
+        func_code: u32,
+    ) -> Result<Vec<crate::client::proto::CompactBlock>, Box<dyn std::error::Error>> {
+        use futures::StreamExt;
+        let mut stream = client
+            .get_compact_outputs_by_func(start, end, func_code)
+            .await?;
+        let mut bodies = Vec::new();
+        while let Some(body) = stream.next().await {
+            bodies.push(body?);
+        }
+        Ok(compact_blocks_from_output_bodies(bodies)
+            .into_iter()
+            .filter(|block| {
+                block.txs.iter().any(|tx| {
+                    tx.outputs
+                        .iter()
+                        .any(|output| !output.encrypted_note.is_empty())
+                })
+            })
+            .collect())
+    }
+
+    async fn store_contract_records(
+        &self,
+        client: &mut LightwalletClient,
+        start: u32,
+        end: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use futures::StreamExt;
+        let mut dao = client.get_compact_dao_calls(start, end).await?;
+        while let Some(call) = dao.next().await {
+            let call = call?;
+            self.db.insert_dao_call(
+                call.height,
+                &call.tx_hash,
+                call.kind,
+                &call.bulla,
+                &call.payload,
+            )?;
+        }
+        for code in [MONEY_FUNC_AUTH_TOKEN_MINT, MONEY_FUNC_AUTH_TOKEN_FREEZE] {
+            let Ok(mut stream) = client.get_compact_outputs_by_func(start, end, code).await else {
+                continue;
+            };
+            while let Some(body) = stream.next().await {
+                let body = body?;
+                if body.encrypted_note.is_empty() {
+                    self.db
+                        .insert_func_event(body.height, &body.tx_hash, body.func_code)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn trial_decrypt_blocks(
+        &self,
+        blocks: &[crate::client::proto::CompactBlock],
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        let hits = batch_open_blocks(&self.secret_keys, blocks);
+        let mut notes_found = 0u32;
+        for block in blocks {
+            notes_found += self.trial_decrypt_block(block, &hits)?;
+        }
+        Ok(notes_found)
+    }
+
     fn trial_decrypt_block(
         &self,
         block: &crate::client::proto::CompactBlock,
+        hits: &std::collections::HashMap<(u32, [u8; 32], u32), (DecryptedNote, Vec<u8>)>,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         let mut notes_found = 0u32;
         for tx in &block.txs {
             let tx_hash_hex = hex::encode(&tx.tx_hash);
             let _ = self.db.confirm_transaction(&tx_hash_hex, block.height);
             for (idx, output) in tx.outputs.iter().enumerate() {
-                for secret_key in &self.secret_keys {
-                    if let Some(note) = trial_decrypt_note(&output.encrypted_note, secret_key) {
+                let mut tx_key = [0u8; 32];
+                if tx.tx_hash.len() != 32 {
+                    continue;
+                }
+                tx_key.copy_from_slice(&tx.tx_hash);
+                let Some((note, secret_key)) = hits.get(&(block.height, tx_key, idx as u32)) else {
+                    continue;
+                };
+                {
                         let tx_hash_hex = hex::encode(&tx.tx_hash);
                         // S5: commitment is output.coin from the compact block
                         let commitment = if output.coin.len() == 32 {
@@ -1466,8 +1569,6 @@ impl SyncEngine {
                             note.memo.as_deref(),
                         )?;
                         notes_found += 1;
-                        break;
-                    }
                 }
             }
         }
@@ -1645,9 +1746,7 @@ impl SyncEngine {
         Ok((heights, covered_end))
     }
 
-    /// PIR-failure and trial-decrypt download. Requests a padded range and
-    /// prefers `GetCompactOutputBodies`. Servers that do not implement that
-    /// RPC yet fall back to padded `GetBlockRange` (same window, full blocks).
+    /// Trial-decrypt download for one padded window.
     async fn fetch_padded_window_blocks(
         &self,
         client: &mut LightwalletClient,
@@ -1656,24 +1755,12 @@ impl SyncEngine {
         tip: u32,
     ) -> Result<Vec<crate::client::proto::CompactBlock>, Box<dyn std::error::Error>> {
         let (pad_start, pad_end) = require_padded_range(window_start, window_end, tip)?;
-        match client.get_compact_output_bodies(pad_start, pad_end).await {
-            Ok(mut stream) => {
-                let mut bodies = Vec::new();
-                while let Some(body) = stream.next().await {
-                    bodies.push(body?);
-                }
-                Ok(compact_blocks_from_output_bodies(bodies))
-            }
-            Err(e) if compact_bodies_unavailable(e.as_ref()) => {
-                tracing::warn!(
-                    "GetCompactOutputBodies unavailable ({}); padded GetBlockRange. \
-                     Gap: this server has no compact-output RPC yet.",
-                    redact_sync_error(&e.to_string())
-                );
-                self.fetch_window_range(client, pad_start, pad_end).await
-            }
-            Err(e) => Err(e),
+        let mut stream = client.get_compact_output_bodies(pad_start, pad_end).await?;
+        let mut bodies = Vec::new();
+        while let Some(body) = stream.next().await {
+            bodies.push(body?);
         }
+        Ok(compact_blocks_from_output_bodies(bodies))
     }
 
     /// Register the detection key once per process, then ask for a pooled digest.
@@ -1719,11 +1806,6 @@ impl SyncEngine {
                     clear_detection_pool();
                     return Err(e);
                 }
-                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
-                    return client
-                        .get_unif_omr_digest(detection_keys.to_vec(), start, end)
-                        .await;
-                }
                 Err(e) => return Err(e),
             }
         }
@@ -1748,19 +1830,8 @@ impl SyncEngine {
                         clear_detection_pool();
                         Err(e)
                     }
-                    Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
-                        clear_detection_pool();
-                        client
-                            .get_unif_omr_digest(detection_keys.to_vec(), start, end)
-                            .await
-                    }
                     Err(e) => Err(e),
                 }
-            }
-            Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
-                client
-                    .get_unif_omr_digest(detection_keys.to_vec(), start, end)
-                    .await
             }
             Err(e) => Err(e),
         }
@@ -1963,13 +2034,7 @@ fn grpc_code_is(err: &(dyn std::error::Error + 'static), code: tonic::Code) -> b
 }
 
 fn checkpoint_status_falls_back(err: &(dyn std::error::Error + 'static)) -> bool {
-    grpc_code_is(err, tonic::Code::NotFound)
-        || grpc_code_is(err, tonic::Code::Unimplemented)
-        || grpc_code_is(err, tonic::Code::FailedPrecondition)
-}
-
-fn compact_bodies_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
-    grpc_code_is(err, tonic::Code::Unimplemented) || grpc_code_is(err, tonic::Code::NotFound)
+    grpc_code_is(err, tonic::Code::NotFound) || grpc_code_is(err, tonic::Code::FailedPrecondition)
 }
 
 fn rebuild_detection_keys(
@@ -2060,6 +2125,7 @@ fn compact_blocks_from_output_bodies(
                 token_commit: Vec::new(),
                 omr_clue: body.omr_clue,
                 omr_metadata_enc: body.omr_metadata_enc,
+                func_code: body.func_code,
             },
         );
     }
@@ -2293,6 +2359,129 @@ pub fn derived_coin_from_note(note: &DecryptedNote, wallet_key: &[u8]) -> Option
         .to_bytes()
         .to_vec(),
     )
+}
+
+const MONEY_FUNC_AUTH_TOKEN_MINT: u32 = 0x04;
+const MONEY_FUNC_AUTH_TOKEN_FREEZE: u32 = 0x05;
+const MONEY_FUNC_TOKEN_MINT: u32 = 0x06;
+
+fn batch_open_blocks(
+    secrets: &[Vec<u8>],
+    blocks: &[crate::client::proto::CompactBlock],
+) -> std::collections::HashMap<(u32, [u8; 32], u32), (DecryptedNote, Vec<u8>)> {
+    use darkfi_sdk::crypto::diffie_hellman::sapling_ka_agree_batch;
+    use darkfi_sdk::crypto::note::AeadEncryptedNote;
+    use darkfi_sdk::crypto::SecretKey;
+    use darkfi_serial::Decodable;
+    use std::io::Cursor;
+
+    struct Job {
+        height: u32,
+        tx: [u8; 32],
+        idx: u32,
+        coin: Vec<u8>,
+        note: AeadEncryptedNote,
+    }
+
+    let mut jobs = Vec::new();
+    let mut fallback = Vec::new();
+    for block in blocks {
+        for tx in &block.txs {
+            if tx.tx_hash.len() != 32 {
+                continue;
+            }
+            let mut tx_key = [0u8; 32];
+            tx_key.copy_from_slice(&tx.tx_hash);
+            for (idx, output) in tx.outputs.iter().enumerate() {
+                if output.encrypted_note.len() < 48 {
+                    continue;
+                }
+                let mut cursor = Cursor::new(output.encrypted_note.as_slice());
+                if let Ok(note) = AeadEncryptedNote::decode(&mut cursor) {
+                    jobs.push(Job {
+                        height: block.height,
+                        tx: tx_key,
+                        idx: idx as u32,
+                        coin: output.coin.clone(),
+                        note,
+                    });
+                } else {
+                    fallback.push((
+                        block.height,
+                        tx_key,
+                        idx as u32,
+                        output.coin.clone(),
+                        output.encrypted_note.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for secret_bytes in secrets {
+        if secret_bytes.len() < 32 {
+            continue;
+        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&secret_bytes[..32]);
+        let Ok(secret) = SecretKey::from_bytes(raw) else {
+            continue;
+        };
+        let pending: Vec<usize> = jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| !out.contains_key(&(job.height, job.tx, job.idx)))
+            .map(|(index, _)| index)
+            .collect();
+        if pending.is_empty() {
+            continue;
+        }
+        let epks: Vec<_> = pending.iter().map(|index| jobs[*index].note.ephem_public).collect();
+        let shared = sapling_ka_agree_batch(&secret, &epks);
+        for (index, shared) in pending.into_iter().zip(shared) {
+            let Ok(shared) = shared else {
+                continue;
+            };
+            let Ok(RemainingBytes(plaintext)) = jobs[index].note.decrypt_with_shared(&shared) else {
+                continue;
+            };
+            let Some(money) = money_note_from_plaintext(&plaintext) else {
+                continue;
+            };
+            let Some(note) = decrypted_from_money_note(money) else {
+                continue;
+            };
+            if let Some(derived) = derived_coin_from_note(&note, secret_bytes) {
+                if jobs[index].coin.len() == 32 && derived.as_slice() != jobs[index].coin.as_slice()
+                {
+                    continue;
+                }
+            }
+            out.insert(
+                (jobs[index].height, jobs[index].tx, jobs[index].idx),
+                (note, secret_bytes.clone()),
+            );
+        }
+    }
+    for (height, tx, idx, coin, encrypted) in fallback {
+        if out.contains_key(&(height, tx, idx)) {
+            continue;
+        }
+        for secret_bytes in secrets {
+            let Some(note) = trial_decrypt_note(&encrypted, secret_bytes) else {
+                continue;
+            };
+            if let Some(derived) = derived_coin_from_note(&note, secret_bytes) {
+                if coin.len() == 32 && derived.as_slice() != coin.as_slice() {
+                    continue;
+                }
+            }
+            out.insert((height, tx, idx), (note, secret_bytes.clone()));
+            break;
+        }
+    }
+    out
 }
 
 /// Trial decrypt a compact block note using the wallet's secret key.

@@ -1,10 +1,10 @@
 # Moonshine Wallet CLI
 
-**Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC and syncs with **UnifOMR only** (scheme `0x05`). There is no PerfOMR fallback.
+**Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`.
 
-**3.00.027** (crate semver **3.0.27** — leading zeros are not valid Cargo versions): Speaks lightwalletd proto 2.0.0 (lightwalletd **0.3.1** or later). Fee calls are built with `TransactionBuilder` signature secrets so the DarkFi pin can pay the fee from tx-local change. Minting a token and deploying a DAO with `drk` is written up in [docs/deploy-a-dao.md](docs/deploy-a-dao.md) (a real localnet transcript, then the same commands on testnet and mainnet). Sync installs a snapshot checkpoint, resumes the Money tree from its saved height, sends only padded commitment and nullifier ranges, reuses one pooled UnifOMR detection key, and retries PIR before fetching the padded window. Tor is Arti 0.47. A send spends one coin, the largest that covers the amount plus fee. DarkFi rejects a two-input transfer proof, so a pile of smaller coins is not combined. DarkFi checkout `8af61b3f0` (`nighthawk-testnet`, path dependency). Reorg recovery unspends a coin only when its nullifier was in a block above the fork. New wallets take `MOONSHINE_WALLET_PASS` and keep the wrap key inside the encrypted database. Sends attach a UniFOMR clue for the sender's change outputs. Money Merkle tree is backfilled from genesis after a birthday rescan so spend proofs stay on-chain (Money `Custom(5)` / `TransferMerkleRootNotFound`). CI checks out the pinned `nighthawk24/darkfi` sibling as `darkfi-nighthawk-testnet`. FIFO-capped clue-registration session cache (10,000 ids; updates do not refresh eviction order). Reorg recovery reports real SQLite `execute` rowcounts for notes and transactions (`invalidate_above_height`). Instant Sync + UnifOMR-strict receive (`sync --force-trial` / `--allow-trial` for trial-decrypt fallback). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.01.00** (crate semver **3.1.0**): Speaks lightwalletd proto 2.1.0. A normal `moonshine sync` trial-decrypts Money notes, token mints, and stores compact DAO calls and auth-token events. `moonshine sync --unifomr` is the experimental clue path and is not maintained until DarkFi mainnet contracts are live. Tor is Arti 0.48, with a fresh circuit per dial. A send spends one coin, the largest that covers the amount plus fee. DarkFi checkout `8af61b3f0` (`nighthawk-testnet`, path dependency). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
-> **Strict UnifOMR (hard-coded):** Moonshine does **not** run supplemental / gap trial decrypt. **Only** transactions that carry UnifOMR clues are discovered during normal sync — typically **Moonshine ↔ Moonshine**, or **Nighthawk → Moonshine**. Payments from upstream `drk` / other non-UnifOMR wallets will **not** appear unless you explicitly run `moonshine sync --force-trial` (privacy trade-off). Nighthawk Android / iOS / desktop default the opposite (trial-decrypt fallback on) so they can receive from any DarkFi wallet.
+> **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 
 Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a **pruned SQLite** wallet (SQLCipher + wrapped secrets) and a small on-disk footprint.
 
@@ -147,7 +147,7 @@ moonshine
 ├── balance
 ├── coins list
 ├── tx send | list | show | broadcast
-├── sync [--force-trial]
+├── sync [--force-trial] [--unifomr]
 ├── rescan
 ├── status
 ├── config show | set
@@ -164,7 +164,7 @@ moonshine
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **UnifOMR only (0x05)** | ✅ | `GetUnifOmrDigest` + `FetchPirBatch` when capabilities say `unifomr` |
+| **Trial decrypt (default)** | ✅ | Padded compact outputs, nullifiers, token mints, compact DAO calls |
 | **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses. Session cache is FIFO-capped at 10,000 ids |
 | **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive. Change outputs get `extra_omr_clues`, but strict sync still does not make that change spendable. Run `sync --force-trial` after the change is in a block |
 | **One input per send** | ✅ | Largest coin that covers amount + fee. A two-input proof is not built; darkfid rejects it |
@@ -173,9 +173,9 @@ moonshine
 | **Multi detection_keys** | ✅ | Up to 16 wallet secrets in `GetUnifOmrDigest` |
 | **Local BlockCache** | ✅ | Sparse/PIR compact blocks cached beside wallet DB |
 | **Instant Sync Checkpoints** | ✅ | Fast Merkle tree restore from authenticated `CheckpointSnapshot` (see [docs/instant-sync-strategy.md](docs/instant-sync-strategy.md)) |
-| **Proto Version Lockstep** | ✅ | Client proto **2.0.0**. A 1.x or 3.x server is a hard mismatch; an empty server version is accepted |
+| **Proto Version Lockstep** | ✅ | Client proto **2.1.0**. A 1.x or 3.x server is a hard mismatch; an empty server version is a mismatch |
 | **OMR Err → no silent trial (S15)** | ✅ | Tip not advanced on OMR **error** |
-| **Empty OMR → supplemental trial** | ❌ (strict) | Use `sync --force-trial` for miss-safety |
+| **Experimental UnifOMR** | optional | `sync --unifomr` or `experimental_unifomr = true`. Off by default |
 | **Tip regression rewind** | ✅ | Rewinds sync height when tip < last synced. Deleted note/tx counts come from SQLite `execute` rowcounts, not log-line length |
 | **`chain_name` network guard** | ✅ | Must match config `network` |
 | **TLS pin remote HTTPS** | ✅ | `tls_pin_sha256` + `PinnedVerifier` (leaf DER SHA-256); remote cleartext refused |
@@ -204,7 +204,7 @@ moonshine
 - Requires **darkfi-lightwalletd** with `fhe-omr`
 - Cross-client crypto parity: RLWE `n=1024`, signed AHE, `CLUE_ERROR_BOUND=2`, length-prefixed SealPIR limbs
 - Flow: RegisterCluePublicKey → GetClue → SendTransaction(omr_clue) → GetUnifOmrDigest → FetchPirBatch
-- Empty OMR → **no** supplemental trial (strict UnifOMR); use `sync --force-trial` for miss-safety
+- Default sync is trial decryption. `--unifomr` is experimental and unmaintained until DarkFi mainnet contracts are live.
 - Send fails closed unless GetClue **ownership proof** verifies (rejects directory decoys)
 - First-run default LWD: loopback `http://127.0.0.1:9067` (Tor off). Remote HTTPS still needs `tls_pin_sha256` + Tor if you want it.
 - Limits: [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md) (Param2 active)
@@ -214,8 +214,8 @@ moonshine
 ## Known issues
 
 1. **One input per transaction.** darkfid rejected a two-input transfer proof on the 2026-10-21 localnet. Selection spends a single coin that covers the amount plus the 0.05 DRK fee. It does not combine smaller coins. If no such coin is visible yet, the send stops before broadcast.
-2. **Own change needs `sync --force-trial`.** The recipient clue does not cover the sender's change. `extra_omr_clues` are attached, and strict sync still did not make that change spendable on the localnet. Sync with `--force-trial` after the change is in a block before the next send. Until then, selection can see only the small coins and report that none covers the fee.
-3. **`--no-omr` is invisible to strict sync.** Android and desktop received those payments only with trial decrypt forced. Moonshine will not see a clue-less incoming payment on a normal sync.
+2. **One coin must cover the amount plus fee.** Change from the previous send is visible after the next default trial-decrypt sync includes that block. A second coin is not combined into the proof.
+3. **Experimental UnifOMR can hide funds.** `--unifomr` only sees payments whose clue was registered on this lightwalletd. Leave it off to receive `drk` and other clue-less transfers.
 4. **`git.dark.fi` returns HTTP 504** and does not publish pin `8af61b3f0`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
 
 ---

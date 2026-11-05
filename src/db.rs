@@ -168,6 +168,22 @@ impl WalletDb {
 
             INSERT OR IGNORE INTO sync_state (id, last_synced_height, birthday_height)
             VALUES (1, 0, 0);
+
+            CREATE TABLE IF NOT EXISTS dao_calls (
+                height INTEGER NOT NULL,
+                tx_hash BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                bulla BLOB NOT NULL,
+                payload BLOB NOT NULL,
+                PRIMARY KEY (height, tx_hash, kind, bulla)
+            );
+
+            CREATE TABLE IF NOT EXISTS func_events (
+                height INTEGER NOT NULL,
+                tx_hash BLOB NOT NULL,
+                func_code INTEGER NOT NULL,
+                PRIMARY KEY (height, tx_hash, func_code)
+            );
         ",
         )?;
         self.migrate_notes_columns()?;
@@ -394,6 +410,29 @@ impl WalletDb {
     }
 
     /// Ensure migrated columns exist on older wallet DBs.
+    pub fn insert_dao_call(
+        &self,
+        height: u32,
+        tx_hash: &[u8],
+        kind: u32,
+        bulla: &[u8],
+        payload: &[u8],
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO dao_calls (height, tx_hash, kind, bulla, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![height, tx_hash, kind, bulla, payload],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_func_event(&self, height: u32, tx_hash: &[u8], func_code: u32) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO func_events (height, tx_hash, func_code) VALUES (?1, ?2, ?3)",
+            rusqlite::params![height, tx_hash, func_code],
+        )?;
+        Ok(())
+    }
+
     fn migrate_notes_columns(&self) -> SqlResult<()> {
         let _ = self
             .conn
@@ -802,6 +841,8 @@ impl WalletDb {
             "DELETE FROM wallet_meta WHERE key = 'trial_synced_height'",
             [],
         )?;
+        self.conn.execute("DELETE FROM dao_calls", [])?;
+        self.conn.execute("DELETE FROM func_events", [])?;
         Ok(())
     }
 
@@ -833,6 +874,10 @@ impl WalletDb {
         self.clamp_height_meta("trial_synced_height", height)?;
         self.clamp_height_meta("tree_applied_height", height)?;
         self.set_sync_height(height)?;
+        self.conn
+            .execute("DELETE FROM dao_calls WHERE height > ?1", params![height])?;
+        self.conn
+            .execute("DELETE FROM func_events WHERE height > ?1", params![height])?;
         Ok((notes_deleted as u32, txs_deleted as u32))
     }
 
