@@ -86,7 +86,10 @@ enum Command {
 
     /// Synchronize wallet with lightwalletd
     Sync {
-        #[arg(long, help = "Force a full trial-decrypt pass even if already caught up")]
+        #[arg(
+            long,
+            help = "Force a full trial-decrypt pass even if already caught up"
+        )]
         force_trial: bool,
         #[arg(
             long,
@@ -1044,67 +1047,69 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     Ok(raw_tx) => {
                         let omr_clue = if !config.experimental_unifomr {
                             Vec::new()
-                        } else { match parse_stub_recipient_pubkey(&raw_tx) {
-                            Some(recipient_pk) => {
-                                let info = match client.get_light_info().await {
-                                    Ok(info) => info,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Error: GetLightInfo failed: {}",
-                                            sync::redact_sync_error(&e.to_string())
-                                        );
-                                        return Ok(());
-                                    }
-                                };
-                                let w = wallet::Wallet::open(&args.wallet_name)?;
-                                wallet::check_directory_attest_pin(
-                                    &w.db,
-                                    &config.server_url,
-                                    &info.directory_attest_pubkey,
-                                )?;
-                                match client.get_clue_public_key(recipient_pk.to_vec()).await {
-                                    Ok(resp) => {
-                                        let network_byte =
-                                            wallet::Wallet::network_byte(&config.network);
-                                        match verified_unifomr_clue(
-                                            network_byte,
-                                            &recipient_pk,
-                                            &resp,
-                                            &info.directory_attest_pubkey,
-                                        ) {
-                                            Ok(clue) => {
-                                                println!(
+                        } else {
+                            match parse_stub_recipient_pubkey(&raw_tx) {
+                                Some(recipient_pk) => {
+                                    let info = match client.get_light_info().await {
+                                        Ok(info) => info,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Error: GetLightInfo failed: {}",
+                                                sync::redact_sync_error(&e.to_string())
+                                            );
+                                            return Ok(());
+                                        }
+                                    };
+                                    let w = wallet::Wallet::open(&args.wallet_name)?;
+                                    wallet::check_directory_attest_pin(
+                                        &w.db,
+                                        &config.server_url,
+                                        &info.directory_attest_pubkey,
+                                    )?;
+                                    match client.get_clue_public_key(recipient_pk.to_vec()).await {
+                                        Ok(resp) => {
+                                            let network_byte =
+                                                wallet::Wallet::network_byte(&config.network);
+                                            match verified_unifomr_clue(
+                                                network_byte,
+                                                &recipient_pk,
+                                                &resp,
+                                                &info.directory_attest_pubkey,
+                                            ) {
+                                                Ok(clue) => {
+                                                    println!(
                                                     "UnifOMR clue from verified directory PK ({} bytes)",
                                                     clue.len()
                                                 );
-                                                clue
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "Error: UnifOMR clue rejected ({e}). \
+                                                    clue
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "Error: UnifOMR clue rejected ({e}). \
                                                      No PerfOMR fallback."
-                                                );
-                                                return Ok(());
+                                                    );
+                                                    return Ok(());
+                                                }
                                             }
                                         }
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "Error: UnifOMR clue PK lookup failed: {}",
-                                            sync::redact_sync_error(&e.to_string())
-                                        );
-                                        return Ok(());
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Error: UnifOMR clue PK lookup failed: {}",
+                                                sync::redact_sync_error(&e.to_string())
+                                            );
+                                            return Ok(());
+                                        }
                                     }
                                 }
-                            }
-                            None => {
-                                eprintln!(
-                                    "Error: could not parse recipient for UnifOMR clue; \
+                                None => {
+                                    eprintln!(
+                                        "Error: could not parse recipient for UnifOMR clue; \
                                      refusing broadcast without lightwalletd clue hint (24h TTL)."
-                                );
-                                return Ok(());
+                                    );
+                                    return Ok(());
+                                }
                             }
-                        } };
+                        };
                         match client
                             .send_transaction(raw_tx, omr_clue, vec![], vec![])
                             .await
@@ -1156,8 +1161,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let secret_keys = w.db.get_all_secrets()?;
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
-            let strict_omr = (unifomr || deprecated_strict || config.experimental_unifomr)
-                && !force_trial;
+            let strict_omr =
+                (unifomr || deprecated_strict || config.experimental_unifomr) && !force_trial;
             if !strict_omr {
                 println!("Syncing with padded trial decryption...");
             } else {
@@ -1169,82 +1174,84 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("Syncing with lightwalletd at {}...", config.server_url);
 
             if strict_omr {
-            // Publish UnifOMR clue PK for every payment address (wallet-level sk_clue).
-            // Fail closed: if registration fails, senders would GetClue decoys.
-            let clue_pk = w
-                .unifomr_clue_public_key(&config.network)
-                .map_err(|e| format!("UnifOMR clue keypair required before sync: {e}"))?;
-            let pay_pks = w
-                .recipient_pubkeys_for_omr()
-                .map_err(|e| format!("payment pubkeys required for RegisterCluePublicKey: {e}"))?;
-            // Map each payment pubkey → owning SecretKey for ownership proofs.
-            let addr_keys = w.db.get_all_address_keys()?;
-            let mut sk_by_pk: std::collections::HashMap<[u8; 32], darkfi_sdk::crypto::SecretKey> =
-                std::collections::HashMap::new();
-            for (_addr, secret_bytes, _default) in addr_keys {
-                if secret_bytes.len() < 32 {
-                    continue;
-                }
-                let mut sk_arr = [0u8; 32];
-                sk_arr.copy_from_slice(&secret_bytes[..32]);
-                let Ok(sk) = darkfi_sdk::crypto::SecretKey::from_bytes(sk_arr) else {
-                    continue;
-                };
-                let pk = darkfi_sdk::crypto::PublicKey::from_secret(sk).to_bytes();
-                sk_by_pk.insert(pk, sk);
-            }
-            let mut reg = crate::client::LightwalletClient::new(
-                &config.server_url,
-                config.tls_pin_sha256.clone(),
-            )
-            .with_tor(config.use_tor);
-            let mut ok = 0usize;
-            let mut last_err: Option<String> = None;
-            let key_version = wallet::CLUE_KEY_VERSION;
-            for pk_pay in pay_pks {
-                if wallet::clue_already_registered(network_byte, &pk_pay, &clue_pk) {
-                    ok += 1;
-                    continue;
-                }
-                let Some(sk) = sk_by_pk.get(&pk_pay) else {
-                    last_err = Some("missing payment SecretKey for ownership proof".into());
-                    continue;
-                };
-                let ownership_proof = wallet::sign_clue_pk_ownership(
-                    sk,
-                    network_byte,
-                    key_version,
-                    &pk_pay,
-                    &clue_pk,
-                );
-                match reg
-                    .register_clue_public_key(
-                        pk_pay.to_vec(),
-                        clue_pk.clone(),
-                        ownership_proof,
-                        key_version,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        wallet::mark_clue_registered(network_byte, &pk_pay, &clue_pk);
-                        ok += 1;
+                // Publish UnifOMR clue PK for every payment address (wallet-level sk_clue).
+                // Fail closed: if registration fails, senders would GetClue decoys.
+                let clue_pk = w
+                    .unifomr_clue_public_key(&config.network)
+                    .map_err(|e| format!("UnifOMR clue keypair required before sync: {e}"))?;
+                let pay_pks = w.recipient_pubkeys_for_omr().map_err(|e| {
+                    format!("payment pubkeys required for RegisterCluePublicKey: {e}")
+                })?;
+                // Map each payment pubkey → owning SecretKey for ownership proofs.
+                let addr_keys = w.db.get_all_address_keys()?;
+                let mut sk_by_pk: std::collections::HashMap<
+                    [u8; 32],
+                    darkfi_sdk::crypto::SecretKey,
+                > = std::collections::HashMap::new();
+                for (_addr, secret_bytes, _default) in addr_keys {
+                    if secret_bytes.len() < 32 {
+                        continue;
                     }
-                    Err(e) => {
-                        last_err = Some(sync::redact_sync_error(&e.to_string()));
-                    }
+                    let mut sk_arr = [0u8; 32];
+                    sk_arr.copy_from_slice(&secret_bytes[..32]);
+                    let Ok(sk) = darkfi_sdk::crypto::SecretKey::from_bytes(sk_arr) else {
+                        continue;
+                    };
+                    let pk = darkfi_sdk::crypto::PublicKey::from_secret(sk).to_bytes();
+                    sk_by_pk.insert(pk, sk);
                 }
-            }
-            if ok == 0 {
-                return Err(format!(
-                    "RegisterCluePublicKey failed for all payment addresses ({}). \
-                     Ensure darkfi-lightwalletd with UnifOMR is reachable at {}.",
-                    last_err.unwrap_or_else(|| "unknown".into()),
-                    config.server_url
+                let mut reg = crate::client::LightwalletClient::new(
+                    &config.server_url,
+                    config.tls_pin_sha256.clone(),
                 )
-                .into());
-            }
-            println!("Registered UnifOMR clue public key for {ok} payment address(es).");
+                .with_tor(config.use_tor);
+                let mut ok = 0usize;
+                let mut last_err: Option<String> = None;
+                let key_version = wallet::CLUE_KEY_VERSION;
+                for pk_pay in pay_pks {
+                    if wallet::clue_already_registered(network_byte, &pk_pay, &clue_pk) {
+                        ok += 1;
+                        continue;
+                    }
+                    let Some(sk) = sk_by_pk.get(&pk_pay) else {
+                        last_err = Some("missing payment SecretKey for ownership proof".into());
+                        continue;
+                    };
+                    let ownership_proof = wallet::sign_clue_pk_ownership(
+                        sk,
+                        network_byte,
+                        key_version,
+                        &pk_pay,
+                        &clue_pk,
+                    );
+                    match reg
+                        .register_clue_public_key(
+                            pk_pay.to_vec(),
+                            clue_pk.clone(),
+                            ownership_proof,
+                            key_version,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            wallet::mark_clue_registered(network_byte, &pk_pay, &clue_pk);
+                            ok += 1;
+                        }
+                        Err(e) => {
+                            last_err = Some(sync::redact_sync_error(&e.to_string()));
+                        }
+                    }
+                }
+                if ok == 0 {
+                    return Err(format!(
+                        "RegisterCluePublicKey failed for all payment addresses ({}). \
+                     Ensure darkfi-lightwalletd with UnifOMR is reachable at {}.",
+                        last_err.unwrap_or_else(|| "unknown".into()),
+                        config.server_url
+                    )
+                    .into());
+                }
+                println!("Registered UnifOMR clue public key for {ok} payment address(es).");
             }
 
             let block_cache = {

@@ -379,12 +379,7 @@ impl SyncEngine {
                 .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
                 .collect();
             let extra = self
-                .fetch_outputs_by_func(
-                    &mut client,
-                    padded_start,
-                    padded_end,
-                    MONEY_FUNC_TOKEN_MINT,
-                )
+                .fetch_outputs_by_func(&mut client, padded_start, padded_end, MONEY_FUNC_TOKEN_MINT)
                 .await?;
             in_window.extend(extra);
             self.store_contract_records(&mut client, padded_start, padded_end)
@@ -392,12 +387,7 @@ impl SyncEngine {
             notes_found += self.trial_decrypt_blocks(&in_window)?;
         } else {
             let extra = self
-                .fetch_outputs_by_func(
-                    &mut client,
-                    padded_start,
-                    padded_end,
-                    MONEY_FUNC_TOKEN_MINT,
-                )
+                .fetch_outputs_by_func(&mut client, padded_start, padded_end, MONEY_FUNC_TOKEN_MINT)
                 .await?;
             notes_found += self.trial_decrypt_blocks(&extra)?;
             self.store_contract_records(&mut client, padded_start, padded_end)
@@ -1503,72 +1493,72 @@ impl SyncEngine {
                     continue;
                 };
                 {
-                        let tx_hash_hex = hex::encode(&tx.tx_hash);
-                        // S5: commitment is output.coin from the compact block
-                        let commitment = if output.coin.len() == 32 {
-                            Some(output.coin.as_slice())
-                        } else {
-                            None
+                    let tx_hash_hex = hex::encode(&tx.tx_hash);
+                    // S5: commitment is output.coin from the compact block
+                    let commitment = if output.coin.len() == 32 {
+                        Some(output.coin.as_slice())
+                    } else {
+                        None
+                    };
+                    // Nullifier = poseidon(secret, coin) — must match LWD nullifier stream.
+                    let nullifier_bytes = {
+                        use darkfi_money_contract::model::Coin;
+                        use darkfi_sdk::crypto::pasta_prelude::PrimeField;
+                        use darkfi_sdk::crypto::{poseidon_hash, SecretKey};
+                        let mut sk_arr = [0u8; 32];
+                        if secret_key.len() < 32 {
+                            continue;
+                        }
+                        sk_arr.copy_from_slice(&secret_key[..32]);
+                        let Ok(sk) = SecretKey::from_bytes(sk_arr) else {
+                            continue;
                         };
-                        // Nullifier = poseidon(secret, coin) — must match LWD nullifier stream.
-                        let nullifier_bytes = {
-                            use darkfi_money_contract::model::Coin;
-                            use darkfi_sdk::crypto::pasta_prelude::PrimeField;
-                            use darkfi_sdk::crypto::{poseidon_hash, SecretKey};
-                            let mut sk_arr = [0u8; 32];
-                            if secret_key.len() < 32 {
-                                continue;
-                            }
-                            sk_arr.copy_from_slice(&secret_key[..32]);
-                            let Ok(sk) = SecretKey::from_bytes(sk_arr) else {
-                                continue;
-                            };
-                            let mut coin_arr = [0u8; 32];
-                            if output.coin.len() != 32 {
-                                continue;
-                            }
-                            coin_arr.copy_from_slice(&output.coin);
-                            let Ok(coin) = Coin::from_bytes(coin_arr) else {
-                                continue;
-                            };
-                            let nf = poseidon_hash([sk.inner(), coin.inner()]);
-                            Some(nf.to_repr().to_vec())
+                        let mut coin_arr = [0u8; 32];
+                        if output.coin.len() != 32 {
+                            continue;
+                        }
+                        coin_arr.copy_from_slice(&output.coin);
+                        let Ok(coin) = Coin::from_bytes(coin_arr) else {
+                            continue;
                         };
-                        self.db.insert_note(
+                        let nf = poseidon_hash([sk.inner(), coin.inner()]);
+                        Some(nf.to_repr().to_vec())
+                    };
+                    self.db.insert_note(
+                        &tx_hash_hex,
+                        idx as u32,
+                        note.value as i64,
+                        &hex::encode(&note.token_id),
+                        &note.serial,
+                        block.height,
+                        note.memo.as_deref(),
+                        Some(&note.coin_blind),
+                        Some(&note.value_blind),
+                        Some(&note.token_blind),
+                        Some(note.spend_hook),
+                        Some(&note.user_data),
+                        None,
+                        commitment,
+                        nullifier_bytes.as_deref(),
+                        Some(secret_key.as_slice()),
+                    )?;
+                    if note.spend_hook_bytes.len() == 32 {
+                        let _ = self.db.set_spend_hook_bytes(
                             &tx_hash_hex,
                             idx as u32,
-                            note.value as i64,
-                            &hex::encode(&note.token_id),
-                            &note.serial,
-                            block.height,
-                            note.memo.as_deref(),
-                            Some(&note.coin_blind),
-                            Some(&note.value_blind),
-                            Some(&note.token_blind),
-                            Some(note.spend_hook),
-                            Some(&note.user_data),
-                            None,
-                            commitment,
-                            nullifier_bytes.as_deref(),
-                            Some(secret_key.as_slice()),
-                        )?;
-                        if note.spend_hook_bytes.len() == 32 {
-                            let _ = self.db.set_spend_hook_bytes(
-                                &tx_hash_hex,
-                                idx as u32,
-                                &note.spend_hook_bytes,
-                            );
-                        }
-                        self.db.insert_transaction(
-                            &tx_hash_hex,
-                            block.height,
-                            "incoming",
-                            note.value as i64,
-                            &hex::encode(&note.token_id),
-                            None,
-                            note.memo.as_deref(),
-                        )?;
-                        notes_found += 1;
+                            &note.spend_hook_bytes,
+                        );
+                    }
+                    self.db.insert_transaction(
+                        &tx_hash_hex,
+                        block.height,
+                        "incoming",
+                        note.value as i64,
+                        &hex::encode(&note.token_id),
+                        None,
+                        note.memo.as_deref(),
+                    )?;
+                    notes_found += 1;
                 }
             }
         }
@@ -2437,13 +2427,17 @@ fn batch_open_blocks(
         if pending.is_empty() {
             continue;
         }
-        let epks: Vec<_> = pending.iter().map(|index| jobs[*index].note.ephem_public).collect();
+        let epks: Vec<_> = pending
+            .iter()
+            .map(|index| jobs[*index].note.ephem_public)
+            .collect();
         let shared = sapling_ka_agree_batch(&secret, &epks);
         for (index, shared) in pending.into_iter().zip(shared) {
             let Ok(shared) = shared else {
                 continue;
             };
-            let Ok(RemainingBytes(plaintext)) = jobs[index].note.decrypt_with_shared(&shared) else {
+            let Ok(RemainingBytes(plaintext)) = jobs[index].note.decrypt_with_shared(&shared)
+            else {
                 continue;
             };
             let Some(money) = money_note_from_plaintext(&plaintext) else {
