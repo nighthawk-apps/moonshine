@@ -1477,7 +1477,7 @@ impl SyncEngine {
     fn trial_decrypt_block(
         &self,
         block: &crate::client::proto::CompactBlock,
-        hits: &std::collections::HashMap<(u32, [u8; 32], u32), (DecryptedNote, Vec<u8>)>,
+        hits: &TrialHits,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         let mut notes_found = 0u32;
         for tx in &block.txs {
@@ -2351,6 +2351,8 @@ pub fn derived_coin_from_note(note: &DecryptedNote, wallet_key: &[u8]) -> Option
     )
 }
 
+type TrialHits = std::collections::HashMap<(u32, [u8; 32], u32), (DecryptedNote, Vec<u8>)>;
+
 const MONEY_FUNC_AUTH_TOKEN_MINT: u32 = 0x04;
 const MONEY_FUNC_AUTH_TOKEN_FREEZE: u32 = 0x05;
 const MONEY_FUNC_TOKEN_MINT: u32 = 0x06;
@@ -2358,7 +2360,7 @@ const MONEY_FUNC_TOKEN_MINT: u32 = 0x06;
 fn batch_open_blocks(
     secrets: &[Vec<u8>],
     blocks: &[crate::client::proto::CompactBlock],
-) -> std::collections::HashMap<(u32, [u8; 32], u32), (DecryptedNote, Vec<u8>)> {
+) -> TrialHits {
     use darkfi_sdk::crypto::diffie_hellman::sapling_ka_agree_batch;
     use darkfi_sdk::crypto::note::AeadEncryptedNote;
     use darkfi_sdk::crypto::SecretKey;

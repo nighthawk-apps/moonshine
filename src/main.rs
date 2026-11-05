@@ -452,7 +452,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 // One input only. darkfid rejects two-input transfer proofs, and a
                 // pile of small coins cannot pay the fee once change is still unconfirmed.
                 let mut unspent = w.db.list_unspent()?;
-                unspent.sort_by(|a, b| b.2.cmp(&a.2));
+                unspent.sort_by_key(|coin| std::cmp::Reverse(coin.2));
                 let mut selected_inputs = Vec::new();
                 let mut input_total = 0u64;
 
@@ -756,7 +756,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 // Largest first so a payment that fits in one coin does not
                 // pull in an extra input. Two-input proofs are currently
                 // rejected by darkfid as invalid.
-                all_coins.sort_by(|a, b| b.note.value.cmp(&a.note.value));
+                all_coins.sort_by_key(|coin| std::cmp::Reverse(coin.note.value));
 
                 // Filter to requested token (DRK aliases native token hex).
                 let want_drk = crate::db::WalletDb::is_drk_token(&token);

@@ -492,6 +492,9 @@ impl LightwalletClient {
     }
 
     /// Fetch a single compact block by height.
+    ///
+    /// Sync uses range and sparse fetches. This wrapper stays for a one-height call.
+    #[allow(dead_code)]
     pub async fn get_block(&mut self, height: u32) -> Result<proto::CompactBlock, Box<dyn Error>> {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
@@ -593,7 +596,8 @@ impl LightwalletClient {
     ///
     /// Pass one or more detection keys (cap 16 on server). Used when the
     /// process has no pooled handle, and again after the server returns
-    /// `NOT_FOUND` for that handle.
+    /// `NOT_FOUND` for that handle. Sync currently goes through the pool RPC.
+    #[allow(dead_code)]
     pub async fn get_unif_omr_digest(
         &mut self,
         detection_keys: Vec<Vec<u8>>,

@@ -58,8 +58,10 @@ bs58 = "0.5"
 rand = "0.9.4"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 
-# Shared UnifOMR crypto (paper ePrint 2026/910) from lightwalletd
-darkfi-lightwalletd = { path = "../darkfi-lightwalletd", default-features = true }
+# Shared UnifOMR crypto (paper ePrint 2026/910) from lightwalletd.
+# Trial decryption is the default sync path; the experimental client still
+# links these types, which live behind lightwalletd's fhe-omr feature.
+darkfi-lightwalletd = { path = "../darkfi-lightwalletd", default-features = false, features = ["fhe-omr"] }
 
 # Embedded Tor (arti) — lightwalletd gRPC routed through Tor by default
 arti-client = { version = "0.48.0", default-features = false, features = ["tokio", "rustls", "compression", "error_detail", "onion-service-client"] }
