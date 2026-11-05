@@ -7,7 +7,7 @@ put treasury funds under DAO control, vote, and pay those funds out early.
 The commands and the outputs below are from a real run on 31 October 2026. The
 node was `darkfid` and the wallet was `drk`, both built from the DarkFi pin
 Moonshine uses (`nighthawk24/darkfi`, branch `nighthawk-testnet`, commit
-`8af61b3f03b47164b4e4e01fcdc84e2744cb8570`). See [darkfi-pin.md](darkfi-pin.md).
+`742ca5458edc75b142a910fd6b4c3ed017f96e12`). See [darkfi-pin.md](darkfi-pin.md).
 
 Your token IDs, DAO bulla, addresses, and transaction IDs will be different.
 Copy the commands. Treat the sample output as a picture of a successful run,
