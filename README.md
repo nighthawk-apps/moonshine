@@ -2,7 +2,7 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`.
 
-**3.01.05** (crate semver **3.1.5**): Speaks lightwalletd proto 2.1.0. A normal `moonshine sync` pulls compact Money notes, DAO calls, and auth-token events from **`darkfi-lightwalletd`**, trial-decrypts them into the local SQLCipher wallet (same scan semantics as `drk`, without full-chain validation like `darkfid`), and deletes processed compact blocks from the encrypted UniFFI-format cache. `moonshine sync --unifomr` remains experimental and is not maintained until DarkFi mainnet contracts are live. Tor is Arti 0.48, with a fresh circuit per dial. A send spends one coin, the largest that covers the amount plus fee. DarkFi checkout `742ca5458` (`nighthawk-testnet`, path dependency). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.01.06** (crate semver **3.1.6**): Speaks lightwalletd proto 2.1.0. A normal `moonshine sync` pulls compact Money notes, DAO calls, and auth-token events from **`darkfi-lightwalletd`**, trial-decrypts them into the local SQLCipher wallet (same scan semantics as `drk`, without full-chain validation like `darkfid`), and deletes processed compact blocks from the encrypted UniFFI-format cache. Beyond sync and DRK send, Moonshine can mint/freeze Money tokens, create/mint DAOs, and deploy/lock Deployooor WASM authorities through the same lightwalletd `SendTransaction` path (native fee attached locally). `moonshine sync --unifomr` remains experimental and is not maintained until DarkFi mainnet contracts are live. Tor is Arti 0.48, with a fresh circuit per dial. A send spends one coin, the largest that covers the amount plus fee. DarkFi checkout `742ca5458` (`nighthawk-testnet`, path dependency). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 
@@ -107,7 +107,7 @@ Optional wallet passphrase for SQLCipher (otherwise a random `{wallet}.pass` fil
 export MOONSHINE_WALLET_PASS='your-strong-passphrase'
 ```
 
-`network` must match lightwalletd (`mainnet` / `testnet`).
+`network` must match lightwalletd (`mainnet` / `testnet` / `localnet`). Localnet payment addresses use the Mainnet `D…` prefix (same as `drk`).
 
 ### Remote HTTPS / TLS pin
 
@@ -132,9 +132,20 @@ moonshine wallet create --name main
 moonshine address default
 moonshine sync
 moonshine balance
+moonshine tx list
 moonshine tx send --to <address> --amount 1.5 --token DRK
 # or: moonshine tx broadcast <hex>   # requires parseable recipient for UnifOMR clue
+
+# Money token / DAO / Deployooor (fee paid from a DRK coin; sync after mining/confirming)
+moonshine token generate-mint --alias ANON
+moonshine token mint ANON 100 "$(moonshine address list | awk '/★/{print $1; exit}')"
+moonshine dao create GuideDAO 20 10 10 0.67 ANON
+moonshine dao mint GuideDAO
+moonshine contract generate-deploy
+moonshine contract deploy <CONTRACT_ID> ./my_contract.wasm
 ```
+
+Full token/DAO walkthrough (including the `drk` path for proposals/votes): [docs/deploy-a-dao.md](docs/deploy-a-dao.md).
 
 ---
 
@@ -146,13 +157,16 @@ moonshine
 ├── address list | new | default
 ├── balance
 ├── coins list
-├── tx send | list | show | broadcast
-├── sync [--force-trial] [--unifomr]
+├── tx send | list | show | broadcast | inspect
+├── sync [--force-trial] [--unifomr] [--rebuild-merkle]
 ├── rescan
 ├── status
 ├── config show | set
 ├── doctor
 ├── prune
+├── token generate-mint | import | list | mint | freeze
+├── dao create | import | list | calls | view | mint
+├── contract generate-deploy | list | events | deploy | lock
 └── version
 ```
 
@@ -165,6 +179,9 @@ moonshine
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Trial decrypt (default)** | ✅ | Padded compact outputs, nullifiers, token mints, compact DAO calls |
+| **Token mint / freeze** | ✅ | `token generate-mint` / `mint` / `freeze` via Money + native fee |
+| **DAO create / mint** | ✅ | `dao create` / `mint`; synced compact DAO calls via `dao calls` |
+| **Contract deploy / lock** | ✅ | Deployooor authority + WASM `deploy` / `lock` through lightwalletd |
 | **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses. Session cache is FIFO-capped at 10,000 ids |
 | **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive. Change outputs get `extra_omr_clues`, but strict sync still does not make that change spendable. Run `sync --force-trial` after the change is in a block |
 | **One input per send** | ✅ | Largest coin that covers amount + fee. A two-input proof is not built; darkfid rejects it |

@@ -1,21 +1,26 @@
 # Create a token and a DAO on DarkFi
 
-This is a beginner walkthrough for the `drk` wallet. You will mint two tokens on a
-one-node localnet, freeze one of them, deploy a DAO with the native DAO contract,
-put treasury funds under DAO control, vote, and pay those funds out early.
+This is a beginner walkthrough. You will mint two tokens on a one-node localnet,
+freeze one of them, deploy a DAO with the native DAO contract, put treasury funds
+under DAO control, vote, and pay those funds out early.
 
-The commands and the outputs below are from a real run on 31 October 2026. The
-node was `darkfid` and the wallet was `drk`, both built from the DarkFi pin
-Moonshine uses (`nighthawk24/darkfi`, branch `nighthawk-testnet`, commit
-`742ca5458edc75b142a910fd6b4c3ed017f96e12`). See [darkfi-pin.md](darkfi-pin.md).
+**Two wallets:**
+
+| Job | Tool |
+| --- | --- |
+| Mint tokens, create/mint a DAO, deploy/lock WASM, send DRK | **Moonshine** (`token` / `dao` / `contract` / `tx send`) or **`drk`** |
+| Propose, vote, exec, DAO treasury spend-hooks | **`drk` only** (Moonshine lists synced DAO calls but does not vote/exec yet) |
+
+The long command log below is from a real `drk` run on 31 October 2026 against
+`darkfid` built from the DarkFi pin Moonshine uses (`nighthawk24/darkfi`, branch
+`nighthawk-testnet`, commit `742ca5458edc75b142a910fd6b4c3ed017f96e12`). See
+[darkfi-pin.md](darkfi-pin.md). A Moonshine 3.1.6 localnet path (token mint → DAO
+mint → Deployooor deploy/lock through `darkfi-lightwalletd`) was verified on
+7 November 2026.
 
 Your token IDs, DAO bulla, addresses, and transaction IDs will be different.
 Copy the commands. Treat the sample output as a picture of a successful run,
 not as values to paste back in.
-
-Moonshine does not create tokens or DAOs. It is a light wallet. Use `drk` for
-every step on this page. A later section says how a Moonshine wallet can receive
-a payment that came from one of these DAOs.
 
 ## What you end up with
 
@@ -748,39 +753,64 @@ drk --config drk.toml scan
 Then fund, propose, vote, and exec exactly as above. Wait for `scan` to show
 a leaf position between mint and vote.
 
-## Receiving the payout in Moonshine
+## Moonshine path (token, DAO mint, deploy)
 
-`drk` does not attach a Moonshine UnifOMR clue. Moonshine's normal sync only
-shows payments that carry a clue.
-
-If a DAO proposal pays a Moonshine address:
+Point Moonshine at a local lightwalletd that follows the same `darkfid`
+(example: `server_url = "http://127.0.0.1:9068"`, `network = "localnet"`).
+Fund the wallet with DRK, then:
 
 ```bash
-moonshine sync --force-trial
+moonshine -w localdao sync
+moonshine -w localdao token generate-mint --alias ANON
+moonshine -w localdao token mint ANON 100 "<your payment address>"
+# mine / wait for confirmation, then:
+moonshine -w localdao sync
+moonshine -w localdao dao create GuideDAO 20 10 10 0.67 ANON
+moonshine -w localdao dao mint GuideDAO
+moonshine -w localdao dao list
+moonshine -w localdao dao calls
+
+# Optional Deployooor upload (needs a wasm32 binary):
+moonshine -w localdao contract generate-deploy
+moonshine -w localdao contract deploy <CONTRACT_ID> ./my_contract.wasm
+moonshine -w localdao contract lock <CONTRACT_ID>
 ```
 
-That finds the coin by trial decryption. It is slower and it is a privacy
-tradeoff, which is why Moonshine does not do it unless you ask. Nighthawk
-Android, iOS, and desktop trial-decrypt by default, so those wallets can see
-a `drk` or DAO payout without an extra flag.
+Each mint/deploy/lock spends a small DRK fee through lightwalletd. After the
+block is mined, sync again so change notes are spendable. Proposal / vote /
+exec still use `drk` as in the sections above.
 
-Moonshine still cannot mint a token, import a DAO, vote, or exec. Do those
-steps in `drk`.
+## Receiving the payout in Moonshine
+
+Default Moonshine sync is padded trial decryption, so a `drk` or DAO payout to
+your address is found without `--unifomr`. Use `--force-trial` only when you
+need to re-scan past a stuck cursor. Experimental `--unifomr` can miss clue-less
+payments.
+
+```bash
+moonshine sync
+moonshine balance
+moonshine tx list
+```
+
+Moonshine can mint tokens, create/mint DAOs, and deploy/lock WASM. It does not
+yet propose, vote, or exec; do those steps in `drk`.
 
 ## A custom WASM contract
 
 Skip this if your goal is a DAO. The DAO you minted above is live without it.
 
-When you do have a compiled contract binary, the wallet commands are:
+When you do have a compiled contract binary:
 
 ```bash
+# Moonshine (broadcasts through lightwalletd)
+moonshine contract generate-deploy
+moonshine contract deploy <CONTRACT_ID> <WASM_FILE>
+moonshine sync
+moonshine contract lock <CONTRACT_ID>
+
+# or drk against darkfid RPC
 drk --config drk.toml contract generate-deploy
-```
-
-That prints a new contract id and its secret. Import the secret, then deploy,
-then lock. Locking stops later upgrades.
-
-```bash
 drk --config drk.toml contract deploy <CONTRACT_ID> <WASM_FILE> \
   | drk --config drk.toml broadcast
 drk --config drk.toml scan
@@ -788,14 +818,11 @@ drk --config drk.toml contract lock <CONTRACT_ID> \
   | drk --config drk.toml broadcast
 ```
 
-This walkthrough did not run those commands. There was no separate contract
-binary to upload. `contract generate-deploy` only creates a key. The chain
-does not have your contract until `contract deploy` is mined.
-
-Building the WASM is a separate project (a Rust crate that exports the contract
-functions, compiled to `wasm32-unknown-unknown`). The DarkFi book walks through
-a hello-world contract. Read that for the crate layout. Do not paste this DAO
-TOML into a WASM deploy, and do not expect `dao mint` to upload a `.wasm` file.
+`contract generate-deploy` only creates a key. The chain does not have your
+contract until `contract deploy` is mined. Building the WASM is a separate
+project (Rust crate → `wasm32-unknown-unknown`). The DarkFi book walks through
+a hello-world contract. Do not paste this DAO TOML into a WASM deploy, and do
+not expect `dao mint` to upload a `.wasm` file.
 
 ## When something fails
 
@@ -813,6 +840,7 @@ TOML into a WASM deploy, and do not expect `dao mint` to upload a `.wasm` file.
 ## Command list
 
 ```text
+# drk
 wallet initialize | wallet address | wallet balance | scan
 token generate-mint | token import | token list | token mint | token freeze
 alias add | alias show
@@ -821,4 +849,10 @@ dao propose-transfer | dao proposal | dao proposal --mint-proposal
 dao vote | dao exec | dao exec --early
 broadcast
 contract generate-deploy | contract deploy | contract lock
+
+# moonshine (3.1.6+)
+sync | balance | tx send | tx list
+token generate-mint | token import | token list | token mint | token freeze
+dao create | dao import | dao list | dao calls | dao view | dao mint
+contract generate-deploy | contract list | contract events | contract deploy | contract lock
 ```

@@ -184,6 +184,29 @@ impl WalletDb {
                 func_code INTEGER NOT NULL,
                 PRIMARY KEY (height, tx_hash, func_code)
             );
+
+            CREATE TABLE IF NOT EXISTS token_mints (
+                token_id TEXT PRIMARY KEY,
+                mint_authority BLOB NOT NULL,
+                token_blind BLOB NOT NULL,
+                alias TEXT,
+                is_frozen INTEGER NOT NULL DEFAULT 0,
+                freeze_height INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS dao_records (
+                name TEXT PRIMARY KEY,
+                params_toml TEXT NOT NULL,
+                bulla TEXT,
+                tx_hash TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS deploy_auths (
+                contract_id TEXT PRIMARY KEY,
+                secret_key BLOB NOT NULL,
+                is_locked INTEGER NOT NULL DEFAULT 0,
+                lock_height INTEGER
+            );
         ",
         )?;
         self.migrate_notes_columns()?;
@@ -429,6 +452,198 @@ impl WalletDb {
         self.conn.execute(
             "INSERT OR IGNORE INTO func_events (height, tx_hash, func_code) VALUES (?1, ?2, ?3)",
             rusqlite::params![height, tx_hash, func_code],
+        )?;
+        Ok(())
+    }
+
+    /// Synced compact DAO calls (most recent first).
+    pub fn list_dao_calls(
+        &self,
+        limit: u32,
+    ) -> SqlResult<Vec<(u32, Vec<u8>, u32, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT height, tx_hash, kind, bulla FROM dao_calls \
+             ORDER BY height DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Synced Money/DAO/deploy func markers (most recent first).
+    pub fn list_func_events(&self, limit: u32) -> SqlResult<Vec<(u32, Vec<u8>, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT height, tx_hash, func_code FROM func_events \
+             ORDER BY height DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    pub fn insert_token_mint(
+        &self,
+        token_id: &str,
+        mint_authority: &[u8],
+        token_blind: &[u8],
+        alias: Option<&str>,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO token_mints \
+             (token_id, mint_authority, token_blind, alias, is_frozen) \
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![token_id, mint_authority, token_blind, alias],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_token_mints(
+        &self,
+    ) -> SqlResult<Vec<(String, Vec<u8>, Vec<u8>, Option<String>, bool, Option<u32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_id, mint_authority, token_blind, alias, is_frozen, freeze_height \
+             FROM token_mints ORDER BY alias IS NULL, alias, token_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, Option<u32>>(5)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_token_mint(
+        &self,
+        token_or_alias: &str,
+    ) -> SqlResult<Option<(String, Vec<u8>, Vec<u8>, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_id, mint_authority, token_blind, is_frozen FROM token_mints \
+             WHERE token_id = ?1 OR alias = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([token_or_alias], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_token_frozen(&self, token_id: &str, height: Option<u32>) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE token_mints SET is_frozen = 1, freeze_height = ?2 WHERE token_id = ?1",
+            rusqlite::params![token_id, height],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_dao_record(
+        &self,
+        name: &str,
+        params_toml: &str,
+        bulla: Option<&str>,
+        tx_hash: Option<&str>,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO dao_records (name, params_toml, bulla, tx_hash) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET
+               params_toml = excluded.params_toml,
+               bulla = COALESCE(excluded.bulla, dao_records.bulla),
+               tx_hash = COALESCE(excluded.tx_hash, dao_records.tx_hash)",
+            rusqlite::params![name, params_toml, bulla, tx_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_dao_records(&self) -> SqlResult<Vec<(String, Option<String>, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, bulla, tx_hash FROM dao_records ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_dao_toml(&self, name: &str) -> SqlResult<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT params_toml FROM dao_records WHERE name = ?1")?;
+        let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn insert_deploy_auth(&self, contract_id: &str, secret_key: &[u8]) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO deploy_auths (contract_id, secret_key, is_locked) \
+             VALUES (?1, ?2, 0)",
+            rusqlite::params![contract_id, secret_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_deploy_auths(&self) -> SqlResult<Vec<(String, bool, Option<u32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT contract_id, is_locked, lock_height FROM deploy_auths ORDER BY contract_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, Option<u32>>(2)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_deploy_auth(&self, contract_id: &str) -> SqlResult<Option<(Vec<u8>, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT secret_key, is_locked FROM deploy_auths WHERE contract_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([contract_id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? != 0))
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_deploy_locked(&self, contract_id: &str, height: Option<u32>) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE deploy_auths SET is_locked = 1, lock_height = ?2 WHERE contract_id = ?1",
+            rusqlite::params![contract_id, height],
         )?;
         Ok(())
     }

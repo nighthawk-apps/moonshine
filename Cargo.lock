@@ -1594,6 +1594,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "darkfi_deployooor_contract"
+version = "0.5.0"
+dependencies = [
+ "darkfi",
+ "darkfi-sdk",
+ "darkfi-serial",
+ "getrandom 0.2.17",
+ "rand 0.8.8",
+ "thiserror 2.0.21",
+ "tracing",
+ "wasmparser",
+]
+
+[[package]]
 name = "darkfi_money_contract"
 version = "0.5.0"
 dependencies = [
@@ -2838,6 +2852,8 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -3746,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "3.1.5"
+version = "3.1.6"
 dependencies = [
  "argon2",
  "arti-client",
@@ -3759,6 +3775,8 @@ dependencies = [
  "darkfi-lightwalletd",
  "darkfi-sdk",
  "darkfi-serial",
+ "darkfi_dao_contract",
+ "darkfi_deployooor_contract",
  "darkfi_money_contract",
  "futures",
  "hex",
@@ -7974,6 +7992,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.249.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30538cae9a794215f490b532df01c557e2e2bfac92569482554acd0992a102ea"
+dependencies = [
+ "bitflags 2.13.2",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.2",
+ "semver",
+ "serde",
 ]
 
 [[package]]

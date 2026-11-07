@@ -212,14 +212,14 @@ impl SyncEngine {
 
         // First sync (cursor 0): install the greatest snapshot <= birthday, or
         // the latest snapshot when the wallet has no birthday. NOT_FOUND and a
-        // tip-only server fall through to commitment replay. A birthday of 0
-        // sets the note cursor to the snapshot so 0..snapshot is not replayed.
+        // tip-only server fall through to commitment replay.
+        //
+        // The snapshot only seeds the Money Merkle tree. Do **not** advance the
+        // note cursor to the tip — trial decrypt (the default) still has to walk
+        // birthday..=tip or a tip snapshot would hide every prior payment until
+        // `--force-trial`.
         if last_synced == 0 && !self.db.merkle_from_genesis() && tip_height > 0 {
-            if let Some(height) = self.try_install_checkpoint(&mut client, birthday).await? {
-                if birthday == 0 {
-                    self.db.set_sync_height(height)?;
-                }
-            }
+            let _ = self.try_install_checkpoint(&mut client, birthday).await?;
         }
         let (last_synced, birthday) = self.db.get_sync_state()?;
         // `--force-trial` keeps its own cursor. A strict sync records heights
@@ -1989,24 +1989,23 @@ pub fn note_scan_start(
 
 /// First height to scan after optional checkpoint state.
 ///
-/// A missing tree with cursor 0 starts at the birthday. An installed snapshot
-/// starts at `max(snapshot + 1, birthday)` so leaves at or below the snapshot
-/// are not appended again.
+/// A fresh wallet (`last_synced == 0`) always starts note discovery at the
+/// birthday, even when a Money-tree snapshot was installed — `tree_applied`
+/// only skips commitment replay, not trial decrypt. After the first scan,
+/// progress is `max(last_synced + 1, birthday, tree_applied + 1)` so leaves
+/// already in the tree are not appended twice.
 pub fn scan_start_for_sync(
     last_synced: u32,
     birthday: u32,
     merkle_from_genesis: bool,
     tree_applied: u32,
 ) -> u32 {
+    if last_synced == 0 {
+        return birthday;
+    }
     if merkle_from_genesis {
         let after_tree = tree_applied.saturating_add(1);
-        if last_synced == 0 {
-            after_tree.max(birthday)
-        } else {
-            last_synced.saturating_add(1).max(birthday).max(after_tree)
-        }
-    } else if last_synced == 0 {
-        birthday
+        last_synced.saturating_add(1).max(birthday).max(after_tree)
     } else {
         last_synced.saturating_add(1).max(birthday)
     }
@@ -2676,9 +2675,12 @@ mod tests {
     fn scan_start_skips_snapshot_prefix() {
         assert_eq!(scan_start_for_sync(0, 5000, false, 0), 5000);
         assert_eq!(scan_start_for_sync(0, 5000, true, 4096), 5000);
-        assert_eq!(scan_start_for_sync(0, 5000, true, 5000), 5001);
+        // Fresh wallet: birthday is the note cursor even if the tree snapshot
+        // sits at the birthday height (commitments are skipped separately).
+        assert_eq!(scan_start_for_sync(0, 5000, true, 5000), 5000);
         assert_eq!(scan_start_for_sync(5000, 0, true, 5000), 5001);
         assert_eq!(scan_start_for_sync(0, 0, false, 0), 0);
+        assert_eq!(scan_start_for_sync(0, 0, true, 117), 0);
     }
 
     #[test]

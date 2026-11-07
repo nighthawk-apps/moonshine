@@ -359,9 +359,15 @@ impl Wallet {
     /// Max wallet pubkeys registered for UnifOMR clue PK (sub-address cap).
     pub const MAX_OMR_DETECT_PUBKEYS: usize = 16;
 
-    /// Map config network string to SDK `Network` (mainnet vs testnet/localnet).
+    /// Map config network string to SDK `Network`.
+    ///
+    /// Matches `drk` (`bin/drk` cli_util): **localnet uses Mainnet address
+    /// prefixes** (`D…`), testnet uses Testnet (`f…`). OMR network byte is
+    /// separate — see [`Self::network_byte`].
     pub fn sdk_network(network: &str) -> Network {
-        if network.eq_ignore_ascii_case("mainnet") {
+        if network.eq_ignore_ascii_case("mainnet")
+            || network.eq_ignore_ascii_case("localnet")
+        {
             Network::Mainnet
         } else {
             Network::Testnet

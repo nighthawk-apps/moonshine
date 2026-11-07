@@ -1,7 +1,7 @@
 [package]
 name = "moonshine"
-version = "3.1.5"
-description = "Moonshine: DarkFi light wallet CLI. Compact blocks from darkfi-lightwalletd; local trial decrypt by default."
+version = "3.1.6"
+description = "Moonshine: DarkFi light wallet CLI. Compact blocks from darkfi-lightwalletd; trial decrypt, money send, token/DAO mint, contract deploy."
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 edition = "2021"
 build = "build.rs"
@@ -12,8 +12,10 @@ build = "build.rs"
 # Pin the nighthawk24 `nighthawk-testnet` tree (Arti 0.48 + keccak + kvdb), not upstream master.
 darkfi = { path = "../darkfi-nighthawk-testnet", features = ["async-daemonize", "bs58", "rpc", "tx"] }
 darkfi_money_contract = { path = "../darkfi-nighthawk-testnet/src/contract/money", features = ["no-entrypoint", "client"] }
+darkfi_dao_contract = { path = "../darkfi-nighthawk-testnet/src/contract/dao", features = ["no-entrypoint", "client"] }
+darkfi_deployooor_contract = { path = "../darkfi-nighthawk-testnet/src/contract/deployooor", features = ["no-entrypoint", "client"] }
 darkfi-sdk = { path = "../darkfi-nighthawk-testnet/src/sdk", features = ["async"] }
-darkfi-serial = { path = "../darkfi-nighthawk-testnet/src/serial" }
+darkfi-serial = { path = "../darkfi-nighthawk-testnet/src/serial", features = ["async"] }
 chacha20poly1305 = "0.10.1"
 
 # gRPC / Proto (+ TLS pin via rustls custom verifier)

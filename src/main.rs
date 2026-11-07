@@ -25,12 +25,17 @@ mod amount;
 mod block_cache;
 mod client;
 mod config;
+mod contract_ops;
+mod dao_ops;
 mod db;
+mod fee_attach;
 mod memo;
 mod mnemonic;
+mod ops_dispatch;
 mod pruning;
 mod secret_wrap;
 mod sync;
+mod token;
 mod tor;
 mod tx_builder;
 mod wallet;
@@ -134,6 +139,24 @@ enum Command {
 
     /// Forget the pinned directory attestation key for the configured server.
     ResetAttestPin,
+
+    /// Mint / freeze custom Money tokens
+    Token {
+        #[command(subcommand)]
+        sub: ops_dispatch::TokenSubcommand,
+    },
+
+    /// Create / mint DAOs and list synced DAO calls
+    Dao {
+        #[command(subcommand)]
+        sub: ops_dispatch::DaoSubcommand,
+    },
+
+    /// Deployooor authorities + WASM deploy / lock
+    Contract {
+        #[command(subcommand)]
+        sub: ops_dispatch::ContractSubcommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1656,6 +1679,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "Cleared the directory attestation pin for {}.",
                 config.server_url
             );
+        }
+        Command::Token { sub } => {
+            let w = wallet::Wallet::open(&args.wallet_name)?;
+            ops_dispatch::run_token(&w, &config, sub).await?;
+        }
+        Command::Dao { sub } => {
+            let w = wallet::Wallet::open(&args.wallet_name)?;
+            ops_dispatch::run_dao(&w, &config, sub).await?;
+        }
+        Command::Contract { sub } => {
+            let w = wallet::Wallet::open(&args.wallet_name)?;
+            ops_dispatch::run_contract(&w, &config, sub).await?;
         }
     }
     Ok(())
