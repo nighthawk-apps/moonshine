@@ -38,7 +38,7 @@ mod wallet;
 #[derive(Parser, Debug)]
 #[command(
     name = "moonshine",
-    about = "Moonshine: A lightweight, private CLI wallet for DarkFi utilizing OMR/OMD"
+    about = "Moonshine: DarkFi light wallet CLI — compact blocks from darkfi-lightwalletd, local trial decrypt"
 )]
 struct Cli {
     #[arg(short, long, default_value = "main")]

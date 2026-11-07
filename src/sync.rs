@@ -18,28 +18,34 @@
 
 //! Sync engine for Moonshine light wallet.
 //!
-//! Sparse OMR sync with lightwalletd:
-//! 1. OMR Round 1 (UnifOMR only) → matching heights
-//! 2. `GetNoteCommitments` — append **all** coins to the Money Merkle tree
+//! Moonshine is a **light client**: it fetches compact Money/DAO/auth-token
+//! records from `darkfi-lightwalletd` and keeps a local SQLCipher wallet. It
+//! does **not** validate the full chain like `darkfid`, and it does **not**
+//! pull full blocks over darkfid JSON-RPC the way `drk` does.
+//!
+//! Default path (padded trial decryption — same semantics as `drk` scan):
+//! 1. `GetCompactOutputBodies` over a power-of-2 padded window
+//! 2. Trial-decrypt Money notes into the local DB; store compact DAO calls
+//!    and auth-token mint/freeze markers for the same window
+//! 3. `GetNoteCommitments` — append **all** coins to the Money Merkle tree
 //!    from height 0 (dummy ZERO leaf + genesis mints). Note trial-decrypt
 //!    may start at the wallet birthday, but the tree must not: skipping
 //!    pre-birthday leaves makes spend proofs use a root the contract never
 //!    stored (Money `Custom(5)`).
-//! 3. `GetNullifiers(scan_start..scan_end)` — mark spent notes
-//! 4. Round 2: Batch PIR for matching heights, otherwise compact output bodies
-//! 5. Trial-decrypt those notes; DAO calls and token mints come from the
-//!    same padded window
+//! 4. `GetNullifiers(scan_start..scan_end)` — mark spent notes
 //!
-//! `--force-trial` trial-decrypts the window without UnifOMR.
-//!
-//! Tip advances only after commitments + nullifiers for the full range
-//! succeed **and** sparse block fetches for all matching heights succeed.
+//! Experimental `--unifomr` / `experimental_unifomr` uses sparse UnifOMR +
+//! Batch PIR instead. Tip advances only after commitments + nullifiers for
+//! the full range succeed (and, in UnifOMR mode, after sparse fetches for
+//! every matching height succeed).
 //!
 //! Privacy mitigations:
-//! - Power-of-2 bucket block-range padding (parity with mobile)
+//! - Power-of-2 bucket block-range padding (parity with mobile UniFFI)
 //! - Jittered sleep between requests (anti-fingerprinting)
 //! - Error redaction (strips IPs/URLs from error messages)
 //! - TLS + cert pin required for non-localhost HTTPS
+//! - Compact blocks in the local cache are encrypted (`NHC1`) and deleted
+//!   as soon as trial decrypt applies them
 
 use crate::block_cache::BlockCache;
 use crate::client::LightwalletClient;
@@ -267,9 +273,13 @@ impl SyncEngine {
 
         jittered_sleep(POLL_BASE_SECS).await;
 
-        // Matching heights for trial decrypt (sparse), or full window if force_trial.
-        let matching_heights: Vec<u32> = if self.force_trial {
-            tracing::warn!("--force-trial: skipping OMR; full-range trial decrypt");
+        // Matching heights for sparse UnifOMR only. Default sync never dials
+        // UnifOMR (server builds ship without `fhe-omr`); go straight to
+        // padded GetCompactOutputBodies trial decrypt.
+        let matching_heights: Vec<u32> = if !self.strict_omr || self.force_trial {
+            if self.force_trial {
+                tracing::warn!("--force-trial: skipping OMR; full-range trial decrypt");
+            }
             (scan_start..=scan_end).collect()
         } else {
             match self
@@ -300,19 +310,12 @@ impl SyncEngine {
                 }
                 Err(e) => {
                     let redacted = redact_sync_error(&e.to_string());
-                    if self.strict_omr {
-                        return Err(format!(
-                            "OMR detection failed ({}); strict UnifOMR refuses trial-decrypt \
-                             fallback (tip not advanced). Pass --allow-trial to override.",
-                            redacted
-                        )
-                        .into());
-                    }
-                    tracing::warn!(
-                        "OMR detection failed ({}); falling back to full-window trial decrypt",
+                    return Err(format!(
+                        "OMR detection failed ({}); strict UnifOMR refuses trial-decrypt \
+                         fallback (tip not advanced).",
                         redacted
-                    );
-                    (scan_start..=scan_end).collect()
+                    )
+                    .into());
                 }
             }
         };
@@ -321,8 +324,8 @@ impl SyncEngine {
         //    so that discovered coins are in the DB when the tree is built (allowing
         //    inline marking of owned positions).
         let mut notes_found = 0u32;
-        // Strict UniFOMR is the default. `--allow-trial` or `--force-trial`
-        // trial-decrypts the window so payments with no clue are still received.
+        // Default and `--force-trial` trial-decrypt the full padded window so
+        // clue-less payments (`drk`, other lightwalletds) are received.
         let use_full_window_trial = self.force_trial || !self.strict_omr;
         let heights_to_fetch: Vec<u32> = if use_full_window_trial {
             (scan_start..=scan_end).collect()
@@ -339,7 +342,7 @@ impl SyncEngine {
         if use_full_window_trial {
             tracing::info!(
                 "Trial-decrypting compact blocks [{scan_start}, {scan_end}] \
-                 (UnifOMR fallback / --force-trial)"
+                 via lightwalletd GetCompactOutputBodies"
             );
             let blocks = self
                 .fetch_padded_window_blocks(&mut client, scan_start, scan_end, tip_height)
@@ -1470,6 +1473,14 @@ impl SyncEngine {
         let mut notes_found = 0u32;
         for block in blocks {
             notes_found += self.trial_decrypt_block(block, &hits)?;
+            if let Some(cache) = &self.block_cache {
+                if let Err(e) = cache.delete_height(block.height) {
+                    tracing::warn!(
+                        "failed to delete processed compact block {}: {e}",
+                        block.height
+                    );
+                }
+            }
         }
         Ok(notes_found)
     }

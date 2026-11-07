@@ -16,26 +16,79 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! Local compact block cache for trial decryption fallback.
+//! Local compact block cache for padded trial decryption.
 //!
-//! When OMR is unavailable or fails, the wallet falls back to downloading
-//! all compact blocks and performing trial decryption. This cache stores
-//! serialized CompactBlock protobufs locally so they don't need to be
-//! re-downloaded on app restart or resync.
+//! Moonshine stores short-lived CompactBlock protobufs while a sync window
+//! is applied, matching the Nighthawk UniFFI (`darkfi-mobile-ffi`) cache:
+//! `NHC1` + XChaCha20-Poly1305 under the wallet passphrase, then delete the
+//! height as soon as trial decrypt has written notes / DAO / func events.
 //!
-//! Blocks are pruned after successful sync past a retention window to
-//! prevent unbounded storage growth on mobile devices.
+//! This is a light-wallet cache only — not a darkfid block store.
 
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    XChaCha20Poly1305, XNonce,
+};
+use rand::RngCore;
 use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::Path;
 
-/// Default retention: keep cached blocks for this many blocks past sync tip.
-/// Older blocks are pruned to save disk space.
-pub const DEFAULT_BLOCK_RETENTION: u32 = 2000;
+/// Same magic and key context as `darkfi-mobile-ffi` `MobileBlockCache`.
+const CACHE_MAGIC: &[u8] = b"NHC1";
+const NONCE_LEN: usize = 24;
+const CACHE_KEY_CONTEXT: &str = "nighthawk compact-block-cache v1";
 
-/// SQLite-backed compact block cache.
+fn cache_key_for_wallet_db(wallet_db: &str) -> Option<[u8; 32]> {
+    let pass = crate::secret_wrap::load_or_create_passphrase(wallet_db).ok()?;
+    Some(blake3::derive_key(CACHE_KEY_CONTEXT, pass.as_bytes()))
+}
+
+fn wrap_blob(key: Option<&[u8; 32]>, plaintext: &[u8]) -> SqlResult<Vec<u8>> {
+    let Some(key) = key else {
+        return Ok(plaintext.to_vec());
+    };
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rng().fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .map_err(|e| sql_err(e.to_string()))?;
+    let mut out = Vec::with_capacity(CACHE_MAGIC.len() + NONCE_LEN + ct.len());
+    out.extend_from_slice(CACHE_MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+fn unwrap_blob(key: Option<&[u8; 32]>, data: &[u8]) -> SqlResult<Vec<u8>> {
+    if !data.starts_with(CACHE_MAGIC) {
+        return Ok(data.to_vec());
+    }
+    let Some(key) = key else {
+        return Err(sql_err(
+            "encrypted compact-block cache requires wallet key".into(),
+        ));
+    };
+    if data.len() <= CACHE_MAGIC.len() + NONCE_LEN {
+        return Err(sql_err("truncated encrypted compact block".into()));
+    }
+    let nonce = &data[CACHE_MAGIC.len()..CACHE_MAGIC.len() + NONCE_LEN];
+    let ct = &data[CACHE_MAGIC.len() + NONCE_LEN..];
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(XNonce::from_slice(nonce), ct)
+        .map_err(|_| sql_err("compact-block cache decrypt failed".into()))
+}
+
+fn sql_err(err: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(err)))
+}
+
+/// Compact-block rows use the Nighthawk UniFFI cache format (`NHC1` + the
+/// wallet passphrase). Detection keys stay in the same SQLite file.
 pub struct BlockCache {
     conn: Connection,
+    key: Option<[u8; 32]>,
 }
 
 impl BlockCache {
@@ -68,7 +121,11 @@ impl BlockCache {
             );
             ",
         )?;
-        Ok(Self { conn })
+        let wallet_db = path.strip_suffix(".blocks.db").unwrap_or(path);
+        Ok(Self {
+            conn,
+            key: cache_key_for_wallet_db(wallet_db),
+        })
     }
 
     /// Open an in-memory cache for testing.
@@ -93,14 +150,15 @@ impl BlockCache {
             );
             ",
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn, key: None })
     }
 
     /// Insert a compact block (serialized protobuf).
     pub fn insert_block(&self, height: u32, data: &[u8]) -> SqlResult<()> {
+        let stored = wrap_blob(self.key.as_ref(), data)?;
         self.conn.execute(
             "INSERT OR REPLACE INTO compact_blocks (height, data) VALUES (?1, ?2)",
-            params![height, data],
+            params![height, stored],
         )?;
         Ok(())
     }
@@ -113,7 +171,7 @@ impl BlockCache {
         let mut rows = stmt.query(params![height])?;
         if let Some(row) = rows.next()? {
             let data: Vec<u8> = row.get(0)?;
-            Ok(Some(data))
+            unwrap_blob(self.key.as_ref(), &data).map(Some)
         } else {
             Ok(None)
         }
@@ -165,6 +223,24 @@ impl BlockCache {
         stmt.query_row([], |row| row.get(0))
     }
 
+    /// Drop one compact block after trial decrypt has applied it.
+    pub fn delete_height(&self, height: u32) -> SqlResult<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM compact_blocks WHERE height = ?1",
+            params![height],
+        )?;
+        Ok(n)
+    }
+
+    /// Delete every compact block at or below a height that has been processed.
+    pub fn prune_scanned(&self, scanned_height: u32) -> SqlResult<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM compact_blocks WHERE height <= ?1",
+            params![scanned_height],
+        )?;
+        Ok(n)
+    }
+
     /// Drop cached blocks above a fork height (reorg).
     pub fn delete_above(&self, height: u32) -> SqlResult<usize> {
         let n = self.conn.execute(
@@ -183,12 +259,12 @@ impl BlockCache {
         Ok(rows)
     }
 
-    /// Prune blocks older than retention window relative to sync height.
+    /// Delete compact blocks that sync has already processed.
+    ///
+    /// The Nighthawk cache does not keep a retention window. Once a height is
+    /// applied, the protobuf is gone.
     pub fn prune_for_sync_height(&self, sync_height: u32) -> SqlResult<usize> {
-        if sync_height <= DEFAULT_BLOCK_RETENTION {
-            return Ok(0);
-        }
-        self.prune_below(sync_height - DEFAULT_BLOCK_RETENTION)
+        self.prune_scanned(sync_height)
     }
 
     /// Check if a contiguous range [start, end] is fully cached.
@@ -289,6 +365,38 @@ mod tests {
         assert_eq!(cache.highest_cached().unwrap(), 0);
         cache.insert_block(42, b"data").unwrap();
         assert_eq!(cache.highest_cached().unwrap(), 42);
+    }
+
+    #[test]
+    fn processed_block_is_removed_from_nighthawk_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "moonshine-nighthawk-cache-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallet.blocks.db");
+        std::fs::write(dir.join("wallet.pass"), "e2e-localnet\n").unwrap();
+        let cache = BlockCache::open(path.to_str().unwrap()).unwrap();
+        cache.insert_block(7, b"compact").unwrap();
+        assert_eq!(
+            cache.get_block(7).unwrap().as_deref(),
+            Some(&b"compact"[..])
+        );
+        let raw: Vec<u8> = cache
+            .conn
+            .query_row(
+                "SELECT data FROM compact_blocks WHERE height = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw.starts_with(b"NHC1"));
+        assert_eq!(cache.delete_height(7).unwrap(), 1);
+        assert_eq!(cache.get_block(7).unwrap(), None);
+        assert_eq!(cache.prune_scanned(9).unwrap(), 0);
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
