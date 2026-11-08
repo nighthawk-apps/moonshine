@@ -149,6 +149,7 @@ fn own_coin_nullifier(coin: &OwnCoin) -> Vec<u8> {
     coin.nullifier().inner().to_repr().to_vec()
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub async fn build_transaction(
     amount: u64,
@@ -161,6 +162,38 @@ pub async fn build_transaction(
     zkas_bins: Vec<(String, Vec<u8>)>,
     payment_memo: Option<Vec<u8>>,
     half_split: bool,
+) -> Result<BuiltTransfer, Box<dyn Error>> {
+    build_transaction_extended(
+        amount,
+        fee,
+        token_id,
+        recipient_pubkey,
+        wallet_secret,
+        all_coins,
+        tree,
+        zkas_bins,
+        payment_memo,
+        half_split,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_transaction_extended(
+    amount: u64,
+    fee: u64,
+    token_id: TokenId,
+    recipient_pubkey: PublicKey,
+    wallet_secret: SecretKey,
+    all_coins: Vec<OwnCoin>,
+    tree: MerkleTree,
+    zkas_bins: Vec<(String, Vec<u8>)>,
+    payment_memo: Option<Vec<u8>>,
+    half_split: bool,
+    spend_hook: Option<FuncId>,
+    user_data: Option<pallas::Base>,
 ) -> Result<BuiltTransfer, Box<dyn Error>> {
     let keypair = Keypair::new(wallet_secret);
 
@@ -217,7 +250,17 @@ pub async fn build_transaction(
 
     let fee_candidates: Vec<OwnCoin> = spendable
         .iter()
-        .filter(|c| c.note.value >= fee && c.note.token_id == token_id)
+        .filter(|c| {
+            c.note.value >= fee
+                && (c.note.token_id == *darkfi_money_contract::model::DARK_TOKEN_ID
+                    || c.note.token_id == TokenId::from(pallas::Base::ZERO))
+        })
+        .cloned()
+        .collect();
+
+    let transfer_spendable: Vec<OwnCoin> = spendable
+        .iter()
+        .filter(|c| c.note.token_id == token_id)
         .cloned()
         .collect();
 
@@ -226,10 +269,10 @@ pub async fn build_transaction(
         recipient_pubkey,
         amount,
         token_id,
-        spendable.clone(),
+        transfer_spendable,
         tree.clone(),
-        None, // spend_hook
-        None, // user_data
+        spend_hook,
+        user_data,
         mint_zkbin,
         mint_pk,
         burn_zkbin,
@@ -272,7 +315,11 @@ pub async fn build_transaction(
                 let Ok(note) = output.note.decrypt::<MoneyNote>(&keypair.secret) else {
                     continue;
                 };
-                if note.value < fee || note.token_id != token_id {
+                // Fee must be paid in native DRK (upstream 0f985c7cf), not the
+                // transfer token — custom-token change cannot cover fees.
+                if note.value < fee
+                    || note.token_id != *darkfi_money_contract::model::DARK_TOKEN_ID
+                {
                     continue;
                 }
                 let derived = CoinAttributes {

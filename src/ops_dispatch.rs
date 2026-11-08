@@ -55,9 +55,9 @@ pub enum DaoSubcommand {
     /// Create DAO params and store them in the wallet
     Create {
         name: String,
-        proposer_limit: u64,
-        quorum: u64,
-        early_exec_quorum: u64,
+        proposer_limit: String,
+        quorum: String,
+        early_exec_quorum: String,
         approval_ratio: f64,
         gov_token: String,
     },
@@ -67,12 +67,23 @@ pub enum DaoSubcommand {
         file: PathBuf,
     },
     List,
+    /// Print standard DAO execution spend hook (Dao::Exec)
+    SpendHook,
+    /// Check unspent treasury balance for a stored DAO
+    Balance {
+        name: String,
+    },
     /// List compact DAO calls observed during sync
     Calls {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// View stored DAO details, bulla, and treasury payment address
     View { name: String },
+    /// List synced DAO calls and proposals
+    Proposals {
+        name: Option<String>,
+    },
     Mint {
         name: String,
         #[arg(long, default_value_t = 5_000_000)]
@@ -211,12 +222,24 @@ pub async fn run_dao(
             approval_ratio,
             gov_token,
         } => {
+            let parse_amount = |s: &str| -> Result<u64, Box<dyn Error>> {
+                if let Ok(a) = amount::parse_drk_atomic(s) {
+                    return Ok(a);
+                }
+                if let Ok(n) = s.parse::<u64>() {
+                    return Ok(n);
+                }
+                Err(format!("invalid amount or atomic integer '{s}'").into())
+            };
+            let p_limit = parse_amount(&proposer_limit)?;
+            let q = parse_amount(&quorum)?;
+            let eq = parse_amount(&early_exec_quorum)?;
             let toml = dao_ops::create_dao(
                 &w.db,
                 &name,
-                proposer_limit,
-                quorum,
-                early_exec_quorum,
+                p_limit,
+                q,
+                eq,
                 approval_ratio,
                 &gov_token,
             )?;
@@ -242,6 +265,53 @@ pub async fn run_dao(
                 );
             }
         }
+        DaoSubcommand::SpendHook => {
+            let hook = dao_ops::dao_spend_hook();
+            println!("DAO Exec Spend Hook: {hook}");
+        }
+        DaoSubcommand::Balance { name } => {
+            let Some(toml_str) = w.db.get_dao_toml(&name)? else {
+                return Err(format!("DAO '{name}' not found").into());
+            };
+            let dao = dao_ops::parse_dao_params(&toml_str, &w.db)?;
+            let dao_bulla = dao.to_bulla();
+            let dao_spend_hook = dao_ops::dao_spend_hook();
+            let coins = w.db.list_unspent_for_dao(
+                &dao_spend_hook.to_bytes(),
+                &dao_bulla.inner().to_repr(),
+            )?;
+            if coins.is_empty() {
+                println!("DAO '{name}' treasury has no unspent coins recorded.");
+                println!("Bulla: {dao_bulla}");
+                println!("Spend Hook: {dao_spend_hook}");
+                let network = if config.network == "mainnet" {
+                    darkfi_sdk::crypto::keypair::Network::Mainnet
+                } else {
+                    darkfi_sdk::crypto::keypair::Network::Testnet
+                };
+                let std_addr = darkfi_sdk::crypto::keypair::Address::from(
+                    darkfi_sdk::crypto::keypair::StandardAddress::from_public(
+                        network,
+                        dao.notes_public_key,
+                    ),
+                );
+                println!("Treasury Address: {std_addr}");
+                return Ok(());
+            }
+            println!("DAO '{name}' Treasury Balance (Bulla: {dao_bulla}):");
+            let mut by_token: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for (_tx, _idx, val, tok) in coins {
+                *by_token.entry(tok).or_insert(0) += val as u64;
+            }
+            for (tok, total) in by_token {
+                let is_drk = crate::db::WalletDb::is_drk_token(&tok);
+                if is_drk {
+                    println!("  DRK:   {} DRK ({total} atomic)", amount::format_drk_atomic(total));
+                } else {
+                    println!("  {tok}: {total} atomic units");
+                }
+            }
+        }
         DaoSubcommand::Calls { limit } => {
             let rows = w.db.list_dao_calls(limit)?;
             if rows.is_empty() {
@@ -257,10 +327,61 @@ pub async fn run_dao(
             }
         }
         DaoSubcommand::View { name } => {
-            let Some(toml) = w.db.get_dao_toml(&name)? else {
+            let Some(toml_str) = w.db.get_dao_toml(&name)? else {
                 return Err(format!("DAO '{name}' not found").into());
             };
-            println!("{toml}");
+            if let Ok(dao) = dao_ops::parse_dao_params(&toml_str, &w.db) {
+                let dao_bulla = dao.to_bulla();
+                let dao_spend_hook = dao_ops::dao_spend_hook();
+                let network = if config.network == "mainnet" {
+                    darkfi_sdk::crypto::keypair::Network::Mainnet
+                } else {
+                    darkfi_sdk::crypto::keypair::Network::Testnet
+                };
+                let std_addr = darkfi_sdk::crypto::keypair::Address::from(
+                    darkfi_sdk::crypto::keypair::StandardAddress::from_public(
+                        network,
+                        dao.notes_public_key,
+                    ),
+                );
+                println!("DAO: {name}");
+                println!("  Bulla:             {dao_bulla}");
+                println!("  Spend Hook:        {dao_spend_hook}");
+                println!("  Treasury Address:  {std_addr}");
+                println!("  Gov Token:         {}", dao.gov_token_id);
+                println!("  Proposer Limit:    {} atomic", dao.proposer_limit);
+                println!("  Quorum:            {} atomic", dao.quorum);
+                println!("  Early Exec Quorum: {} atomic", dao.early_exec_quorum);
+                println!(
+                    "  Approval Ratio:    {:.2}% ({}/{})",
+                    (dao.approval_ratio_quot as f64 / dao.approval_ratio_base as f64) * 100.0,
+                    dao.approval_ratio_quot,
+                    dao.approval_ratio_base
+                );
+                println!("\nStored TOML:\n{toml_str}");
+            } else {
+                println!("{toml_str}");
+            }
+        }
+        DaoSubcommand::Proposals { name: _ } => {
+            let calls = w.db.list_dao_calls_full(100)?;
+            if calls.is_empty() {
+                println!("No compact DAO calls observed yet. Run `moonshine sync` first.");
+                return Ok(());
+            }
+            println!("Observed DAO Calls & Proposals ({} total synced calls):", calls.len());
+            for (h, tx, kind, bulla, payload) in calls {
+                let kind_str = match kind {
+                    0 => "Mint",
+                    1 => "Propose",
+                    2 => "Vote",
+                    3 => "Exec",
+                    _ => "Unknown",
+                };
+                let bulla_b58 = bs58::encode(&bulla).into_string();
+                let tx_hex = hex::encode(&tx);
+                println!("  [Block {h}] Kind: {kind_str:7} | Bulla: {bulla_b58} | TX: {tx_hex} (payload: {} bytes)", payload.len());
+            }
         }
         DaoSubcommand::Mint { name, fee } => {
             let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
@@ -369,9 +490,24 @@ async fn broadcast_builder(
         let mut builder = builder;
         (builder.build_signed()?, Vec::new())
     } else {
-        let (fee_coin, tree) = pick_fee_coin(w, fee)?;
-        let (tx, _cm, nf) =
-            fee_attach::finish_with_native_fee(builder, fee, fee_coin, &tree, money_zkas).await?;
+        let wallet_secret = SecretKey::from_bytes(w.wallet_secret_bytes()?)
+            .map_err(|e| format!("Invalid wallet secret: {e:?}"))?;
+        // Prefer tx-local TransferV1 change (drk/0f985c7cf); only pick a wallet
+        // DRK coin when that path cannot cover the fee.
+        let fallback = pick_fee_coin(w, fee).ok();
+        let (fee_coin, tree) = match &fallback {
+            Some((c, t)) => (Some(c.clone()), Some(t)),
+            None => (None, None),
+        };
+        let (tx, _cm, nf) = fee_attach::finish_with_native_fee(
+            builder,
+            fee,
+            fee_coin,
+            tree,
+            money_zkas,
+            &[wallet_secret],
+        )
+        .await?;
         (tx, nf)
     };
     let mut raw = Vec::new();
@@ -512,21 +648,34 @@ fn parse_address_pubkey(s: &str) -> Result<PublicKey, Box<dyn Error>> {
     Ok(*addr.public_key())
 }
 
-fn parse_func_id(s: &str) -> Result<FuncId, Box<dyn Error>> {
+pub fn parse_func_id(s: &str) -> Result<FuncId, Box<dyn Error>> {
     FuncId::from_str(s).map_err(|e| format!("spend_hook: {e}").into())
 }
 
-fn parse_user_data(s: &str) -> Result<pallas::Base, Box<dyn Error>> {
+pub fn parse_user_data(s: &str) -> Result<pallas::Base, Box<dyn Error>> {
     if let Ok(n) = s.parse::<u64>() {
         return Ok(pallas::Base::from(n));
     }
-    let bytes = hex::decode(s.trim_start_matches("0x"))?;
-    if bytes.len() != 32 {
-        return Err("user_data must be u64 or 32-byte hex".into());
+    // Try base58 (standard encoding for Bullas in drk and deploy-a-dao guide)
+    if let Ok(bytes) = bs58::decode(s).into_vec() {
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            if let Some(f) = pallas::Base::from_repr(arr).into_option() {
+                return Ok(f);
+            }
+        }
     }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    pallas::Base::from_repr(arr)
-        .into_option()
-        .ok_or_else(|| "invalid user_data field element".into())
+    // Try hex (with or without 0x prefix)
+    let clean_hex = s.trim_start_matches("0x");
+    if let Ok(bytes) = hex::decode(clean_hex) {
+        if bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            if let Some(f) = pallas::Base::from_repr(arr).into_option() {
+                return Ok(f);
+            }
+        }
+    }
+    Err("user_data must be u64 integer, 32-byte base58 bulla, or 32-byte hex".into())
 }

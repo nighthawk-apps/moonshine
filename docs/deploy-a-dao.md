@@ -13,7 +13,7 @@ under DAO control, vote, and pay those funds out early.
 
 The long command log below is from a real `drk` run on 31 October 2026 against
 `darkfid` built from the DarkFi pin Moonshine uses (`nighthawk24/darkfi`, branch
-`nighthawk-testnet`, commit `742ca5458edc75b142a910fd6b4c3ed017f96e12`). See
+`nighthawk-testnet`, commit `44ec78b6efbf1d3e797f99bffe95195994b2488d`). See
 [darkfi-pin.md](darkfi-pin.md). A Moonshine 3.1.6 localnet path (token mint → DAO
 mint → Deployooor deploy/lock through `darkfi-lightwalletd`) was verified on
 7 November 2026.
@@ -768,7 +768,14 @@ moonshine -w localdao sync
 moonshine -w localdao dao create GuideDAO 20 10 10 0.67 ANON
 moonshine -w localdao dao mint GuideDAO
 moonshine -w localdao dao list
+moonshine -w localdao dao view GuideDAO
+moonshine -w localdao dao spend-hook
+moonshine -w localdao dao balance GuideDAO
 moonshine -w localdao dao calls
+moonshine -w localdao dao proposals
+
+# Fund the DAO treasury with custom tokens or DRK:
+# moonshine -w localdao tx send --to <DAO_TREASURY_ADDR> --amount 10 --token ANON --spend-hook $(moonshine dao spend-hook) --user-data <DAO_BULLA>
 
 # Optional Deployooor upload (needs a wasm32 binary):
 moonshine -w localdao contract generate-deploy
@@ -853,6 +860,6 @@ contract generate-deploy | contract deploy | contract lock
 # moonshine (3.1.6+)
 sync | balance | tx send | tx list
 token generate-mint | token import | token list | token mint | token freeze
-dao create | dao import | dao list | dao calls | dao view | dao mint
+dao create | dao import | dao list | dao spend-hook | dao balance | dao calls | dao view | dao proposals | dao mint
 contract generate-deploy | contract list | contract events | contract deploy | contract lock
 ```

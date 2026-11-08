@@ -2,7 +2,7 @@
 
 **Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`.
 
-**3.01.06** (crate semver **3.1.6**): Speaks lightwalletd proto 2.1.0. A normal `moonshine sync` pulls compact Money notes, DAO calls, and auth-token events from **`darkfi-lightwalletd`**, trial-decrypts them into the local SQLCipher wallet (same scan semantics as `drk`, without full-chain validation like `darkfid`), and deletes processed compact blocks from the encrypted UniFFI-format cache. Beyond sync and DRK send, Moonshine can mint/freeze Money tokens, create/mint DAOs, and deploy/lock Deployooor WASM authorities through the same lightwalletd `SendTransaction` path (native fee attached locally). `moonshine sync --unifomr` remains experimental and is not maintained until DarkFi mainnet contracts are live. Tor is Arti 0.48, with a fresh circuit per dial. A send spends one coin, the largest that covers the amount plus fee. DarkFi checkout `742ca5458` (`nighthawk-testnet`, path dependency). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**3.01.06** (crate semver **3.1.6**): Speaks lightwalletd proto 2.1.0. A normal `moonshine sync` pulls compact Money notes, DAO calls, and auth-token events from **`darkfi-lightwalletd`**, trial-decrypts them into the local SQLCipher wallet (same scan semantics as `drk`, without full-chain validation like `darkfid`), and deletes processed compact blocks from the encrypted UniFFI-format cache. Beyond sync and DRK send, Moonshine can mint/freeze Money tokens, create/mint DAOs, and deploy/lock Deployooor WASM authorities through the same lightwalletd `SendTransaction` path (native fee attached locally). `moonshine sync --unifomr` remains experimental and is not maintained until DarkFi mainnet contracts are live. Tor is Arti 0.48, with a fresh circuit per dial. A send spends one coin, the largest that covers the amount plus fee. DarkFi checkout `44ec78b6e` (`nighthawk-testnet`, path dependency). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 
@@ -28,7 +28,7 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 |-------------|--------|
 | **Rust** stable | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` |
-| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `742ca5458` (full `742ca5458edc75b142a910fd6b4c3ed017f96e12`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough, and `git.dark.fi` returns HTTP 504 and does not have this pin. You may `ln -s nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet` — that tree is the same pin. |
+| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `44ec78b6e` (full `44ec78b6efbf1d3e797f99bffe95195994b2488d`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough, and `git.dark.fi` returns HTTP 504 and does not have this pin. You may `ln -s nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet` — that tree is the same pin. |
 | **Sibling `darkfi-lightwalletd`** | Proto from `../darkfi-lightwalletd/proto/lightwallet.proto` |
 | **Running lightwalletd** | Local or remote before `moonshine sync` |
 
@@ -36,7 +36,7 @@ Clone the path dependencies as **sibling directories** (names matter — see `Ca
 
 ```text
 parent/
-  darkfi-nighthawk-testnet/ # MUST be this name — pin 742ca5458, not git.dark.fi master
+  darkfi-nighthawk-testnet/ # MUST be this name — pin 44ec78b6e, not git.dark.fi master
   darkfi-lightwalletd/      # gRPC server + proto + UnifOMR crate
   moonshine/                # this repo
   # optional; same pin if you already built Android:
@@ -59,7 +59,7 @@ Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
 ```bash
 # from darkfi-lightwalletd/
 FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
-# See docs/darkfi-pin.md — current SHA 742ca5458edc75b142a910fd6b4c3ed017f96e12
+# See docs/darkfi-pin.md — current SHA 44ec78b6efbf1d3e797f99bffe95195994b2488d
 ```
 
 Moonshine’s own pruned wallet remains **SQLCipher** (`PRAGMA key`) by design — it does
@@ -134,18 +134,21 @@ moonshine sync
 moonshine balance
 moonshine tx list
 moonshine tx send --to <address> --amount 1.5 --token DRK
-# or: moonshine tx broadcast <hex>   # requires parseable recipient for UnifOMR clue
+# or send custom tokens or fund a DAO treasury with spend-hook & user-data:
+# moonshine tx send --to <DAO_TREASURY_ADDR> --amount 10 --token ANON --spend-hook $(moonshine dao spend-hook) --user-data <DAO_BULLA>
 
 # Money token / DAO / Deployooor (fee paid from a DRK coin; sync after mining/confirming)
 moonshine token generate-mint --alias ANON
 moonshine token mint ANON 100 "$(moonshine address list | awk '/★/{print $1; exit}')"
 moonshine dao create GuideDAO 20 10 10 0.67 ANON
 moonshine dao mint GuideDAO
+moonshine dao spend-hook
+moonshine dao balance GuideDAO
 moonshine contract generate-deploy
 moonshine contract deploy <CONTRACT_ID> ./my_contract.wasm
 ```
 
-Full token/DAO walkthrough (including the `drk` path for proposals/votes): [docs/deploy-a-dao.md](docs/deploy-a-dao.md).
+Full token/DAO walkthrough (including DAO treasury deposits, proposals, and votes): [docs/deploy-a-dao.md](docs/deploy-a-dao.md).
 
 ---
 
@@ -157,15 +160,15 @@ moonshine
 ├── address list | new | default
 ├── balance
 ├── coins list
-├── tx send | list | show | broadcast | inspect
+├── tx send [--to <ADDR>] [--amount <VAL>] [--token <TOK>] [--spend-hook <HOOK>] [--user-data <DATA>] | list | show | broadcast | inspect
 ├── sync [--force-trial] [--unifomr] [--rebuild-merkle]
 ├── rescan
 ├── status
-├── config show | set
+├── config [--server-url <URL>] [--network <NET>] [--use-tor <BOOL>] [--tls-pin <HEX>] [--experimental-unifomr <BOOL>]
 ├── doctor
 ├── prune
 ├── token generate-mint | import | list | mint | freeze
-├── dao create | import | list | calls | view | mint
+├── dao create | import | list | spend-hook | balance | calls | view | proposals | mint
 ├── contract generate-deploy | list | events | deploy | lock
 └── version
 ```
@@ -179,8 +182,8 @@ moonshine
 | Feature | Status | Notes |
 |---------|--------|-------|
 | **Trial decrypt (default)** | ✅ | Padded compact outputs, nullifiers, token mints, compact DAO calls |
-| **Token mint / freeze** | ✅ | `token generate-mint` / `mint` / `freeze` via Money + native fee |
-| **DAO create / mint** | ✅ | `dao create` / `mint`; synced compact DAO calls via `dao calls` |
+| **Token mint / freeze / send** | ✅ | `token generate-mint` / `mint` / `freeze` via Money + native fee; custom token transfers with spend-hooks |
+| **DAO create / mint / treasury** | ✅ | `dao create` / `mint` / `spend-hook` / `balance` / `proposals`; automatic DAO treasury trial decryption on sync |
 | **Contract deploy / lock** | ✅ | Deployooor authority + WASM `deploy` / `lock` through lightwalletd |
 | **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses. Session cache is FIFO-capped at 10,000 ids |
 | **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive. Change outputs get `extra_omr_clues`, but strict sync still does not make that change spendable. Run `sync --force-trial` after the change is in a block |
@@ -233,7 +236,7 @@ moonshine
 1. **One input per transaction.** darkfid rejected a two-input transfer proof on the 2026-10-21 localnet. Selection spends a single coin that covers the amount plus the 0.05 DRK fee. It does not combine smaller coins. If no such coin is visible yet, the send stops before broadcast.
 2. **One coin must cover the amount plus fee.** Change from the previous send is visible after the next default trial-decrypt sync includes that block. A second coin is not combined into the proof.
 3. **Experimental UnifOMR can hide funds.** `--unifomr` only sees payments whose clue was registered on this lightwalletd. Leave it off to receive `drk` and other clue-less transfers.
-4. **`git.dark.fi` returns HTTP 504** and does not publish pin `742ca5458`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
+4. **`git.dark.fi` returns HTTP 504** and does not publish pin `44ec78b6e`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
 
 ---
 
@@ -241,7 +244,7 @@ moonshine
 
 | Sibling directory | Role |
 |-------------------|------|
-| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `742ca5458` (symlink to `nighthawk-android-wallet/third_party/darkfi`) |
+| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `44ec78b6e` (symlink to `nighthawk-android-wallet/third_party/darkfi`) |
 | `../darkfi-lightwalletd` | gRPC lightwalletd + shared UnifOMR |
 | `../darkfi-mobile-ffi` | Shared UniFFI crate (Android / iOS / desktop) |
 | `../nighthawk-android-wallet` | Android wallet (`third_party/darkfi` = same pin) |
