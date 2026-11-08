@@ -231,7 +231,7 @@ impl SyncEngine {
             self.force_trial && trial_cursor.unwrap_or(birthday.saturating_sub(1)) < tip_height;
 
         if last_synced >= tip_height && !force_backfill {
-            if !self.db.merkle_from_genesis() {
+            if !self.db.merkle_from_genesis() || self.tree_applied_height() < last_synced {
                 eprintln!(
                     "Money Merkle tree is missing pre-birthday / height-0 leaves; \
                      rebuilding from genesis so spend roots match the chain..."
@@ -406,6 +406,29 @@ impl SyncEngine {
         // Wallets synced before `tree_applied_height` existed already hold a
         // tree through `last_synced`. Stamp that cursor so a backfill does not
         // append those leaves a second time.
+        // If notes were newly discovered in a range where the Merkle tree was
+        // already stamped ahead (e.g. from a checkpoint snapshot or an earlier
+        // clue-less scan), the snapshot tree never marked our owned leaf positions.
+        // Reset the tree to genesis so ensure_genesis_merkle + apply_note_commitments
+        // rebuild and mark every owned coin at its exact leaf position.
+        if notes_found > 0
+            && self
+                .tree_applied_recorded()
+                .is_some_and(|applied| applied >= scan_start)
+        {
+            tracing::info!(
+                "Rebuilding Merkle tree from genesis: {} note(s) discovered at or below tree_applied_height ({:?})",
+                notes_found,
+                self.tree_applied_recorded()
+            );
+            let mut out = Vec::new();
+            darkfi_serial::Encodable::encode(&genesis_money_tree(), &mut out)
+                .map_err(|e| format!("encode genesis tree: {e}"))?;
+            self.db.set_meta("tree_state", &out)?;
+            self.db.set_merkle_from_genesis(false)?;
+            self.db.delete_meta("tree_applied_height")?;
+        }
+
         if self.db.merkle_from_genesis()
             && self.tree_applied_recorded().is_none()
             && last_synced > 0
@@ -1989,23 +2012,17 @@ pub fn note_scan_start(
 
 /// First height to scan after optional checkpoint state.
 ///
-/// A fresh wallet (`last_synced == 0`) always starts note discovery at the
-/// birthday, even when a Money-tree snapshot was installed — `tree_applied`
-/// only skips commitment replay, not trial decrypt. After the first scan,
-/// progress is `max(last_synced + 1, birthday, tree_applied + 1)` so leaves
-/// already in the tree are not appended twice.
+/// Note discovery scans every block from birthday to tip (default trial decrypt).
+/// A Money-tree checkpoint snapshot (`tree_applied`) only skips commitment replay
+/// in `apply_note_commitments`, never trial decryption.
 pub fn scan_start_for_sync(
     last_synced: u32,
     birthday: u32,
-    merkle_from_genesis: bool,
-    tree_applied: u32,
+    _merkle_from_genesis: bool,
+    _tree_applied: u32,
 ) -> u32 {
     if last_synced == 0 {
-        return birthday;
-    }
-    if merkle_from_genesis {
-        let after_tree = tree_applied.saturating_add(1);
-        last_synced.saturating_add(1).max(birthday).max(after_tree)
+        birthday
     } else {
         last_synced.saturating_add(1).max(birthday)
     }
@@ -2679,6 +2696,8 @@ mod tests {
         // sits at the birthday height (commitments are skipped separately).
         assert_eq!(scan_start_for_sync(0, 5000, true, 5000), 5000);
         assert_eq!(scan_start_for_sync(5000, 0, true, 5000), 5001);
+        // Multi-window scan: last_synced progresses sequentially without skipping to tree_applied
+        assert_eq!(scan_start_for_sync(100, 0, true, 5000), 101);
         assert_eq!(scan_start_for_sync(0, 0, false, 0), 0);
         assert_eq!(scan_start_for_sync(0, 0, true, 117), 0);
     }

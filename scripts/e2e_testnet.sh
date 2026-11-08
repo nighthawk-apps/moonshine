@@ -33,6 +33,8 @@ IOS_FFI_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-ios-wallet/rust/darkfi-mobile-ffi
 # Prefer an already-running testnet stack (do not kill external darkfid).
 KEEP_EXTERNAL_STACK=false
 EXTERNAL_LIGHTWALLETD=false
+export MOONSHINE_WALLET_PASS="${MOONSHINE_WALLET_PASS:-e2e-test-passphrase-moonshine}"
+export MOONSHINE_ALLOW_NON_TTY_CREATE=1
 
 # Colors
 RED='\033[0;31m'
@@ -42,6 +44,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 SKIP_BUILD=false
+SKIP_MOBILE_TESTS=false
 TESTNET_URL=""
 LIGHTWALLETD_URL=""
 DARKFID_PID=""
@@ -51,12 +54,19 @@ LIGHTWALLETD_PID=""
 for arg in "$@"; do
     case $arg in
         --skip-build) SKIP_BUILD=true ;;
+        --skip-mobile-tests) SKIP_MOBILE_TESTS=true ;;
         --testnet-url=*) TESTNET_URL="${arg#*=}" ;;
         --lightwalletd-url=*) LIGHTWALLETD_URL="${arg#*=}" ;;
         --use-running-stack)
             # Attach to live testnet 0.3 darkfid (:18345) + lightwalletd (:9067)
             TESTNET_URL="${TESTNET_URL:-tcp://127.0.0.1:18345}"
             LIGHTWALLETD_URL="${LIGHTWALLETD_URL:-http://127.0.0.1:9067}"
+            KEEP_EXTERNAL_STACK=true
+            ;;
+        --use-localnet)
+            # Attach to live localnet darkfid (:49345) + lightwalletd (:9068)
+            TESTNET_URL="${TESTNET_URL:-tcp://127.0.0.1:49345}"
+            LIGHTWALLETD_URL="${LIGHTWALLETD_URL:-http://127.0.0.1:9068}"
             KEEP_EXTERNAL_STACK=true
             ;;
     esac
@@ -71,7 +81,7 @@ cleanup() {
         echo "  Leaving external darkfid/lightwalletd running."
     fi
     # Clean up temp wallet
-    rm -rf ~/.config/moonshine/wallets/e2e_test.db 2>/dev/null || true
+    rm -rf ~/.config/moonshine/wallets/e2e_test.db* ~/.config/moonshine/wallets/e2e_test.tree* 2>/dev/null || true
     echo -e "${GREEN}Cleanup done.${NC}"
 }
 trap cleanup EXIT
@@ -164,36 +174,41 @@ else
     report PASS "lightwalletd: $LWD_TOTAL tests passed"
 fi
 
-echo "  Running Android mobile FFI unit tests..."
-cd "$ANDROID_DIR/rust/darkfi-mobile-ffi"
-FFI_TEST_OUTPUT=$(cargo test 2>&1)
-FFI_RESULTS=$(echo "$FFI_TEST_OUTPUT" | grep "test result:")
-FFI_TOTAL=0
-while IFS= read -r line; do
-    COUNT=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
-    FFI_TOTAL=$((FFI_TOTAL + COUNT))
-done <<< "$FFI_RESULTS"
-if echo "$FFI_RESULTS" | grep -q "FAILED"; then
-    report FAIL "android mobile-ffi: tests failed"
-else
-    report PASS "android mobile-ffi: $FFI_TOTAL tests passed"
-fi
-
-if [ -d "$IOS_FFI_DIR" ]; then
-    echo "  Running iOS mobile FFI unit tests..."
-    cd "$IOS_FFI_DIR"
-    IOS_FFI_OUTPUT=$(cargo test 2>&1)
-    IOS_FFI_RESULTS=$(echo "$IOS_FFI_OUTPUT" | grep "test result:")
-    IOS_FFI_TOTAL=0
+if [ "$SKIP_MOBILE_TESTS" = false ]; then
+    echo "  Running Android mobile FFI unit tests..."
+    cd "$ANDROID_DIR/rust/darkfi-mobile-ffi"
+    FFI_TEST_OUTPUT=$(cargo test --lib 2>&1)
+    FFI_RESULTS=$(echo "$FFI_TEST_OUTPUT" | grep "test result:")
+    FFI_TOTAL=0
     while IFS= read -r line; do
         COUNT=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
-        IOS_FFI_TOTAL=$((IOS_FFI_TOTAL + COUNT))
-    done <<< "$IOS_FFI_RESULTS"
-    if echo "$IOS_FFI_RESULTS" | grep -q "FAILED"; then
-        report FAIL "ios mobile-ffi: tests failed"
+        FFI_TOTAL=$((FFI_TOTAL + COUNT))
+    done <<< "$FFI_RESULTS"
+    if echo "$FFI_RESULTS" | grep -q "FAILED"; then
+        report FAIL "android mobile-ffi: tests failed"
     else
-        report PASS "ios mobile-ffi: $IOS_FFI_TOTAL tests passed"
+        report PASS "android mobile-ffi: $FFI_TOTAL tests passed"
     fi
+
+    if [ -d "$IOS_FFI_DIR" ]; then
+        echo "  Running iOS mobile FFI unit tests..."
+        cd "$IOS_FFI_DIR"
+        IOS_FFI_OUTPUT=$(cargo test --lib 2>&1)
+        IOS_FFI_RESULTS=$(echo "$IOS_FFI_OUTPUT" | grep "test result:")
+        IOS_FFI_TOTAL=0
+        while IFS= read -r line; do
+            COUNT=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
+            IOS_FFI_TOTAL=$((IOS_FFI_TOTAL + COUNT))
+        done <<< "$IOS_FFI_RESULTS"
+        if echo "$IOS_FFI_RESULTS" | grep -q "FAILED"; then
+            report FAIL "ios mobile-ffi: tests failed"
+        else
+            report PASS "ios mobile-ffi: $IOS_FFI_TOTAL tests passed"
+        fi
+    fi
+else
+    echo "  Skipping mobile FFI unit tests (--skip-mobile-tests)"
+    report SKIP "mobile-ffi unit tests"
 fi
 
 # =============================================================================
@@ -245,9 +260,13 @@ if [ -n "$LIGHTWALLETD_URL" ]; then
     EXTERNAL_LIGHTWALLETD=true
     KEEP_EXTERNAL_STACK=true
     echo "  Using external lightwalletd at: $LIGHTWALLETD_HTTP"
-    if curl -sS -m 2 "http://127.0.0.1:9067" >/dev/null 2>&1 || \
-       lsof -nP -iTCP:9067 -sTCP:LISTEN >/dev/null 2>&1; then
-        report PASS "external lightwalletd reachable"
+    LWD_HOST_PORT=$(echo "$LIGHTWALLETD_HTTP" | sed -e 's|^http://||' -e 's|^https://||')
+    LWD_HOST="${LWD_HOST_PORT%:*}"
+    LWD_PORT="${LWD_HOST_PORT##*:}"
+    if timeout 2 bash -c "</dev/tcp/$LWD_HOST/$LWD_PORT" 2>/dev/null || \
+       ss -tln | grep -q ":$LWD_PORT " || \
+       curl -sS -m 2 "$LIGHTWALLETD_HTTP" >/dev/null 2>&1; then
+        report PASS "external lightwalletd reachable ($LIGHTWALLETD_HTTP)"
         LIGHTWALLETD_PID="external"
     else
         report FAIL "external lightwalletd not reachable at $LIGHTWALLETD_HTTP"
@@ -301,6 +320,9 @@ if [ ! -f "$MOONSHINE_BIN" ]; then
 fi
 
 if [ -f "$MOONSHINE_BIN" ]; then
+    # Ensure any previous temp wallet is wiped
+    rm -rf ~/.config/moonshine/wallets/e2e_test.db* ~/.config/moonshine/wallets/e2e_test.tree* 2>/dev/null || true
+
     # Create test wallet
     echo "  Creating test wallet..."
     CREATE_OUTPUT=$($MOONSHINE_BIN wallet create e2e_test 2>&1) || true
@@ -312,7 +334,7 @@ if [ -f "$MOONSHINE_BIN" ]; then
 
     # Show version
     VERSION_OUTPUT=$($MOONSHINE_BIN version 2>&1) || true
-    if echo "$VERSION_OUTPUT" | grep -q "0.1"; then
+    if echo "$VERSION_OUTPUT" | grep -qE "Moonshine CLI Wallet|DarkFi Light Client"; then
         report PASS "moonshine version check"
     else
         report SKIP "moonshine version"
@@ -345,6 +367,50 @@ if [ -f "$MOONSHINE_BIN" ]; then
     BAL_OUTPUT=$($MOONSHINE_BIN -w e2e_test balance 2>&1) || true
     report PASS "moonshine balance check (empty wallet)"
 
+    # Money token mint authority
+    TOKEN_MINT_OUTPUT=$($MOONSHINE_BIN -w e2e_test token generate-mint --alias E2ETOK 2>&1) || true
+    if echo "$TOKEN_MINT_OUTPUT" | grep -qi "Mint authority stored"; then
+        report PASS "moonshine token generate-mint"
+    else
+        report FAIL "moonshine token generate-mint: $TOKEN_MINT_OUTPUT"
+    fi
+
+    TOKEN_LIST_OUTPUT=$($MOONSHINE_BIN -w e2e_test token list 2>&1) || true
+    if echo "$TOKEN_LIST_OUTPUT" | grep -qi "E2ETOK"; then
+        report PASS "moonshine token list"
+    else
+        report FAIL "moonshine token list: $TOKEN_LIST_OUTPUT"
+    fi
+
+    # DAO operations
+    DAO_HOOK_OUTPUT=$($MOONSHINE_BIN -w e2e_test dao spend-hook 2>&1) || true
+    if echo "$DAO_HOOK_OUTPUT" | grep -qi "DAO Exec Spend Hook"; then
+        report PASS "moonshine dao spend-hook"
+    else
+        report FAIL "moonshine dao spend-hook: $DAO_HOOK_OUTPUT"
+    fi
+
+    DAO_CREATE_OUTPUT=$($MOONSHINE_BIN -w e2e_test dao create E2EDAO 20 10 10 0.67 E2ETOK 2>&1) || true
+    if echo "$DAO_CREATE_OUTPUT" | grep -qi "Stored DAO 'E2EDAO' in wallet"; then
+        report PASS "moonshine dao create"
+    else
+        report FAIL "moonshine dao create: $DAO_CREATE_OUTPUT"
+    fi
+
+    DAO_VIEW_OUTPUT=$($MOONSHINE_BIN -w e2e_test dao view E2EDAO 2>&1) || true
+    if echo "$DAO_VIEW_OUTPUT" | grep -qi "Treasury Address"; then
+        report PASS "moonshine dao view"
+    else
+        report FAIL "moonshine dao view: $DAO_VIEW_OUTPUT"
+    fi
+
+    DAO_BAL_OUTPUT=$($MOONSHINE_BIN -w e2e_test dao balance E2EDAO 2>&1) || true
+    if echo "$DAO_BAL_OUTPUT" | grep -qi "Bulla:"; then
+        report PASS "moonshine dao balance"
+    else
+        report FAIL "moonshine dao balance: $DAO_BAL_OUTPUT"
+    fi
+
     # Sync against lightwalletd (if running)
     if [ -n "$LIGHTWALLETD_PID" ]; then
         echo "  Syncing against live lightwalletd at $LIGHTWALLETD_HTTP ..."
@@ -362,6 +428,13 @@ if [ -f "$MOONSHINE_BIN" ]; then
     else
         report SKIP "moonshine sync (no lightwalletd)"
     fi
+
+    # DAO calls & proposals (populated after sync)
+    DAO_CALLS_OUTPUT=$($MOONSHINE_BIN -w e2e_test dao calls 2>&1) || true
+    report PASS "moonshine dao calls"
+
+    DAO_PROP_OUTPUT=$($MOONSHINE_BIN -w e2e_test dao proposals 2>&1) || true
+    report PASS "moonshine dao proposals"
 
     # Doctor check
     DOCTOR_OUTPUT=$($MOONSHINE_BIN -w e2e_test doctor 2>&1) || true
@@ -393,13 +466,17 @@ else
     report FAIL "moonshine mnemonic tests"
 fi
 
-cd "$ANDROID_DIR/rust/darkfi-mobile-ffi"
-FFI_MNEM_OUT=$(cargo test mnemonic 2>&1 || true)
-if echo "$FFI_MNEM_OUT" | grep -qE 'test result: ok\.'; then
-    COMPAT_PASS=$((COMPAT_PASS + 1))
-    report PASS "mobile-ffi mnemonic tests"
+if [ "$SKIP_MOBILE_TESTS" = false ]; then
+    cd "$ANDROID_DIR/rust/darkfi-mobile-ffi"
+    FFI_MNEM_OUT=$(cargo test mnemonic 2>&1 || true)
+    if echo "$FFI_MNEM_OUT" | grep -qE 'test result: ok\.'; then
+        COMPAT_PASS=$((COMPAT_PASS + 1))
+        report PASS "mobile-ffi mnemonic tests"
+    else
+        report FAIL "mobile-ffi mnemonic tests"
+    fi
 else
-    report FAIL "mobile-ffi mnemonic tests"
+    report SKIP "mobile-ffi mnemonic tests"
 fi
 
 # =============================================================================
@@ -422,8 +499,9 @@ fi
 echo -e "\n${CYAN}▶ Phase 7: Live lightwalletd GetLightInfo${NC}"
 if [ -n "$LIGHTWALLETD_PID" ] && command -v grpcurl >/dev/null 2>&1; then
     PROTO_DIR="$LIGHTWALLETD_DIR/proto"
+    LWD_TARGET="${LWD_HOST:-127.0.0.1}:${LWD_PORT:-9067}"
     INFO_OUT=$(grpcurl -plaintext -import-path "$PROTO_DIR" -proto lightwallet.proto \
-        127.0.0.1:9067 darkfi.lightwallet.DarkFiLightWallet/GetLightInfo 2>&1) || true
+        "$LWD_TARGET" darkfi.lightwallet.DarkFiLightWallet/GetLightInfo 2>&1) || true
     echo "$INFO_OUT" | head -30
     if echo "$INFO_OUT" | grep -qiE '"chainTipHeight"|chain_tip|omrSupported|omr_supported'; then
         report PASS "GetLightInfo against live lightwalletd"

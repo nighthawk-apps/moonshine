@@ -132,6 +132,12 @@ enum Command {
         server_url: Option<String>,
         #[arg(long, help = "Set network (mainnet/testnet)")]
         network: Option<String>,
+        #[arg(long, help = "Toggle Tor routing (true/false)")]
+        use_tor: Option<bool>,
+        #[arg(long, help = "Set leaf certificate SHA-256 pin hex")]
+        tls_pin: Option<String>,
+        #[arg(long, help = "Toggle experimental UnifOMR feature flag (true/false)")]
+        experimental_unifomr: Option<bool>,
     },
 
     /// Show version info
@@ -225,6 +231,12 @@ enum TxSubcommand {
         /// Build and reserve inputs but do not broadcast (hex for `tx broadcast`).
         #[arg(long)]
         no_broadcast: bool,
+        /// Spend hook function ID (e.g. for DAO deposit or contract call)
+        #[arg(long)]
+        spend_hook: Option<String>,
+        /// User data for the recipient note (u64, base58 bulla, or hex)
+        #[arg(long)]
+        user_data: Option<String>,
     },
     List,
     Show {
@@ -388,12 +400,34 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Balance => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
-            let balance = w.db.confirmed_balance("DRK")?;
-            println!(
-                "Balance: {} DRK",
-                crate::amount::format_drk_atomic(balance as u64)
-            );
-            println!("  Raw:   {} atomic units", balance);
+            let balances = w.db.list_token_balances()?;
+            if balances.is_empty() {
+                println!("Balance: 0 DRK (0 atomic units)");
+            } else {
+                println!("Confirmed Balances:");
+                for (token_id, alias, amount) in balances {
+                    let is_drk = crate::db::WalletDb::is_drk_token(&token_id);
+                    if is_drk {
+                        println!(
+                            "  DRK:   {} DRK ({} atomic units)",
+                            crate::amount::format_drk_atomic(amount as u64),
+                            amount
+                        );
+                    } else {
+                        let name = alias.unwrap_or_else(|| {
+                            if token_id.len() >= 12 {
+                                format!("{}..{}", &token_id[..6], &token_id[token_id.len() - 4..])
+                            } else {
+                                token_id.clone()
+                            }
+                        });
+                        println!(
+                            "  {name:5}: {} atomic units (token: {token_id})",
+                            amount
+                        );
+                    }
+                }
+            }
         }
         Command::Coins { sub } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
@@ -426,6 +460,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 half_split,
                 no_omr,
                 no_broadcast,
+                spend_hook,
+                user_data,
             } => {
                 let w = wallet::Wallet::open(&args.wallet_name)?;
 
@@ -449,59 +485,112 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
                 let fee_atomic = fee;
 
-                if token != "DRK"
-                    && !token.eq_ignore_ascii_case(&crate::db::WalletDb::dark_token_id_hex())
-                {
-                    return Err(format!(
-                        "custom tokens are not supported yet (got '{token}'). \
-                         Omit --token or pass DRK."
-                    )
-                    .into());
+                let parsed_spend_hook = match spend_hook {
+                    Some(ref s) => Some(crate::ops_dispatch::parse_func_id(s)?),
+                    None => None,
+                };
+                let parsed_user_data = match user_data {
+                    Some(ref s) => Some(crate::ops_dispatch::parse_user_data(s)?),
+                    None => None,
+                };
+
+                let resolved_token_hex = w.db.resolve_token_id(&token)?;
+                let is_drk = crate::db::WalletDb::is_drk_token(&resolved_token_hex);
+
+                // Check balances
+                if is_drk {
+                    let balance = w.db.confirmed_balance("DRK")?;
+                    let total_needed = amount_atomic.checked_add(fee_atomic).ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "amount+fee overflow")
+                    })?;
+                    if (balance as u64) < total_needed {
+                        return Err(format!(
+                            "Insufficient funds. Have {} atomic DRK, need {} ({} + {} fee).",
+                            balance, total_needed, amount_atomic, fee_atomic
+                        )
+                        .into());
+                    }
+                } else {
+                    let token_bal = w.db.confirmed_balance(&resolved_token_hex)?;
+                    if (token_bal as u64) < amount_atomic {
+                        return Err(format!(
+                            "Insufficient token funds for {token}. Have {} atomic, need {}.",
+                            token_bal, amount_atomic
+                        )
+                        .into());
+                    }
+                    if fee_atomic > 0 {
+                        let drk_bal = w.db.confirmed_balance("DRK")?;
+                        if (drk_bal as u64) < fee_atomic {
+                            return Err(format!(
+                                "Insufficient DRK for transaction fee. Have {} atomic DRK, need {}.",
+                                drk_bal, fee_atomic
+                            )
+                            .into());
+                        }
+                    }
                 }
 
-                // Check balance
-                let balance = w.db.confirmed_balance(&token)?;
-                let total_needed = amount_atomic.checked_add(fee_atomic).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "amount+fee overflow")
-                })?;
-                if (balance as u64) < total_needed {
-                    return Err(format!(
-                        "Insufficient funds. Have {} atomic, need {} ({} + {} fee).",
-                        balance, total_needed, amount_atomic, fee_atomic
-                    )
-                    .into());
-                }
-
-                // One input only. darkfid rejects two-input transfer proofs, and a
-                // pile of small coins cannot pay the fee once change is still unconfirmed.
+                // Coin selection
                 let mut unspent = w.db.list_unspent()?;
                 unspent.sort_by_key(|coin| std::cmp::Reverse(coin.2));
                 let mut selected_inputs = Vec::new();
                 let mut input_total = 0u64;
 
-                for (tx_hash, idx, value, ref token_id) in &unspent {
-                    let token_ok = (crate::db::WalletDb::is_drk_token(&token)
-                        && crate::db::WalletDb::is_drk_token(token_id))
-                        || token_id == &token;
-                    if token_ok && (*value as u64) >= total_needed {
-                        selected_inputs.push((tx_hash.clone(), *idx, *value));
-                        input_total = *value as u64;
-                        break;
+                if is_drk {
+                    let total_needed = amount_atomic + fee_atomic;
+                    for (tx_hash, idx, value, ref tok_id) in &unspent {
+                        if crate::db::WalletDb::is_drk_token(tok_id) && (*value as u64) >= total_needed {
+                            selected_inputs.push((tx_hash.clone(), *idx, *value));
+                            input_total = *value as u64;
+                            break;
+                        }
+                    }
+                    if selected_inputs.is_empty() {
+                        return Err(format!(
+                            "No single coin covers {total_needed} atomic DRK \
+                             (amount {amount_atomic} + fee {fee_atomic}). \
+                             Moonshine spends one input per transaction; darkfid rejects \
+                             two-input proofs. If change from the last send is missing, \
+                             run `moonshine sync` after that change is in a block."
+                        )
+                        .into());
+                    }
+                } else {
+                    for (tx_hash, idx, value, ref tok_id) in &unspent {
+                        let matches = tok_id == &resolved_token_hex || tok_id == &token;
+                        if matches && (*value as u64) >= amount_atomic {
+                            selected_inputs.push((tx_hash.clone(), *idx, *value));
+                            input_total += *value as u64;
+                            break;
+                        }
+                    }
+                    if selected_inputs.is_empty() {
+                        return Err(format!(
+                            "No single coin covers {amount_atomic} atomic for token {token}. \
+                             If change from the last send is missing, \
+                             run `moonshine sync` after that change is in a block."
+                        )
+                        .into());
+                    }
+                    if fee_atomic > 0 {
+                        let drk_ok = unspent.iter().any(|(_, _, val, tok_id)| {
+                            crate::db::WalletDb::is_drk_token(tok_id) && (*val as u64) >= fee_atomic
+                        });
+                        if !drk_ok {
+                            return Err(format!(
+                                "No single DRK coin covers fee of {fee_atomic} atomic units."
+                            )
+                            .into());
+                        }
                     }
                 }
 
-                if selected_inputs.is_empty() {
-                    return Err(format!(
-                        "No single coin covers {total_needed} atomic \
-                         (amount {amount_atomic} + fee {fee_atomic}). \
-                         Moonshine spends one input per transaction; darkfid rejects \
-                         two-input proofs. If change from the last send is missing, \
-                         run `moonshine sync --force-trial` after that change is in a block."
-                    )
-                    .into());
-                }
-
-                let change = input_total - total_needed;
+                let change = if is_drk {
+                    input_total.saturating_sub(amount_atomic + fee_atomic)
+                } else {
+                    input_total.saturating_sub(amount_atomic)
+                };
 
                 // UnifOMR clue from directory PK (GetCluePublicKey → build_omr_clue_from_pk).
                 // `--no-omr` skips the clue so the recipient discovers via trial decrypt.
@@ -599,7 +688,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         m.chars().take(32).collect::<String>()
                     );
                 }
-                if no_omr {
+                if no_omr || !config.experimental_unifomr {
                     println!("║  OMR:     none (trial-decrypt receive)        ║");
                 } else {
                     println!("║  OMR:     UnifOMR (0x05) ✓                    ║");
@@ -781,26 +870,32 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 // rejected by darkfid as invalid.
                 all_coins.sort_by_key(|coin| std::cmp::Reverse(coin.note.value));
 
-                // Filter to requested token (DRK aliases native token hex).
-                let want_drk = crate::db::WalletDb::is_drk_token(&token);
+                // Filter to requested token (and native DRK for fee when custom token)
+                let want_drk = is_drk;
+                let token_id = if is_drk {
+                    *darkfi_money_contract::model::DARK_TOKEN_ID
+                } else {
+                    use std::str::FromStr;
+                    darkfi_money_contract::model::TokenId::from_str(&resolved_token_hex)
+                        .map_err(|e| format!("Invalid token_id '{resolved_token_hex}': {e}"))?
+                };
                 let all_coins: Vec<_> = all_coins
                     .into_iter()
                     .filter(|c| {
                         let hex = hex::encode(c.note.token_id.to_bytes());
+                        let is_c_drk = crate::db::WalletDb::is_drk_token(&hex);
                         if want_drk {
-                            crate::db::WalletDb::is_drk_token(&hex)
+                            is_c_drk
                         } else {
-                            token == hex
+                            hex == resolved_token_hex || is_c_drk
                         }
                     })
                     .collect();
                 if all_coins.is_empty() {
                     return Err(format!(
                         "no spendable coins for token '{token}'. \
-                         Unspent rows exist but lack owner_secret/leaf_position/commitment, \
-                         or token_id does not match native DRK ({}). \
+                         Unspent rows exist but lack owner_secret/leaf_position/commitment. \
                          Run: moonshine -w {} --server {} sync --rebuild-merkle",
-                        crate::db::WalletDb::dark_token_id_hex(),
                         args.wallet_name,
                         config.server_url
                     )
@@ -813,14 +908,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     a
                 })
                 .unwrap();
-                let token_id = *darkfi_money_contract::model::DARK_TOKEN_ID;
                 // Change/output signing key: default address secret (not seed_hash).
                 let wallet_secret =
                     darkfi_sdk::crypto::SecretKey::from_bytes(w.wallet_secret_bytes()?)
                         .map_err(|e| format!("Invalid wallet secret: {e:?}"))?;
 
                 // Build OMR metadata (plaintext) and encrypt for the recipient.
-                let omr_metadata_enc = if no_omr {
+                let omr_metadata_enc = if no_omr || !config.experimental_unifomr {
                     Vec::new()
                 } else {
                     use darkfi_sdk::crypto::pasta_prelude::PrimeField;
@@ -841,7 +935,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.as_bytes().to_vec());
 
-                let built = crate::tx_builder::build_transaction(
+                let built = crate::tx_builder::build_transaction_extended(
                     amount_atomic,
                     fee_atomic,
                     token_id,
@@ -855,6 +949,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         .collect(),
                     payment_memo,
                     half_split,
+                    parsed_spend_hook,
+                    parsed_user_data,
                 )
                 .await?;
                 let tx = built.tx;
@@ -915,9 +1011,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         Ok(resp) => {
                             if !resp.error.is_empty() && resp.error != "0" {
                                 eprintln!("TX hex written to {}", last_tx_path.display());
+                                let hint_note = if !omr_clue.is_empty() {
+                                    " Refusing manual/darkfid fallback so the UnifOMR clue hint stays live."
+                                } else {
+                                    ""
+                                };
                                 return Err(format!(
-                                    "lightwalletd SendTransaction error: {}. \
-                                     Refusing manual/darkfid fallback so the UnifOMR clue hint stays live.",
+                                    "lightwalletd SendTransaction error: {}.{hint_note}",
                                     resp.error
                                 )
                                 .into());
@@ -956,9 +1056,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         }
                         Err(e) => {
                             eprintln!("TX hex written to {}", last_tx_path.display());
+                            let hint_note = if !omr_clue.is_empty() {
+                                " UnifOMR requires SendTransaction so the clue hint is stored (24h TTL)."
+                            } else {
+                                ""
+                            };
                             return Err(format!(
-                                "Broadcast via lightwalletd failed: {}. \
-                                 UnifOMR requires SendTransaction so the clue hint is stored (24h TTL).",
+                                "Broadcast via lightwalletd failed: {}.{hint_note}",
                                 sync::redact_sync_error(&e.to_string())
                             )
                             .into());
@@ -1181,7 +1285,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
             rebuild_merkle,
         } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
-            let secret_keys = w.db.get_all_secrets()?;
+            let mut secret_keys = w.db.get_all_secrets()?;
+            let dao_secrets = w.db.get_all_dao_notes_secrets().unwrap_or_default();
+            for ds in dao_secrets {
+                if !secret_keys.iter().any(|sk| sk == &ds) {
+                    secret_keys.push(ds);
+                }
+            }
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
             let strict_omr =
@@ -1620,7 +1730,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 println!("  TLS/Security:    FAIL — remote cleartext refused (use https:// + tls_pin_sha256)");
             }
 
-            println!("  OMR Scheme:      UnifOMR (0x05) only");
+            let sync_scheme = if config.experimental_unifomr {
+                "UnifOMR (0x05) [experimental feature flag active]"
+            } else {
+                "Padded trial decryption (default; UnifOMR available via --unifomr)"
+            };
+            println!("  Sync Scheme:     {sync_scheme}");
         }
         Command::Prune => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
@@ -1634,13 +1749,30 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Config {
             server_url,
             network,
+            use_tor,
+            tls_pin,
+            experimental_unifomr,
         } => {
-            if server_url.is_none() && network.is_none() {
+            if server_url.is_none()
+                && network.is_none()
+                && use_tor.is_none()
+                && tls_pin.is_none()
+                && experimental_unifomr.is_none()
+            {
                 println!("Configuration:");
-                println!("  Server URL:   {}", config.server_url);
-                println!("  Network:      {}", config.network);
+                println!("  Server URL:           {}", config.server_url);
+                println!("  Network:              {}", config.network);
+                println!("  Use Tor:              {}", config.use_tor);
                 println!(
-                    "  Config Path:  {}",
+                    "  TLS Pin SHA-256:      {}",
+                    config.tls_pin_sha256.as_deref().unwrap_or("(none)")
+                );
+                println!(
+                    "  Experimental UnifOMR: {} (default: false, trial decrypt)",
+                    config.experimental_unifomr
+                );
+                println!(
+                    "  Config Path:          {}",
                     config::Config::config_path().display()
                 );
             } else {
@@ -1660,6 +1792,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 if let Some(n) = network {
                     config.network = n;
                 }
+                if let Some(t) = use_tor {
+                    config.use_tor = t;
+                }
+                if let Some(pin) = tls_pin {
+                    config.tls_pin_sha256 = if pin.is_empty() || pin == "none" {
+                        None
+                    } else {
+                        Some(pin)
+                    };
+                }
+                if let Some(u) = experimental_unifomr {
+                    config.experimental_unifomr = u;
+                }
                 if let Err(e) = config.save() {
                     eprintln!("Error saving config: {}", e);
                 } else {
@@ -1669,8 +1814,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Version => {
             println!("Moonshine CLI version {}", env!("CARGO_PKG_VERSION"));
-            println!("  OMR Scheme:  UnifOMR (ePrint 2026/910, scheme 0x05)");
-            println!("  Privacy:     Block range padding, jitter, error redaction");
+            println!("  Sync Scheme:  Padded trial decryption (default) / UnifOMR (0x05, experimental)");
+            println!("  Privacy:      Block range padding, jitter, error redaction, ephemeral block cache");
         }
         Command::ResetAttestPin => {
             let w = wallet::Wallet::open(&args.wallet_name)?;

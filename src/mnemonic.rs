@@ -52,11 +52,8 @@ use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 /// Blake3 KDF context — must match `darkfi-mobile-ffi/src/mnemonic.rs`
 const DERIVE_CONTEXT: &str = "nighthawk-drk-v1";
 
-/// Derive a [`SecretKey`] from wallet mnemonic words (deterministic per phrase).
-///
-/// This function is identical to `secret_key_from_mnemonic` in the mobile FFI.
-/// Given the same mnemonic words, it produces the exact same SecretKey.
-pub fn secret_key_from_mnemonic(mnemonic: &[String]) -> Result<SecretKey, String> {
+/// 32-byte HD derivation seed from mnemonic — same as mobile FFI.
+pub fn derivation_seed_from_mnemonic(mnemonic: &[String]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DERIVE_CONTEXT.as_bytes());
     hasher.update(&[0]);
@@ -64,11 +61,15 @@ pub fn secret_key_from_mnemonic(mnemonic: &[String]) -> Result<SecretKey, String
         hasher.update(word.trim().to_lowercase().as_bytes());
         hasher.update(&[0]);
     }
-    let seed = hasher.finalize();
+    *hasher.finalize().as_bytes()
+}
 
-    // Intermediate seed material is wiped before return (parity with the
-    // mobile FFI implementation of this same derivation).
-    let mut seed_bytes = *seed.as_bytes();
+/// Derive a [`SecretKey`] from wallet mnemonic words (deterministic per phrase).
+///
+/// This function is identical to `secret_key_from_mnemonic` in the mobile FFI.
+/// Given the same mnemonic words, it produces the exact same SecretKey (index 0).
+pub fn secret_key_from_mnemonic(mnemonic: &[String]) -> Result<SecretKey, String> {
+    let mut seed_bytes = derivation_seed_from_mnemonic(mnemonic);
     for counter in 0u8..=255 {
         let mut bytes = seed_bytes;
         bytes[31] ^= counter;
@@ -77,10 +78,33 @@ pub fn secret_key_from_mnemonic(mnemonic: &[String]) -> Result<SecretKey, String
             seed_bytes.fill(0);
             return Ok(key);
         }
+        bytes.fill(0);
     }
     seed_bytes.fill(0);
 
     Err("could not derive canonical SecretKey from mnemonic".into())
+}
+
+/// Derive a [`SecretKey`] from a persisted 32-byte seed and address index.
+/// Must match `darkfi-mobile-ffi` `secret_key_from_seed_index` for `index >= 1`.
+pub fn secret_key_from_seed_index(seed32: &[u8; 32], index: u32) -> Result<SecretKey, String> {
+    let mut hasher = blake3::Hasher::new_derive_key(DERIVE_CONTEXT);
+    hasher.update(seed32);
+    hasher.update(&index.to_le_bytes());
+    let mut seed_bytes = *hasher.finalize().as_bytes();
+
+    for counter in 0u8..=255 {
+        let mut bytes = seed_bytes;
+        bytes[31] ^= counter;
+        if let Ok(key) = SecretKey::from_bytes(bytes) {
+            bytes.fill(0);
+            seed_bytes.fill(0);
+            return Ok(key);
+        }
+        bytes.fill(0);
+    }
+    seed_bytes.fill(0);
+    Err("could not derive canonical SecretKey from seed index".into())
 }
 
 #[derive(Error, Debug)]

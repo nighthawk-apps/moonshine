@@ -1024,23 +1024,144 @@ impl WalletDb {
     }
 
     /// Confirmed balance for a token. `"DRK"` matches the native DarkFi token
-    /// hex id (and older rows stored as the literal `DRK`).
+    /// hex id (and older rows stored as the literal `DRK`). Excludes contract-hooked coins.
     pub fn confirmed_balance(&self, token_id: &str) -> SqlResult<i64> {
+        let is_unhooked = "(spend_hook IS NULL OR spend_hook = 0) AND (spend_hook_bytes IS NULL OR length(spend_hook_bytes) = 0)";
         if Self::is_drk_token(token_id) {
             let hex = Self::dark_token_id_hex();
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare(&format!(
                 "SELECT COALESCE(SUM(value_raw), 0) FROM notes \
-                 WHERE spent = 0 AND (token_id = ?1 OR lower(token_id) = 'drk')",
-            )?;
+                 WHERE spent = 0 AND (token_id = ?1 OR lower(token_id) = 'drk') AND {is_unhooked}"
+            ))?;
             let balance: i64 = stmt.query_row(params![hex], |row| row.get(0))?;
             Ok(balance)
         } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT COALESCE(SUM(value_raw), 0) FROM notes WHERE token_id = ?1 AND spent = 0",
-            )?;
-            let balance: i64 = stmt.query_row(params![token_id], |row| row.get(0))?;
+            let resolved = self.resolve_token_id(token_id)?;
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT COALESCE(SUM(value_raw), 0) FROM notes WHERE (token_id = ?1 OR token_id = ?2) AND spent = 0 AND {is_unhooked}"
+            ))?;
+            let balance: i64 = stmt.query_row(params![token_id, resolved], |row| row.get(0))?;
             Ok(balance)
         }
+    }
+
+    /// List confirmed token balances across all unspent, unhooked notes in the wallet.
+    /// Returns `(token_id, alias, balance)` with native DRK first if present.
+    pub fn list_token_balances(&self) -> SqlResult<Vec<(String, Option<String>, i64)>> {
+        let is_unhooked = "(n.spend_hook IS NULL OR n.spend_hook = 0) AND (n.spend_hook_bytes IS NULL OR length(n.spend_hook_bytes) = 0)";
+        let query = format!(
+            "SELECT n.token_id, m.alias, SUM(n.value_raw) as total \
+             FROM notes n \
+             LEFT JOIN token_mints m ON (n.token_id = m.token_id) \
+             WHERE n.spent = 0 AND {is_unhooked} \
+             GROUP BY n.token_id \
+             HAVING total > 0"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| {
+            let token_id: String = row.get(0)?;
+            let alias: Option<String> = row.get(1)?;
+            let total: i64 = row.get(2)?;
+            Ok((token_id, alias, total))
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        list.sort_by(|a, b| {
+            let a_is_drk = Self::is_drk_token(&a.0);
+            let b_is_drk = Self::is_drk_token(&b.0);
+            match (a_is_drk, b_is_drk) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.0.cmp(&b.0),
+            }
+        });
+        Ok(list)
+    }
+
+    /// Resolve a token display name or alias (e.g. "ANON", "DRK") to its 32-byte hex ID.
+    pub fn resolve_token_id(&self, token_or_alias: &str) -> SqlResult<String> {
+        if Self::is_drk_token(token_or_alias) {
+            return Ok(Self::dark_token_id_hex());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT token_id FROM token_mints WHERE alias = ?1 OR token_id = ?1")?;
+        let mut rows = stmt.query_map([token_or_alias], |r| r.get::<_, String>(0))?;
+        if let Some(Ok(tid)) = rows.next() {
+            return Ok(tid);
+        }
+        Ok(token_or_alias.to_string())
+    }
+
+    /// Unspent coins held by a DAO treasury matching spend_hook and user_data (bulla).
+    pub fn list_unspent_for_dao(
+        &self,
+        dao_spend_hook: &[u8],
+        dao_bulla: &[u8],
+    ) -> SqlResult<Vec<(String, u32, i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tx_hash, output_index, value_raw, token_id FROM notes \
+             WHERE spent = 0 AND (spend_hook_bytes = ?1 OR user_data = ?2) \
+             ORDER BY block_height",
+        )?;
+        let rows = stmt.query_map(params![dao_spend_hook, dao_bulla], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Retrieve notes secrets from all stored DAO records so SyncEngine can trial-decrypt treasury notes.
+    pub fn get_all_dao_notes_secrets(&self) -> SqlResult<Vec<Vec<u8>>> {
+        let mut stmt = self.conn.prepare("SELECT params_toml FROM dao_records")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut secrets = Vec::new();
+        for r in rows {
+            let toml_str = r?;
+            if let Ok(value) = toml::from_str::<toml::Value>(&toml_str) {
+                if let Some(table) = value.as_table() {
+                    let sec = table
+                        .get("notes_secret")
+                        .or_else(|| table.get("notes_secret_key"))
+                        .and_then(|v| v.as_str());
+                    if let Some(b58) = sec {
+                        if let Ok(bytes) = bs58::decode(b58).into_vec() {
+                            if bytes.len() >= 32 {
+                                secrets.push(bytes[..32].to_vec());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(secrets)
+    }
+
+    /// Synced compact DAO calls including payload (ordered by height ascending for tree/replay).
+    pub fn list_dao_calls_full(
+        &self,
+        limit: u32,
+    ) -> SqlResult<Vec<(u32, Vec<u8>, u32, Vec<u8>, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT height, tx_hash, kind, bulla, payload FROM dao_calls \
+             ORDER BY height ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        rows.collect()
     }
 
     /// Clear notes/tx history and Merkle tree, then rewind sync height (rescan).

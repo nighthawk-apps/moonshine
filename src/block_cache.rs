@@ -251,6 +251,7 @@ impl BlockCache {
     }
 
     /// Prune blocks below a given height.
+    #[allow(dead_code)]
     pub fn prune_below(&self, height: u32) -> SqlResult<usize> {
         let rows = self.conn.execute(
             "DELETE FROM compact_blocks WHERE height < ?1",

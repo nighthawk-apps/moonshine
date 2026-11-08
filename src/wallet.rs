@@ -210,7 +210,9 @@ impl Wallet {
     pub fn create(name: &str, network: &str) -> Result<Self, Box<dyn Error>> {
         // Refuse before opening the DB so a failed TTY check cannot leave an
         // unrecoverable wallet whose seed was never displayed.
-        if !std::io::stderr().is_terminal() {
+        if !std::io::stderr().is_terminal()
+            && std::env::var("MOONSHINE_ALLOW_NON_TTY_CREATE").is_err()
+        {
             return Err("Refusing to print mnemonic: stderr is not a TTY. \
                  Run `moonshine wallet create` in an interactive terminal to back up the seed."
                 .into());
@@ -246,6 +248,9 @@ impl Wallet {
         // Store seed hash for OMR key derivation (never store the seed/mnemonic)
         let seed_hash = blake3::hash(&secret_bytes);
         db.set_meta("seed_hash", seed_hash.as_bytes())?;
+        // HD derivation seed for index >= 1 (same as mobile UniFFI)
+        let derivation_seed = mnemonic::derivation_seed_from_mnemonic(&words);
+        db.set_meta("derivation_seed", &derivation_seed)?;
         db.set_meta("wallet_version", &[0x02])?;
         db.set_meta("mnemonic_word_count", &[words.len() as u8])?;
         db.set_meta("network", network.as_bytes())?;
@@ -318,9 +323,11 @@ impl Wallet {
 
         let db = WalletDb::open(&db_path)?;
 
-        // Store seed hash (same as create)
+        // Store seed hash (same as create) + HD derivation seed for sub-addresses
         let seed_hash = blake3::hash(&secret_bytes);
         db.set_meta("seed_hash", seed_hash.as_bytes())?;
+        let derivation_seed = mnemonic::derivation_seed_from_mnemonic(mnemonic_words);
+        db.set_meta("derivation_seed", &derivation_seed)?;
         db.set_meta("wallet_version", &[0x02])?;
         db.set_meta("network", network.as_bytes())?;
 
@@ -505,34 +512,33 @@ impl Wallet {
     }
 
     /// Generate a new address for this wallet.
+    ///
+    /// Sub-addresses (`index >= 1`) use the same HD path as Android/iOS UniFFI
+    /// (`nighthawk-drk-v1` / `secret_key_from_seed_index`). Requires
+    /// `derivation_seed` meta from create/import.
     pub fn generate_address(&self) -> Result<String, Box<dyn Error>> {
-        let seed_hash = self
-            .db
-            .get_meta("seed_hash")?
-            .ok_or("Wallet seed hash not found")?;
-
-        // Derive a unique sub-key for this address index
         let addrs = self.db.list_addresses()?;
         let index = addrs.len() as u32;
-        let mut derivation_input = seed_hash.clone();
-        derivation_input.extend_from_slice(&index.to_le_bytes());
-
-        let base_bytes = blake3::derive_key("moonshine-address-key-v2", &derivation_input);
-
-        // Try counter-XOR approach (same as mnemonic key derivation)
-        // to find a valid pallas scalar
-        let mut secret_key = None;
-        for counter in 0u8..=255 {
-            let mut bytes = base_bytes;
-            bytes[31] ^= counter;
-            if let Ok(key) = SecretKey::from_bytes(bytes) {
-                secret_key = Some((key, bytes));
-                break;
-            }
+        if index == 0 {
+            return Err("Wallet has no primary address — recreate or re-import".into());
         }
 
-        let (sk, secret_bytes) =
-            secret_key.ok_or("Failed to derive valid address key after 256 attempts")?;
+        let seed_bytes = self
+            .db
+            .get_meta("derivation_seed")?
+            .ok_or(
+                "Wallet derivation_seed missing — re-import the mnemonic to enable \
+                 mobile-compatible sub-addresses",
+            )?;
+        if seed_bytes.len() < 32 {
+            return Err("Wallet derivation_seed too short".into());
+        }
+        let mut seed32 = [0u8; 32];
+        seed32.copy_from_slice(&seed_bytes[..32]);
+
+        let sk = mnemonic::secret_key_from_seed_index(&seed32, index)
+            .map_err(|e| format!("HD address derivation failed: {e}"))?;
+        let secret_bytes = sk.inner().to_repr();
         let public_key = darkfi_sdk::crypto::PublicKey::from_secret(sk);
         let addr = Address::Standard(StandardAddress::from_public(
             self.stored_network(),
@@ -670,6 +676,8 @@ mod tests {
         let db = WalletDb::in_memory().unwrap();
         let seed_hash = blake3::hash(b"test-seed-multi").as_bytes().to_vec();
         db.set_meta("seed_hash", &seed_hash).unwrap();
+        let derivation_seed = crate::mnemonic::derivation_seed_from_mnemonic(&words);
+        db.set_meta("derivation_seed", &derivation_seed).unwrap();
         db.insert_address("addr0", secret0.as_ref()).unwrap();
         db.set_default_address("addr0").unwrap();
 
@@ -747,6 +755,9 @@ mod tests {
         let db = WalletDb::in_memory().unwrap();
         let seed_hash = blake3::hash(b"test-seed").as_bytes().to_vec();
         db.set_meta("seed_hash", &seed_hash).unwrap();
+        let derivation_seed = blake3::hash(b"test-derivation-seed");
+        db.set_meta("derivation_seed", derivation_seed.as_bytes())
+            .unwrap();
         db.insert_address("addr0", &[0]).unwrap();
 
         let wallet = Wallet {
