@@ -156,6 +156,7 @@ impl WalletDb {
                 token_id TEXT NOT NULL,
                 counterparty TEXT,
                 memo TEXT,
+                kind TEXT NOT NULL DEFAULT 'transfer',
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -660,7 +661,16 @@ impl WalletDb {
         let _ = self
             .conn
             .execute("ALTER TABLE notes ADD COLUMN spent_height INTEGER", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE transactions ADD COLUMN kind TEXT NOT NULL DEFAULT 'transfer'",
+            [],
+        );
         Ok(())
+    }
+
+    /// Rows changed by the last statement. `INSERT OR IGNORE` that skipped is 0.
+    pub fn changed(&self) -> bool {
+        self.conn.changes() > 0
     }
 
     /// Hex encoding of the native DRK token id (what sync stores).
@@ -1023,10 +1033,47 @@ impl WalletDb {
         Ok(n)
     }
 
+    /// SQL predicate: note has no spend hook.
+    ///
+    /// Compact-block sync stores `FuncId::none()` as a 32-byte zero blob. Older
+    /// filters only accepted NULL/empty `spend_hook_bytes`, which hid spendable
+    /// DRK (balance 0 while `coins list` still showed the note).
+    fn sql_note_unhooked(alias: &str) -> String {
+        let p = if alias.is_empty() {
+            String::new()
+        } else {
+            format!("{alias}.")
+        };
+        format!(
+            "({p}spend_hook IS NULL OR {p}spend_hook = 0) AND \
+             ({p}spend_hook_bytes IS NULL OR length({p}spend_hook_bytes) = 0 OR \
+              {p}spend_hook_bytes = zeroblob(length({p}spend_hook_bytes)))"
+        )
+    }
+
+    /// Hex form of a token id. Accepts `TokenId` base58 or the 32-byte hex
+    /// stored on synced notes. Aliases are resolved by the caller first.
+    pub fn token_id_hex(token_id: &str) -> Option<String> {
+        use std::str::FromStr;
+
+        use darkfi_money_contract::model::TokenId;
+
+        if let Ok(id) = TokenId::from_str(token_id) {
+            return Some(hex::encode(id.to_bytes()));
+        }
+        let bytes = hex::decode(token_id).ok()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        let id = TokenId::from_bytes(arr).ok()?;
+        Some(hex::encode(id.to_bytes()))
+    }
+
     /// Confirmed balance for a token. `"DRK"` matches the native DarkFi token
     /// hex id (and older rows stored as the literal `DRK`). Excludes contract-hooked coins.
+    ///
+    /// Custom tokens match both the mint-authority base58 id and the hex id
+    /// written by sync.
     pub fn confirmed_balance(&self, token_id: &str) -> SqlResult<i64> {
-        let is_unhooked = "(spend_hook IS NULL OR spend_hook = 0) AND (spend_hook_bytes IS NULL OR length(spend_hook_bytes) = 0)";
+        let is_unhooked = Self::sql_note_unhooked("");
         if Self::is_drk_token(token_id) {
             let hex = Self::dark_token_id_hex();
             let mut stmt = self.conn.prepare(&format!(
@@ -1037,10 +1084,14 @@ impl WalletDb {
             Ok(balance)
         } else {
             let resolved = self.resolve_token_id(token_id)?;
+            let hex_key = Self::token_id_hex(&resolved).unwrap_or_else(|| resolved.clone());
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT COALESCE(SUM(value_raw), 0) FROM notes WHERE (token_id = ?1 OR token_id = ?2) AND spent = 0 AND {is_unhooked}"
+                "SELECT COALESCE(SUM(value_raw), 0) FROM notes \
+                 WHERE (token_id = ?1 OR token_id = ?2 OR token_id = ?3) \
+                 AND spent = 0 AND {is_unhooked}"
             ))?;
-            let balance: i64 = stmt.query_row(params![token_id, resolved], |row| row.get(0))?;
+            let balance: i64 =
+                stmt.query_row(params![token_id, resolved, hex_key], |row| row.get(0))?;
             Ok(balance)
         }
     }
@@ -1048,7 +1099,7 @@ impl WalletDb {
     /// List confirmed token balances across all unspent, unhooked notes in the wallet.
     /// Returns `(token_id, alias, balance)` with native DRK first if present.
     pub fn list_token_balances(&self) -> SqlResult<Vec<(String, Option<String>, i64)>> {
-        let is_unhooked = "(n.spend_hook IS NULL OR n.spend_hook = 0) AND (n.spend_hook_bytes IS NULL OR length(n.spend_hook_bytes) = 0)";
+        let is_unhooked = Self::sql_note_unhooked("n");
         let query = format!(
             "SELECT n.token_id, m.alias, SUM(n.value_raw) as total \
              FROM notes n \
@@ -1081,13 +1132,19 @@ impl WalletDb {
     }
 
     /// Resolve a token display name or alias (e.g. "ANON", "DRK") to its 32-byte hex ID.
+    ///
+    /// When several mint authorities share an alias, prefer a still-mintable row so
+    /// `token mint E2E` does not hit a previously frozen authority with the same name.
     pub fn resolve_token_id(&self, token_or_alias: &str) -> SqlResult<String> {
         if Self::is_drk_token(token_or_alias) {
             return Ok(Self::dark_token_id_hex());
         }
-        let mut stmt = self
-            .conn
-            .prepare("SELECT token_id FROM token_mints WHERE alias = ?1 OR token_id = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT token_id FROM token_mints \
+             WHERE alias = ?1 OR token_id = ?1 \
+             ORDER BY is_frozen ASC, token_id ASC \
+             LIMIT 1",
+        )?;
         let mut rows = stmt.query_map([token_or_alias], |r| r.get::<_, String>(0))?;
         if let Some(Ok(tid)) = rows.next() {
             return Ok(tid);
@@ -1311,13 +1368,47 @@ impl WalletDb {
         counterparty: Option<&str>,
         memo: Option<&str>,
     ) -> SqlResult<()> {
+        self.insert_typed(
+            hash,
+            block_height,
+            direction,
+            kind_from_direction(direction),
+            value_raw,
+            token_id,
+            counterparty,
+            memo,
+        )
+    }
+
+    /// Insert a history row with an explicit kind (`send`, `token-mint`, `burn`, …).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_typed(
+        &self,
+        hash: &str,
+        block_height: u32,
+        direction: &str,
+        kind: &str,
+        value_raw: i64,
+        token_id: &str,
+        counterparty: Option<&str>,
+        memo: Option<&str>,
+    ) -> SqlResult<()> {
         self.conn.execute(
-            "INSERT INTO transactions (hash, block_height, direction, value_raw, token_id, counterparty, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO transactions (hash, block_height, direction, value_raw, token_id, counterparty, memo, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(hash) DO UPDATE SET
                block_height = excluded.block_height
              WHERE transactions.block_height = 0 AND excluded.block_height > 0",
-            params![hash, block_height, direction, value_raw, token_id, counterparty, memo],
+            params![
+                hash,
+                block_height,
+                direction,
+                value_raw,
+                token_id,
+                counterparty,
+                memo,
+                kind
+            ],
         )?;
         Ok(())
     }
@@ -1325,7 +1416,7 @@ impl WalletDb {
     /// List transactions, most recent first.
     pub fn list_transactions(&self, limit: u32) -> SqlResult<Vec<TransactionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT hash, block_height, direction, value_raw, token_id, counterparty, memo, timestamp
+            "SELECT hash, block_height, direction, value_raw, token_id, counterparty, memo, timestamp, kind
              FROM transactions ORDER BY block_height DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
@@ -1338,6 +1429,7 @@ impl WalletDb {
                 counterparty: row.get(5)?,
                 memo: row.get(6)?,
                 timestamp: row.get(7)?,
+                kind: row.get(8)?,
             })
         })?;
         rows.collect()
@@ -1346,7 +1438,7 @@ impl WalletDb {
     /// Get a single transaction by hash.
     pub fn get_transaction(&self, hash: &str) -> SqlResult<Option<TransactionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT hash, block_height, direction, value_raw, token_id, counterparty, memo, timestamp
+            "SELECT hash, block_height, direction, value_raw, token_id, counterparty, memo, timestamp, kind
              FROM transactions WHERE hash = ?1",
         )?;
         let mut rows = stmt.query(params![hash])?;
@@ -1360,6 +1452,7 @@ impl WalletDb {
                 counterparty: row.get(5)?,
                 memo: row.get(6)?,
                 timestamp: row.get(7)?,
+                kind: row.get(8)?,
             }))
         } else {
             Ok(None)
@@ -1397,6 +1490,15 @@ pub struct TransactionRow {
     pub counterparty: Option<String>,
     pub memo: Option<String>,
     pub timestamp: String,
+    pub kind: String,
+}
+
+fn kind_from_direction(direction: &str) -> &str {
+    match direction {
+        "incoming" => "receive",
+        "outgoing" => "send",
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -1960,5 +2062,76 @@ mod tests {
         let (notes, txs) = db.invalidate_above_height(0).unwrap();
         assert_eq!(notes, 0);
         assert_eq!(txs, 0);
+    }
+
+    #[test]
+    fn test_zeroblob_spend_hook_bytes_count_as_unhooked() {
+        let db = WalletDb::in_memory().unwrap();
+        let drk = WalletDb::dark_token_id_hex();
+        db.insert_note(
+            "tx-zero-hook",
+            0,
+            2_000_000_000,
+            &drk,
+            &[1, 2, 3, 4],
+            50,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            Some(1),
+            Some(&[7u8; 32]),
+            Some(&[1, 2, 3, 4]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        // Compact sync stores FuncId::none() as 32 zero bytes, not NULL/empty.
+        db.set_spend_hook_bytes("tx-zero-hook", 0, &[0u8; 32]).unwrap();
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 2_000_000_000);
+        let listed = db.list_token_balances().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(WalletDb::is_drk_token(&listed[0].0));
+        assert_eq!(listed[0].2, 2_000_000_000);
+    }
+
+    #[test]
+    fn confirmed_balance_matches_base58_token_id_to_hex_note() {
+        use std::str::FromStr;
+
+        use darkfi_money_contract::model::TokenId;
+
+        let db = WalletDb::in_memory().unwrap();
+        let id = TokenId::from_str("DkKtPmBw2LKCpo5KXq5RKR7Cp3V4pTzVchtJ4kJaPjpK").unwrap();
+        let hex_id = hex::encode(id.to_bytes());
+        assert_eq!(
+            WalletDb::token_id_hex("DkKtPmBw2LKCpo5KXq5RKR7Cp3V4pTzVchtJ4kJaPjpK").as_deref(),
+            Some(hex_id.as_str())
+        );
+        db.insert_note(
+            "tx-omr2",
+            0,
+            100_000_000,
+            &hex_id,
+            &[1, 2, 3, 4],
+            50,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            Some(1),
+            Some(&[7u8; 32]),
+            Some(&[1, 2, 3, 4]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(
+            db.confirmed_balance("DkKtPmBw2LKCpo5KXq5RKR7Cp3V4pTzVchtJ4kJaPjpK")
+                .unwrap(),
+            100_000_000
+        );
     }
 }

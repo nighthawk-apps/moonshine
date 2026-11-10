@@ -1,6 +1,7 @@
 //! CLI dispatch for token / DAO / contract / synced-event views.
 
 use crate::amount;
+use crate::tx_status;
 use crate::client::LightwalletClient;
 use crate::config::Config;
 use crate::fee_attach;
@@ -122,7 +123,20 @@ pub async fn run_token(
 ) -> Result<(), Box<dyn Error>> {
     match sub {
         TokenSubcommand::GenerateMint { alias } => {
+            tx_status::begin("asset-create", "local");
             let tid = token::generate_mint(&w.db, alias.as_deref())?;
+            tx_status::emit(
+                "asset-create",
+                "local",
+                "success",
+                "local",
+                "",
+                None,
+                &tid.to_string(),
+                None,
+                "mint-authority",
+                "",
+            );
             println!("Mint authority stored.");
             println!("Token ID: {tid}");
             if let Some(a) = alias {
@@ -134,7 +148,20 @@ pub async fn run_token(
             token_blind,
             alias,
         } => {
+            tx_status::begin("asset-create", "import");
             let tid = token::import_mint(&w.db, &secret, &token_blind, alias.as_deref())?;
+            tx_status::emit(
+                "asset-create",
+                "import",
+                "success",
+                "local",
+                "",
+                None,
+                &tid.to_string(),
+                None,
+                "mint-authority",
+                "",
+            );
             println!("Imported mint authority for {tid}");
         }
         TokenSubcommand::List => {
@@ -161,6 +188,7 @@ pub async fn run_token(
             spend_hook,
             user_data,
         } => {
+            tx_status::begin("token-mint", "build");
             let atomic = amount::parse_drk_atomic(&amount).map_err(|e| e.to_string())?;
             let recipient_pk = parse_address_pubkey(&recipient)?;
             let hook = spend_hook
@@ -188,10 +216,11 @@ pub async fn run_token(
                 &zkas,
             )
             .await?;
-            broadcast_builder(w, config, builder, fee, &zkas).await?;
+            broadcast_builder(w, config, builder, fee, &zkas, "token-mint", &tid.to_string(), atomic, "").await?;
             println!("Minted token id: {tid}");
         }
         TokenSubcommand::Freeze { token: tok, fee } => {
+            tx_status::begin("burn", "build");
             let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
                 .with_tor(config.use_tor);
             let zkas = zkas_pairs(
@@ -200,9 +229,32 @@ pub async fn run_token(
                     .await?,
             );
             let (builder, tid) = token::build_freeze_builder(&w.db, &tok, &zkas).await?;
-            broadcast_builder(w, config, builder, fee, &zkas).await?;
+            broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &zkas,
+                "burn",
+                &tid.to_string(),
+                0,
+                "freeze-mint-authority",
+            )
+            .await?;
             w.db.set_token_frozen(&tid.to_string(), None)?;
             println!("Marked {tid} frozen in wallet (confirm on-chain with sync).");
+            tx_status::emit(
+                "burn",
+                "local",
+                "success",
+                "confirming",
+                "",
+                None,
+                &tid.to_string(),
+                None,
+                "freeze-marked-locally",
+                "",
+            );
         }
     }
     Ok(())
@@ -222,6 +274,7 @@ pub async fn run_dao(
             approval_ratio,
             gov_token,
         } => {
+            tx_status::begin("dao-create", "sign");
             let parse_amount = |s: &str| -> Result<u64, Box<dyn Error>> {
                 if let Ok(a) = amount::parse_drk_atomic(s) {
                     return Ok(a);
@@ -245,11 +298,48 @@ pub async fn run_dao(
             )?;
             println!("{toml}");
             println!("Stored DAO '{name}' in wallet.");
+            tx_status::emit(
+                "dao-create",
+                "sign",
+                "success",
+                "local",
+                "",
+                None,
+                &gov_token,
+                None,
+                "signing-keys",
+                "",
+            );
+            tx_status::emit(
+                "dao-sign",
+                "sign",
+                "success",
+                "local",
+                "",
+                None,
+                &gov_token,
+                None,
+                &format!("dao={name}"),
+                "",
+            );
         }
         DaoSubcommand::Import { name, file } => {
+            tx_status::begin("dao-create", "import");
             let toml = std::fs::read_to_string(&file)?;
             w.db.upsert_dao_record(&name, &toml, None, None)?;
             println!("Imported DAO '{name}' from {}", file.display());
+            tx_status::emit(
+                "dao-create",
+                "import",
+                "success",
+                "local",
+                "",
+                None,
+                "",
+                None,
+                &format!("dao={name}"),
+                "",
+            );
         }
         DaoSubcommand::List => {
             let rows = w.db.list_dao_records()?;
@@ -384,6 +474,7 @@ pub async fn run_dao(
             }
         }
         DaoSubcommand::Mint { name, fee } => {
+            tx_status::begin("dao-mint", "build");
             let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
                 .with_tor(config.use_tor);
             let zkas = zkas_pairs(
@@ -397,7 +488,18 @@ pub async fn run_dao(
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
                     .await?,
             );
-            broadcast_builder(w, config, builder, fee, &money_zkas).await?;
+            broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &money_zkas,
+                "dao-mint",
+                "",
+                0,
+                &format!("dao={name}"),
+            )
+            .await?;
             println!("DAO bulla: {bulla}");
         }
     }
@@ -411,7 +513,20 @@ pub async fn run_contract(
 ) -> Result<(), Box<dyn Error>> {
     match sub {
         ContractSubcommand::GenerateDeploy => {
+            tx_status::begin("asset-create", "local");
             let id = contract_ops::generate_deploy(&w.db)?;
+            tx_status::emit(
+                "asset-create",
+                "local",
+                "success",
+                "local",
+                "",
+                None,
+                &id.to_string(),
+                None,
+                "deploy-authority",
+                "",
+            );
             println!("Deploy authority created.");
             println!("Contract ID: {id}");
         }
@@ -446,6 +561,7 @@ pub async fn run_contract(
             deploy_ix,
             fee,
         } => {
+            tx_status::begin("contract-deploy", "build");
             let builder = contract_ops::build_deploy_builder(
                 &w.db,
                 &deploy_auth,
@@ -460,9 +576,21 @@ pub async fn run_contract(
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
                     .await?,
             );
-            broadcast_builder(w, config, builder, fee, &money_zkas).await?;
+            broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &money_zkas,
+                "contract-deploy",
+                &deploy_auth,
+                0,
+                "",
+            )
+            .await?;
         }
         ContractSubcommand::Lock { deploy_auth, fee } => {
+            tx_status::begin("contract-lock", "build");
             let builder = contract_ops::build_lock_builder(&w.db, &deploy_auth).await?;
             let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
                 .with_tor(config.use_tor);
@@ -471,7 +599,18 @@ pub async fn run_contract(
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
                     .await?,
             );
-            broadcast_builder(w, config, builder, fee, &money_zkas).await?;
+            broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &money_zkas,
+                "contract-lock",
+                &deploy_auth,
+                0,
+                "",
+            )
+            .await?;
             w.db.set_deploy_locked(&deploy_auth, None)?;
             println!("Marked {deploy_auth} locked in wallet (confirm on-chain with sync).");
         }
@@ -485,7 +624,12 @@ async fn broadcast_builder(
     builder: darkfi::tx::TransactionBuilder,
     fee: u64,
     money_zkas: &[(String, Vec<u8>)],
+    kind: &str,
+    token: &str,
+    amount: u64,
+    detail: &str,
 ) -> Result<(), Box<dyn Error>> {
+    tx_status::phase("sign");
     let (tx, nf) = if fee == 0 {
         let mut builder = builder;
         (builder.build_signed()?, Vec::new())
@@ -510,13 +654,27 @@ async fn broadcast_builder(
         .await?;
         (tx, nf)
     };
+    let tx_hash = format!("{}", tx.hash());
+    tx_status::emit(
+        kind,
+        "sign",
+        "success",
+        "waiting",
+        &tx_hash,
+        None,
+        token,
+        Some(amount),
+        detail,
+        "",
+    );
     let mut raw = Vec::new();
     darkfi_serial::Encodable::encode(&tx, &mut raw)?;
     let last_tx_path = Wallet::write_last_tx(&w.name, &raw);
+    tx_status::phase("broadcast");
     let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
         .with_tor(config.use_tor);
     let resp = client
-        .send_transaction(raw, Vec::new(), Vec::new(), Vec::new())
+        .send_transaction(raw, Vec::new(), Vec::new(), Vec::new(), 0)
         .await?;
     if !resp.error.is_empty() && resp.error != "0" {
         return Err(format!("SendTransaction error: {}", resp.error).into());
@@ -524,9 +682,30 @@ async fn broadcast_builder(
     if !nf.is_empty() {
         let _ = w.db.mark_note_spent(&nf);
     }
-    let tx_hash = format!("{}", tx.hash());
+    let _ = w.db.insert_typed(
+        &tx_hash,
+        0,
+        "outgoing",
+        kind,
+        amount as i64,
+        token,
+        None,
+        None,
+    );
     println!("✅ Broadcast via lightwalletd");
     println!("TX hash: {tx_hash}");
+    tx_status::emit(
+        kind,
+        "broadcast",
+        "success",
+        "confirming",
+        &tx_hash,
+        Some(0),
+        token,
+        Some(amount),
+        detail,
+        "",
+    );
     println!("Explorer: {}/tx/{tx_hash}", config.explorer_base_url());
     println!("Last tx hex: {}", last_tx_path.display());
     Ok(())

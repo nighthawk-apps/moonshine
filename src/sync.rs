@@ -152,6 +152,7 @@ impl SyncEngine {
             .with_tor(self.use_tor);
 
         let info = client.get_light_info().await?;
+        let tip_stale = tip_poll_is_stale(info.tip_fetched_unix);
         crate::wallet::check_directory_attest_pin(
             &self.db,
             &self.server_url,
@@ -207,6 +208,7 @@ impl SyncEngine {
                 notes_found: 0,
                 notes_spent: 0,
                 tip_height,
+                tip_stale,
             });
         }
 
@@ -243,6 +245,7 @@ impl SyncEngine {
                 notes_found: 0,
                 notes_spent: 0,
                 tip_height,
+                tip_stale,
             });
         }
 
@@ -263,6 +266,7 @@ impl SyncEngine {
                 notes_found: 0,
                 notes_spent: 0,
                 tip_height,
+                tip_stale,
             });
         }
         // May be clamped down below if the server truncates the OMR digest at its
@@ -470,6 +474,7 @@ impl SyncEngine {
             notes_found,
             notes_spent,
             tip_height,
+            tip_stale,
         })
     }
 
@@ -1472,6 +1477,20 @@ impl SyncEngine {
                 &call.bulla,
                 &call.payload,
             )?;
+            if self.db.changed() {
+                crate::tx_status::emit(
+                    crate::tx_status::dao_kind(call.kind),
+                    "sync",
+                    "success",
+                    "confirmed",
+                    &hex::encode(&call.tx_hash),
+                    Some(call.height),
+                    "",
+                    None,
+                    crate::tx_status::dao_detail(call.kind),
+                    "",
+                );
+            }
         }
         for code in [MONEY_FUNC_AUTH_TOKEN_MINT, MONEY_FUNC_AUTH_TOKEN_FREEZE] {
             let Ok(mut stream) = client.get_compact_outputs_by_func(start, end, code).await else {
@@ -1482,6 +1501,20 @@ impl SyncEngine {
                 if body.encrypted_note.is_empty() {
                     self.db
                         .insert_func_event(body.height, &body.tx_hash, body.func_code)?;
+                    if self.db.changed() {
+                        crate::tx_status::emit(
+                            crate::tx_status::money_event_kind(body.func_code),
+                            "sync",
+                            "success",
+                            "confirmed",
+                            &hex::encode(&body.tx_hash),
+                            Some(body.height),
+                            "",
+                            None,
+                            crate::tx_status::money_event_detail(body.func_code),
+                            "",
+                        );
+                    }
                 }
             }
         }
@@ -1516,7 +1549,36 @@ impl SyncEngine {
         let mut notes_found = 0u32;
         for tx in &block.txs {
             let tx_hash_hex = hex::encode(&tx.tx_hash);
-            let _ = self.db.confirm_transaction(&tx_hash_hex, block.height);
+            if self
+                .db
+                .confirm_transaction(&tx_hash_hex, block.height)
+                .unwrap_or(0)
+                > 0
+            {
+                if let Ok(Some(row)) = self.db.get_transaction(&tx_hash_hex) {
+                    let kind = if row.kind.is_empty() || row.kind == "transfer" {
+                        if row.direction == "incoming" {
+                            "receive"
+                        } else {
+                            "send"
+                        }
+                    } else {
+                        row.kind.as_str()
+                    };
+                    crate::tx_status::emit(
+                        kind,
+                        "sync",
+                        "success",
+                        "confirmed",
+                        &row.hash,
+                        Some(row.block_height),
+                        &row.token_id,
+                        Some(row.value_raw as u64),
+                        "",
+                        "",
+                    );
+                }
+            }
             for (idx, output) in tx.outputs.iter().enumerate() {
                 let mut tx_key = [0u8; 32];
                 if tx.tx_hash.len() != 32 {
@@ -1558,7 +1620,7 @@ impl SyncEngine {
                         let nf = poseidon_hash([sk.inner(), coin.inner()]);
                         Some(nf.to_repr().to_vec())
                     };
-                    self.db.insert_note(
+                    let _rowid = self.db.insert_note(
                         &tx_hash_hex,
                         idx as u32,
                         note.value as i64,
@@ -1576,6 +1638,7 @@ impl SyncEngine {
                         nullifier_bytes.as_deref(),
                         Some(secret_key.as_slice()),
                     )?;
+                    let fresh_note = self.db.changed();
                     if note.spend_hook_bytes.len() == 32 {
                         let _ = self.db.set_spend_hook_bytes(
                             &tx_hash_hex,
@@ -1592,6 +1655,32 @@ impl SyncEngine {
                         None,
                         note.memo.as_deref(),
                     )?;
+                    if fresh_note {
+                        let token_hex = hex::encode(&note.token_id);
+                        let (kind, detail) = match self.db.get_transaction(&tx_hash_hex) {
+                            Ok(Some(row)) if row.direction == "outgoing" => {
+                                let kind = if row.kind.is_empty() || row.kind == "transfer" {
+                                    "send".to_string()
+                                } else {
+                                    row.kind
+                                };
+                                (kind, format!("own-output-{idx}"))
+                            }
+                            _ => ("receive".to_string(), format!("output-{idx}")),
+                        };
+                        crate::tx_status::emit(
+                            &kind,
+                            "sync",
+                            "success",
+                            "confirmed",
+                            &tx_hash_hex,
+                            Some(block.height),
+                            &token_hex,
+                            Some(note.value),
+                            &detail,
+                            "",
+                        );
+                    }
                     notes_found += 1;
                 }
             }
@@ -2197,6 +2286,22 @@ pub struct SyncResult {
     pub notes_found: u32,
     pub notes_spent: u32,
     pub tip_height: u32,
+    /// Served tip was last refreshed from darkfid more than two minutes ago.
+    /// `false` when the server did not report a poll time.
+    pub tip_stale: bool,
+}
+
+/// `0` is unknown (older server, or the poll has not succeeded). A reported
+/// time older than two minutes means the served tip may be frozen.
+pub fn tip_poll_is_stale(fetched_unix: u64) -> bool {
+    if fetched_unix == 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(fetched_unix) > 120
 }
 
 /// A decrypted note from trial decryption (blinds extracted; commitment from caller).
@@ -2456,31 +2561,49 @@ fn batch_open_blocks(
         if pending.is_empty() {
             continue;
         }
-        let epks: Vec<_> = pending
-            .iter()
-            .map(|index| jobs[*index].note.ephem_public)
-            .collect();
-        let shared = sapling_ka_agree_batch(&secret, &epks);
-        for (index, shared) in pending.into_iter().zip(shared) {
-            let Ok(shared) = shared else {
-                continue;
-            };
-            let Ok(RemainingBytes(plaintext)) = jobs[index].note.decrypt_with_shared(&shared)
-            else {
-                continue;
-            };
-            let Some(money) = money_note_from_plaintext(&plaintext) else {
-                continue;
-            };
-            let Some(note) = decrypted_from_money_note(money) else {
-                continue;
-            };
-            if let Some(derived) = derived_coin_from_note(&note, secret_bytes) {
-                if jobs[index].coin.len() == 32 && derived.as_slice() != jobs[index].coin.as_slice()
-                {
-                    continue;
-                }
-            }
+        // Chunks of 48 notes do Diffie-Hellman and AEAD together on the Rayon
+        // pool. The caller still writes SQLite after the join. Smaller windows
+        // stay on this thread.
+        const BATCH_CHUNK: usize = 48;
+        let open = |indexes: &[usize]| -> Vec<(usize, DecryptedNote)> {
+            let epks: Vec<_> = indexes
+                .iter()
+                .map(|index| jobs[*index].note.ephem_public)
+                .collect();
+            let shared = sapling_ka_agree_batch(&secret, &epks);
+            indexes
+                .iter()
+                .zip(shared)
+                .filter_map(|(index, shared)| {
+                    let shared = shared.ok()?;
+                    let Ok(RemainingBytes(plaintext)) =
+                        jobs[*index].note.decrypt_with_shared(&shared)
+                    else {
+                        return None;
+                    };
+                    let money = money_note_from_plaintext(&plaintext)?;
+                    let note = decrypted_from_money_note(money)?;
+                    if let Some(derived) = derived_coin_from_note(&note, secret_bytes) {
+                        if jobs[*index].coin.len() == 32
+                            && derived.as_slice() != jobs[*index].coin.as_slice()
+                        {
+                            return None;
+                        }
+                    }
+                    Some((*index, note))
+                })
+                .collect()
+        };
+        let hits: Vec<(usize, DecryptedNote)> = if pending.len() <= BATCH_CHUNK {
+            open(&pending)
+        } else {
+            use rayon::prelude::*;
+            pending
+                .par_chunks(BATCH_CHUNK)
+                .flat_map_iter(|chunk| open(chunk))
+                .collect()
+        };
+        for (index, note) in hits {
             out.insert(
                 (jobs[index].height, jobs[index].tx, jobs[index].idx),
                 (note, secret_bytes.clone()),
@@ -2623,6 +2746,17 @@ pub fn compute_supplemental_heights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_tip_poll_time_is_not_stale() {
+        assert!(!tip_poll_is_stale(0));
+        assert!(tip_poll_is_stale(1));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(!tip_poll_is_stale(now));
+    }
 
     #[test]
     fn raw_cursor_range_is_rejected() {

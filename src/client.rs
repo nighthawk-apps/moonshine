@@ -461,13 +461,14 @@ impl LightwalletClient {
         omr_clue: Vec<u8>,
         omr_metadata_enc: Vec<u8>,
         extra_omr_clues: Vec<proto::OutputOmrClue>,
+        omr_clue_output_index: u32,
     ) -> Result<proto::SendResponse, Box<dyn Error>> {
         self.connect().await?;
         let mut client = self.client.clone().unwrap();
         let req = proto::RawTransaction {
             data: raw_tx,
             omr_clue,
-            omr_clue_output_index: 0, // payment output
+            omr_clue_output_index,
             omr_metadata_enc,
             extra_omr_clues,
         };

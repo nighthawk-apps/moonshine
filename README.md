@@ -1,8 +1,6 @@
 # Moonshine Wallet CLI
 
-**Moonshine** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`.
-
-**3.01.07** (crate semver **3.1.7**): Speaks lightwalletd proto 2.1.0. A normal `moonshine sync` pulls compact Money notes, DAO calls, and auth-token events from **`darkfi-lightwalletd`**, trial-decrypts them into the local SQLCipher wallet (same scan semantics as `drk`, without full-chain validation like `darkfid`), and deletes processed compact blocks from the encrypted UniFFI-format cache. Beyond sync and DRK send, Moonshine can mint/freeze Money tokens, create/mint DAOs, and deploy/lock Deployooor WASM authorities through the same lightwalletd `SendTransaction` path (native fee attached locally). `moonshine sync --unifomr` remains experimental and is not maintained until DarkFi mainnet contracts are live. Tor is Arti 0.48, with a fresh circuit per dial. A send spends one coin, the largest that covers the amount plus fee. DarkFi checkout `44ec78b6e` (`nighthawk-testnet`, path dependency). Testnet explorer: [https://explorer.testnet.dark.fi](https://explorer.testnet.dark.fi).
+**Moonshine 3.1.8** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`.
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 

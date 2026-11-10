@@ -1,6 +1,6 @@
 [package]
 name = "moonshine"
-version = "3.1.7"
+version = "3.1.8"
 description = "Moonshine: DarkFi light wallet CLI. Compact blocks from darkfi-lightwalletd; trial decrypt, money send, token/DAO mint, contract deploy."
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 edition = "2021"
@@ -58,6 +58,7 @@ num-traits = "0.2"
 unicode-normalization = "0.1"
 bs58 = "0.5"
 rand = "0.9.4"
+rayon = "1.12"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 
 # Shared UnifOMR crypto (paper ePrint 2026/910) from lightwalletd.

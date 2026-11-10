@@ -32,12 +32,14 @@ mod fee_attach;
 mod memo;
 mod mnemonic;
 mod ops_dispatch;
+mod payment_uri;
 mod pruning;
 mod secret_wrap;
 mod sync;
 mod token;
 mod tor;
 mod tx_builder;
+mod tx_status;
 mod wallet;
 
 #[derive(Parser, Debug)]
@@ -197,6 +199,13 @@ enum AddressSubcommand {
     Default,
     /// Display the default address for receiving payments
     Receive,
+    /// Print a `drk:` invoice for the default address (amount and memo optional)
+    Invoice {
+        #[arg(long)]
+        amount: Option<String>,
+        #[arg(long)]
+        memo: Option<String>,
+    },
     /// Validate a DarkFi address
     Validate { address: String },
 }
@@ -258,6 +267,7 @@ enum TxSubcommand {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
+        tx_status::emit_fail(&e.to_string());
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -384,6 +394,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         Err(e) => println!("✗ Invalid address: {e}"),
                     }
                 }
+                AddressSubcommand::Invoice { amount, memo } => match w.db.get_default_address()? {
+                    Some(addr) => {
+                        println!(
+                            "{}",
+                            payment_uri::build_payment_uri(
+                                &addr,
+                                amount.as_deref(),
+                                memo.as_deref()
+                            )
+                        );
+                    }
+                    None => println!("No default address set. Run: moonshine address new"),
+                },
                 AddressSubcommand::Receive => match w.db.get_default_address()? {
                     Some(addr) => {
                         println!("\n  ╔══════════════════════════════════════════════════════════════════════╗");
@@ -463,6 +486,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 spend_hook,
                 user_data,
             } => {
+                tx_status::begin("send", "build");
                 let w = wallet::Wallet::open(&args.wallet_name)?;
 
                 // Validate recipient as a DarkFi Address (base58 with checksum).
@@ -495,6 +519,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
 
                 let resolved_token_hex = w.db.resolve_token_id(&token)?;
+                let token_hex = crate::db::WalletDb::token_id_hex(&resolved_token_hex)
+                    .unwrap_or_else(|| resolved_token_hex.clone());
                 let is_drk = crate::db::WalletDb::is_drk_token(&resolved_token_hex);
 
                 // Check balances
@@ -558,7 +584,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 } else {
                     for (tx_hash, idx, value, ref tok_id) in &unspent {
-                        let matches = tok_id == &resolved_token_hex || tok_id == &token;
+                        let matches = tok_id == &resolved_token_hex
+                            || tok_id == &token
+                            || tok_id == &token_hex;
                         if matches && (*value as u64) >= amount_atomic {
                             selected_inputs.push((tx_hash.clone(), *idx, *value));
                             input_total += *value as u64;
@@ -875,9 +903,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 let token_id = if is_drk {
                     *darkfi_money_contract::model::DARK_TOKEN_ID
                 } else {
-                    use std::str::FromStr;
-                    darkfi_money_contract::model::TokenId::from_str(&resolved_token_hex)
-                        .map_err(|e| format!("Invalid token_id '{resolved_token_hex}': {e}"))?
+                    {
+                        let raw = hex::decode(&token_hex).map_err(|e| {
+                            format!("Invalid token_id '{resolved_token_hex}': {e}")
+                        })?;
+                        let arr: [u8; 32] = raw.try_into().map_err(|_| {
+                            format!("Invalid token_id '{resolved_token_hex}'")
+                        })?;
+                        darkfi_money_contract::model::TokenId::from_bytes(arr).map_err(|e| {
+                            format!("Invalid token_id '{resolved_token_hex}': {e}")
+                        })?
+                    }
                 };
                 let all_coins: Vec<_> = all_coins
                     .into_iter()
@@ -887,7 +923,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         if want_drk {
                             is_c_drk
                         } else {
-                            hex == resolved_token_hex || is_c_drk
+                            hex == token_hex || is_c_drk
                         }
                     })
                     .collect();
@@ -960,8 +996,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 tx.encode(&mut tx_data).unwrap();
                 let last_tx_path = wallet::Wallet::write_last_tx(&args.wallet_name, &tx_data);
 
+                tx_status::phase("sign");
                 println!("\n✅ ZK Transaction Generated!");
                 println!("TX size: {} bytes", tx_data.len());
+                let signed_hash = format!("{}", tx.hash());
+                tx_status::emit(
+                    "send",
+                    "sign",
+                    "success",
+                    "waiting",
+                    &signed_hash,
+                    None,
+                    &token,
+                    Some(amount_atomic),
+                    "",
+                    "",
+                );
 
                 if omr_clue.is_empty() {
                     println!("(No OMR clue — recipient will trial-decrypt)");
@@ -987,16 +1037,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     );
                 } else {
                     // Auto-broadcast via lightwalletd
+                    tx_status::phase("broadcast");
                     println!("\nBroadcasting transaction...");
                     let mut broadcast_client = crate::client::LightwalletClient::new(
                         &config.server_url,
                         config.tls_pin_sha256.clone(),
                     )
                     .with_tor(config.use_tor);
+                    let payment_index = payment_index_from_self(&built.self_output_indices);
                     let extra_omr_clues = self_change_clues(
                         &config.network,
                         &w,
                         &omr_clue,
+                        payment_index,
                         &built.self_output_indices,
                     );
                     match broadcast_client
@@ -1005,6 +1058,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             omr_clue.clone(),
                             omr_metadata_enc,
                             extra_omr_clues,
+                            payment_index,
                         )
                         .await
                     {
@@ -1031,6 +1085,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 );
                             }
                             println!("✅ Transaction broadcast successfully via lightwalletd!");
+                            tx_status::emit(
+                                "send",
+                                "broadcast",
+                                "success",
+                                "confirming",
+                                &format!("{}", tx.hash()),
+                                Some(0),
+                                &token,
+                                Some(amount_atomic),
+                                "",
+                                "",
+                            );
                             if resp.clue_accepted {
                                 println!(
                                     "UnifOMR clue hint stored (24h TTL) — confirm while LWD indexes."
@@ -1097,26 +1163,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 } else {
                     println!("Transaction History ({} transactions):", txs.len());
                     println!(
-                        "{:<10} {:<10} {:>16} {:<6} {:<20} Hash",
-                        "Height", "Direction", "Amount", "Token", "Time"
+                        "{:<10} {:<12} {:<16} {:>16} {:<8} {:<20} Hash",
+                        "Height", "State", "Kind", "Amount", "Token", "Time"
                     );
                     println!("{}", "-".repeat(90));
                     for tx in &txs {
                         let drk_amount = crate::amount::format_drk_atomic(tx.value_raw as u64);
-                        let dir_icon = if tx.direction == "incoming" {
-                            "⬇ recv"
-                        } else {
-                            "⬆ send"
-                        };
                         let hash_short = if tx.hash.len() > 12 {
                             &tx.hash[..12]
                         } else {
                             &tx.hash
                         };
+                        let kind = display_kind(&tx.kind, &tx.direction);
                         println!(
-                            "{:<10} {:<10} {:>16} {:<6} {:<20} {}…",
+                            "{:<10} {:<12} {:<16} {:>16} {:<8} {:<20} {}…",
                             tx.block_height,
-                            dir_icon,
+                            tx_status::stored_state(tx.block_height),
+                            kind,
                             drk_amount,
                             tx.token_id,
                             tx.timestamp,
@@ -1137,6 +1200,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         println!("Transaction Details");
                         println!("  Hash:         {}", tx.hash);
                         println!("  Block Height: {}", tx.block_height);
+                        println!("  State:        {}", tx_status::stored_state(tx.block_height));
+                        println!("  Kind:         {}", display_kind(&tx.kind, &tx.direction));
                         println!("  Direction:    {}", tx.direction);
                         println!(
                             "  Amount:       {} {} ({} atomic)",
@@ -1165,6 +1230,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
             TxSubcommand::Broadcast { hex } => {
+                tx_status::begin("broadcast", "build");
                 let mut client = client::LightwalletClient::new(
                     &config.server_url,
                     config.tls_pin_sha256.clone(),
@@ -1180,10 +1246,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                     let info = match client.get_light_info().await {
                                         Ok(info) => info,
                                         Err(e) => {
-                                            eprintln!(
-                                                "Error: GetLightInfo failed: {}",
-                                                sync::redact_sync_error(&e.to_string())
+                                            let reason = sync::redact_sync_error(&e.to_string());
+                                            tx_status::phase("broadcast");
+                                            tx_status::emit(
+                                                "broadcast",
+                                                "broadcast",
+                                                "fail",
+                                                "failed",
+                                                "",
+                                                None,
+                                                "",
+                                                None,
+                                                "",
+                                                &reason,
                                             );
+                                            eprintln!("Error: GetLightInfo failed: {reason}");
                                             return Ok(());
                                         }
                                     };
@@ -1211,6 +1288,19 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                                     clue
                                                 }
                                                 Err(e) => {
+                                                    tx_status::phase("broadcast");
+                                                    tx_status::emit(
+                                                        "broadcast",
+                                                        "broadcast",
+                                                        "fail",
+                                                        "failed",
+                                                        "",
+                                                        None,
+                                                        "",
+                                                        None,
+                                                        "",
+                                                        &e,
+                                                    );
                                                     eprintln!(
                                                         "Error: UnifOMR clue rejected ({e}). \
                                                      No PerfOMR fallback."
@@ -1220,25 +1310,50 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                             }
                                         }
                                         Err(e) => {
+                                            let reason = sync::redact_sync_error(&e.to_string());
+                                            tx_status::phase("broadcast");
+                                            tx_status::emit(
+                                                "broadcast",
+                                                "broadcast",
+                                                "fail",
+                                                "failed",
+                                                "",
+                                                None,
+                                                "",
+                                                None,
+                                                "",
+                                                &reason,
+                                            );
                                             eprintln!(
-                                                "Error: UnifOMR clue PK lookup failed: {}",
-                                                sync::redact_sync_error(&e.to_string())
+                                                "Error: UnifOMR clue PK lookup failed: {reason}"
                                             );
                                             return Ok(());
                                         }
                                     }
                                 }
                                 None => {
-                                    eprintln!(
-                                        "Error: could not parse recipient for UnifOMR clue; \
-                                     refusing broadcast without lightwalletd clue hint (24h TTL)."
+                                    let reason = "could not parse recipient for UnifOMR clue; refusing broadcast without lightwalletd clue hint (24h TTL)";
+                                    tx_status::emit(
+                                        "broadcast",
+                                        "build",
+                                        "fail",
+                                        "failed",
+                                        "",
+                                        None,
+                                        "",
+                                        None,
+                                        "",
+                                        reason,
                                     );
+                                    eprintln!("Error: {reason}");
                                     return Ok(());
                                 }
                             }
                         };
+                        tx_status::phase("broadcast");
+                        let tx_hash = tx_hash_hex(&raw_tx);
                         match client
-                            .send_transaction(raw_tx, omr_clue, vec![], vec![])
+                            .send_transaction(raw_tx, omr_clue, vec![], vec![], 0)
                             .await
                         {
                             Ok(resp) => {
@@ -1246,17 +1361,67 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                     println!(
                                         "Broadcast OK via lightwalletd (UnifOMR clue hint stored, 24h TTL)"
                                     );
+                                    tx_status::emit(
+                                        "broadcast",
+                                        "broadcast",
+                                        "success",
+                                        "confirming",
+                                        &tx_hash,
+                                        Some(0),
+                                        "",
+                                        None,
+                                        "",
+                                        "",
+                                    );
                                 } else {
+                                    tx_status::emit(
+                                        "broadcast",
+                                        "broadcast",
+                                        "fail",
+                                        "failed",
+                                        &tx_hash,
+                                        None,
+                                        "",
+                                        None,
+                                        "",
+                                        &resp.error,
+                                    );
                                     eprintln!("Broadcast error: {}", resp.error);
                                 }
                             }
-                            Err(e) => eprintln!(
-                                "Broadcast failed: {}",
-                                sync::redact_sync_error(&e.to_string())
-                            ),
+                            Err(e) => {
+                                let reason = sync::redact_sync_error(&e.to_string());
+                                tx_status::emit(
+                                    "broadcast",
+                                    "broadcast",
+                                    "fail",
+                                    "failed",
+                                    &tx_hash,
+                                    None,
+                                    "",
+                                    None,
+                                    "",
+                                    &reason,
+                                );
+                                eprintln!("Broadcast failed: {reason}");
+                            }
                         }
                     }
-                    Err(e) => eprintln!("Invalid hex: {}", e),
+                    Err(e) => {
+                        tx_status::emit(
+                            "broadcast",
+                            "build",
+                            "fail",
+                            "failed",
+                            "",
+                            None,
+                            "",
+                            None,
+                            "",
+                            &e.to_string(),
+                        );
+                        eprintln!("Invalid hex: {e}");
+                    }
                 }
             }
             TxSubcommand::Inspect { file, verify } => {
@@ -1436,13 +1601,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let mut total_found = 0u32;
             let mut total_spent = 0u32;
             let mut rate_limit_pauses = 0u32;
+            let mut block_range_pauses = 0u32;
+            let mut warned_stale_tip = false;
             loop {
                 match engine.sync_once().await {
                     Ok(result) => {
                         rate_limit_pauses = 0;
+                        block_range_pauses = 0;
                         total_scanned += u64::from(result.blocks_scanned);
                         total_found += result.notes_found;
                         total_spent += result.notes_spent;
+                        if result.tip_stale && !warned_stale_tip {
+                            warned_stale_tip = true;
+                            eprintln!(
+                                "Served tip may be frozen: lightwalletd has not reached darkfid recently"
+                            );
+                        }
                         let (last_synced, _) =
                             engine.db.get_sync_state().unwrap_or((result.tip_height, 0));
                         // force-trial backfill keeps last_synced at the tip on purpose.
@@ -1478,6 +1652,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             std::thread::sleep(std::time::Duration::from_secs(5));
                             continue;
                         }
+                        let block_range_full = msg.contains("too many block-range streams")
+                            || msg.contains("block-range limiter closed");
+                        if block_range_full && block_range_pauses < 6 {
+                            block_range_pauses += 1;
+                            eprintln!(
+                                "Sync paused, lightwalletd block-range capacity full ({block_range_pauses}/6): {}",
+                                sync::redact_sync_error(&msg)
+                            );
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                            continue;
+                        }
                         eprintln!("Sync failed: {}", sync::redact_sync_error(&msg));
                         break;
                     }
@@ -1508,6 +1693,27 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     println!("Current tip height: {}", tip.height);
                     let hex_hash = hex::encode(&tip.hash);
                     println!("Current tip hash:   {}", hex_hash);
+                    match client.get_light_info().await {
+                        Ok(info) if info.tip_fetched_unix > 0 => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let age = now.saturating_sub(info.tip_fetched_unix);
+                            if age > 120 {
+                                println!(
+                                    "Tip freshness: stale (last darkfid poll {age}s ago)"
+                                );
+                            } else {
+                                println!("Tip freshness: {age}s ago");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "Tip freshness: unknown ({})",
+                            sync::redact_sync_error(&e.to_string())
+                        ),
+                    }
                 }
                 Err(e) => {
                     eprintln!(
@@ -2196,6 +2402,28 @@ async fn verify_serialized_tx(raw: &[u8], config: &config::Config) -> Result<(),
     Ok(())
 }
 
+fn tx_hash_hex(raw: &[u8]) -> String {
+    use darkfi::tx::Transaction;
+    use darkfi_serial::Decodable;
+    match Transaction::decode(&mut std::io::Cursor::new(raw)) {
+        Ok(tx) => format!("{}", tx.hash()),
+        Err(_) => "-".into(),
+    }
+}
+
+fn display_kind<'a>(kind: &'a str, direction: &'a str) -> &'a str {
+    match kind {
+        "" | "transfer" => {
+            if direction == "incoming" {
+                "receive"
+            } else {
+                "send"
+            }
+        }
+        other => other,
+    }
+}
+
 fn sha2_256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).into()
@@ -2203,10 +2431,21 @@ fn sha2_256(data: &[u8]) -> [u8; 32] {
 
 /// Verify GetCluePublicKey directory attestation, then build a UnifOMR clue.
 /// Clues for the sender's change outputs. Output 0 keeps the recipient clue.
+/// Compact index of the payment. Own change and fee indexes are `self_indexes`.
+fn payment_index_from_self(self_indexes: &[u32]) -> u32 {
+    let Some(&max) = self_indexes.iter().max() else {
+        return 0;
+    };
+    (0..=max)
+        .find(|idx| !self_indexes.contains(idx))
+        .unwrap_or(0)
+}
+
 fn self_change_clues(
     network: &str,
     w: &wallet::Wallet,
     payment_clue: &[u8],
+    payment_index: u32,
     indices: &[u32],
 ) -> Vec<crate::client::proto::OutputOmrClue> {
     if payment_clue.is_empty() {
@@ -2219,14 +2458,15 @@ fn self_change_clues(
     let Ok((_sk, pk)) = darkfi_lightwalletd::unifomr::clue_keypair_from_wallet(&secret, net) else {
         return Vec::new();
     };
-    let clue = darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk);
+    // A fresh ciphertext per output. Lightwalletd used to keep only the first
+    // copy of identical clue bytes, which left the fee output out of the digest.
     indices
         .iter()
         .copied()
-        .filter(|idx| *idx != 0)
+        .filter(|idx| *idx != payment_index)
         .map(|output_index| crate::client::proto::OutputOmrClue {
             output_index,
-            omr_clue: clue.clone(),
+            omr_clue: darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk),
         })
         .collect()
 }
