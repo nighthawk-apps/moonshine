@@ -8,7 +8,7 @@ resolve. Reuse the Android pin:
 ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
-Do not clone [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi). That host returns HTTP 504, and this pin is not published there. Do not pin git.dark.fi master — that tree is Arti 0.42 without the keccak overlay. CI checks this pin out from `nighthawk24/darkfi` (`nighthawk-testnet`, Arti 0.47 + keccak + kvdb-overlay). Upstream `0f985c7cf` is included: fee calls spend a tx-local change output when it covers the fee, and `ContractCallLeaf` carries the signing keys.
+Do not clone [git.dark.fi/darkrenaissance/darkfi](https://git.dark.fi/darkrenaissance/darkfi). That host returns HTTP 504, and this pin is not published there. Do not pin git.dark.fi master — that tree is an older Arti without the keccak overlay. CI checks this pin out from `nighthawk24/darkfi` (`nighthawk-testnet`, Arti 0.48 + keccak + kvdb-overlay). The pin includes tx-local fees: a fee call spends a change output in the same transaction when that output covers the fee.
 
 Cargo git deps inside the pin (also HTTP 504 on git.dark.fi):
 
