@@ -114,7 +114,19 @@ pub fn reset_directory_attest_pin(db: &WalletDb, server_url: &str) -> Result<(),
 ///
 /// The clue key is derived from the wallet secret and does not rotate, so
 /// this stays 1. A timestamp would distinguish real directory rows from decoys.
+/// Decoy / legacy floor (must stay `1` to match lightwalletd `decoy_key_version`).
+#[allow(dead_code)]
 pub const CLUE_KEY_VERSION: u64 = 1;
+
+/// Monotonic clue-key version for `RegisterCluePublicKey` (unix seconds).
+/// Matches mobile FFI `clue_key_version_now` so re-registration is not rejected
+/// as stale after an earlier timestamped registration on the same LWD.
+pub fn clue_key_version_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1)
+}
 
 /// Session-scoped clue-registration ids. Oldest insert is dropped at `cap`.
 /// Updating an already-present id does not refresh FIFO position.
@@ -188,6 +200,44 @@ pub fn mark_clue_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) {
     if let Ok(mut s) = clue_reg_cache().lock() {
         s.insert(id);
     }
+}
+
+/// Wallet-DB meta key for a durable UnifOMR registration mark (survives CLI restarts).
+fn clue_reg_meta_key(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> String {
+    let id = clue_registration_id(network, pay_pk, clue_pk);
+    format!("clue_reg_v1:{}", hex::encode(id))
+}
+
+/// Session cache **or** durable wallet meta — each `moonshine` CLI process is fresh,
+/// so UnifOMR stress loops must not re-hit `RegisterCluePublicKey` every invocation.
+pub fn clue_already_registered_db(
+    db: &crate::db::WalletDb,
+    network: u8,
+    pay_pk: &[u8; 32],
+    clue_pk: &[u8],
+) -> bool {
+    if clue_already_registered(network, pay_pk, clue_pk) {
+        return true;
+    }
+    let key = clue_reg_meta_key(network, pay_pk, clue_pk);
+    match db.get_meta(&key) {
+        Ok(Some(_)) => {
+            mark_clue_registered(network, pay_pk, clue_pk);
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn mark_clue_registered_db(
+    db: &crate::db::WalletDb,
+    network: u8,
+    pay_pk: &[u8; 32],
+    clue_pk: &[u8],
+) {
+    mark_clue_registered(network, pay_pk, clue_pk);
+    let key = clue_reg_meta_key(network, pay_pk, clue_pk);
+    let _ = db.set_meta(&key, &[1u8]);
 }
 
 /// The main wallet handle.
@@ -372,9 +422,7 @@ impl Wallet {
     /// prefixes** (`D…`), testnet uses Testnet (`f…`). OMR network byte is
     /// separate — see [`Self::network_byte`].
     pub fn sdk_network(network: &str) -> Network {
-        if network.eq_ignore_ascii_case("mainnet")
-            || network.eq_ignore_ascii_case("localnet")
-        {
+        if network.eq_ignore_ascii_case("mainnet") || network.eq_ignore_ascii_case("localnet") {
             Network::Mainnet
         } else {
             Network::Testnet
@@ -523,13 +571,10 @@ impl Wallet {
             return Err("Wallet has no primary address — recreate or re-import".into());
         }
 
-        let seed_bytes = self
-            .db
-            .get_meta("derivation_seed")?
-            .ok_or(
-                "Wallet derivation_seed missing — re-import the mnemonic to enable \
+        let seed_bytes = self.db.get_meta("derivation_seed")?.ok_or(
+            "Wallet derivation_seed missing — re-import the mnemonic to enable \
                  mobile-compatible sub-addresses",
-            )?;
+        )?;
         if seed_bytes.len() < 32 {
             return Err("Wallet derivation_seed too short".into());
         }
@@ -729,6 +774,18 @@ mod tests {
             !clue_already_registered(0, &pk, &clue),
             "different network must not collide"
         );
+    }
+
+    #[test]
+    fn test_clue_registration_persists_in_wallet_meta() {
+        let db = WalletDb::in_memory().unwrap();
+        let pk = [0x33u8; 32];
+        let clue = vec![0x44u8; 8];
+        assert!(!clue_already_registered_db(&db, 1, &pk, &clue));
+        mark_clue_registered_db(&db, 1, &pk, &clue);
+        assert!(clue_already_registered_db(&db, 1, &pk, &clue));
+        let key = clue_reg_meta_key(1, &pk, &clue);
+        assert!(db.get_meta(&key).unwrap().is_some());
     }
 
     #[test]

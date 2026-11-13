@@ -1,16 +1,16 @@
 //! CLI dispatch for token / DAO / contract / synced-event views.
 
 use crate::amount;
-use crate::tx_status;
 use crate::client::LightwalletClient;
 use crate::config::Config;
 use crate::fee_attach;
+use crate::tx_status;
 use crate::wallet::Wallet;
 use crate::{contract_ops, dao_ops, token};
 use clap::Subcommand;
+use darkfi::zk::halo2::Field;
 use darkfi_money_contract::client::OwnCoin;
 use darkfi_sdk::bridgetree::Position;
-use darkfi::zk::halo2::Field;
 use darkfi_sdk::crypto::keypair::Address;
 use darkfi_sdk::crypto::{pasta_prelude::PrimeField, FuncId, PublicKey, SecretKey};
 use darkfi_sdk::pasta::pallas;
@@ -80,7 +80,9 @@ pub enum DaoSubcommand {
         limit: u32,
     },
     /// View stored DAO details, bulla, and treasury payment address
-    View { name: String },
+    View {
+        name: String,
+    },
     /// List synced DAO calls and proposals
     Proposals {
         name: Option<String>,
@@ -167,7 +169,9 @@ pub async fn run_token(
         TokenSubcommand::List => {
             let rows = w.db.list_token_mints()?;
             if rows.is_empty() {
-                println!("No token mint authorities. Try: moonshine token generate-mint --alias ANON");
+                println!(
+                    "No token mint authorities. Try: moonshine token generate-mint --alias ANON"
+                );
                 return Ok(());
             }
             for (tid, _, _, alias, frozen, fh) in rows {
@@ -191,38 +195,38 @@ pub async fn run_token(
             tx_status::begin("token-mint", "build");
             let atomic = amount::parse_drk_atomic(&amount).map_err(|e| e.to_string())?;
             let recipient_pk = parse_address_pubkey(&recipient)?;
-            let hook = spend_hook
-                .as_deref()
-                .map(parse_func_id)
-                .transpose()?;
-            let ud = user_data
-                .as_deref()
-                .map(parse_user_data)
-                .transpose()?;
-            let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
-                .with_tor(config.use_tor);
+            let hook = spend_hook.as_deref().map(parse_func_id).transpose()?;
+            let ud = user_data.as_deref().map(parse_user_data).transpose()?;
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
             let zkas = zkas_pairs(
                 client
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
                     .await?,
             );
-            let (builder, tid) = token::build_mint_builder(
-                &w.db,
-                &tok,
-                atomic,
-                recipient_pk,
-                hook,
-                ud,
+            let (builder, tid) =
+                token::build_mint_builder(&w.db, &tok, atomic, recipient_pk, hook, ud, &zkas)
+                    .await?;
+            broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
                 &zkas,
+                "token-mint",
+                &tid.to_string(),
+                atomic,
+                "",
             )
             .await?;
-            broadcast_builder(w, config, builder, fee, &zkas, "token-mint", &tid.to_string(), atomic, "").await?;
             println!("Minted token id: {tid}");
         }
         TokenSubcommand::Freeze { token: tok, fee } => {
             tx_status::begin("burn", "build");
-            let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
-                .with_tor(config.use_tor);
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
             let zkas = zkas_pairs(
                 client
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
@@ -287,15 +291,8 @@ pub async fn run_dao(
             let p_limit = parse_amount(&proposer_limit)?;
             let q = parse_amount(&quorum)?;
             let eq = parse_amount(&early_exec_quorum)?;
-            let toml = dao_ops::create_dao(
-                &w.db,
-                &name,
-                p_limit,
-                q,
-                eq,
-                approval_ratio,
-                &gov_token,
-            )?;
+            let toml =
+                dao_ops::create_dao(&w.db, &name, p_limit, q, eq, approval_ratio, &gov_token)?;
             println!("{toml}");
             println!("Stored DAO '{name}' in wallet.");
             tx_status::emit(
@@ -366,10 +363,9 @@ pub async fn run_dao(
             let dao = dao_ops::parse_dao_params(&toml_str, &w.db)?;
             let dao_bulla = dao.to_bulla();
             let dao_spend_hook = dao_ops::dao_spend_hook();
-            let coins = w.db.list_unspent_for_dao(
-                &dao_spend_hook.to_bytes(),
-                &dao_bulla.inner().to_repr(),
-            )?;
+            let coins = w
+                .db
+                .list_unspent_for_dao(&dao_spend_hook.to_bytes(), &dao_bulla.inner().to_repr())?;
             if coins.is_empty() {
                 println!("DAO '{name}' treasury has no unspent coins recorded.");
                 println!("Bulla: {dao_bulla}");
@@ -389,14 +385,18 @@ pub async fn run_dao(
                 return Ok(());
             }
             println!("DAO '{name}' Treasury Balance (Bulla: {dao_bulla}):");
-            let mut by_token: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            let mut by_token: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
             for (_tx, _idx, val, tok) in coins {
                 *by_token.entry(tok).or_insert(0) += val as u64;
             }
             for (tok, total) in by_token {
                 let is_drk = crate::db::WalletDb::is_drk_token(&tok);
                 if is_drk {
-                    println!("  DRK:   {} DRK ({total} atomic)", amount::format_drk_atomic(total));
+                    println!(
+                        "  DRK:   {} DRK ({total} atomic)",
+                        amount::format_drk_atomic(total)
+                    );
                 } else {
                     println!("  {tok}: {total} atomic units");
                 }
@@ -459,7 +459,10 @@ pub async fn run_dao(
                 println!("No compact DAO calls observed yet. Run `moonshine sync` first.");
                 return Ok(());
             }
-            println!("Observed DAO Calls & Proposals ({} total synced calls):", calls.len());
+            println!(
+                "Observed DAO Calls & Proposals ({} total synced calls):",
+                calls.len()
+            );
             for (h, tx, kind, bulla, payload) in calls {
                 let kind_str = match kind {
                     0 => "Mint",
@@ -475,8 +478,9 @@ pub async fn run_dao(
         }
         DaoSubcommand::Mint { name, fee } => {
             tx_status::begin("dao-mint", "build");
-            let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
-                .with_tor(config.use_tor);
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
             let zkas = zkas_pairs(
                 client
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::DAO_CONTRACT_ID.to_string())
@@ -569,8 +573,9 @@ pub async fn run_contract(
                 deploy_ix.as_deref(),
             )
             .await?;
-            let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
-                .with_tor(config.use_tor);
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
             let money_zkas = zkas_pairs(
                 client
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
@@ -592,8 +597,9 @@ pub async fn run_contract(
         ContractSubcommand::Lock { deploy_auth, fee } => {
             tx_status::begin("contract-lock", "build");
             let builder = contract_ops::build_lock_builder(&w.db, &deploy_auth).await?;
-            let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
-                .with_tor(config.use_tor);
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
             let money_zkas = zkas_pairs(
                 client
                     .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
@@ -680,7 +686,8 @@ async fn broadcast_builder(
         return Err(format!("SendTransaction error: {}", resp.error).into());
     }
     if !nf.is_empty() {
-        let _ = w.db.mark_note_spent(&nf);
+        let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
+        let _ = w.db.reserve_note(&nf, reserved_at);
     }
     let _ = w.db.insert_typed(
         &tx_hash,
@@ -692,7 +699,7 @@ async fn broadcast_builder(
         None,
         None,
     );
-    println!("✅ Broadcast via lightwalletd");
+    println!("Lightwalletd accepted the transaction (unconfirmed until it is in a block).");
     println!("TX hash: {tx_hash}");
     tx_status::emit(
         kind,
@@ -715,10 +722,9 @@ fn pick_fee_coin(
     w: &Wallet,
     fee: u64,
 ) -> Result<(OwnCoin, darkfi_sdk::crypto::MerkleTree), Box<dyn Error>> {
-    let tree_bytes = w
-        .db
-        .get_meta("tree_state")?
-        .ok_or("Money Merkle tree missing — run: moonshine sync --rebuild-merkle")?;
+    let tree_bytes =
+        w.db.get_meta("tree_state")?
+            .ok_or("Money Merkle tree missing — run: moonshine sync --rebuild-merkle")?;
     let tree: darkfi_sdk::crypto::MerkleTree =
         Decodable::decode(&mut std::io::Cursor::new(&tree_bytes))?;
     let unspent = w.db.list_unspent_full()?;
@@ -756,7 +762,10 @@ fn pick_fee_coin(
                 .ok_or("bad token_blind")?
         };
         let token_id = darkfi_money_contract::model::TokenId::from_bytes(
-            hex::decode(&tok)?.as_slice().try_into().map_err(|_| "token id len")?,
+            hex::decode(&tok)?
+                .as_slice()
+                .try_into()
+                .map_err(|_| "token id len")?,
         )?;
         let mut hook_bytes = [0u8; 32];
         if hook.len() == 32 {
@@ -807,13 +816,10 @@ fn pick_fee_coin(
         }
     }
     let coin = best.ok_or_else(|| {
-        format!(
-            "no DRK coin covering fee {fee}. Sync/rebuild-merkle, or lower --fee"
-        )
+        format!("no DRK coin covering fee {fee}. Sync/rebuild-merkle, or lower --fee")
     })?;
     Ok((coin, tree))
 }
-
 
 fn zkas_pairs(resp: crate::client::proto::ZkasResponse) -> Vec<(String, Vec<u8>)> {
     resp.bincodes

@@ -444,10 +444,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 token_id.clone()
                             }
                         });
-                        println!(
-                            "  {name:5}: {} atomic units (token: {token_id})",
-                            amount
-                        );
+                        println!("  {name:5}: {} atomic units (token: {token_id})", amount);
                     }
                 }
             }
@@ -566,7 +563,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 if is_drk {
                     let total_needed = amount_atomic + fee_atomic;
                     for (tx_hash, idx, value, ref tok_id) in &unspent {
-                        if crate::db::WalletDb::is_drk_token(tok_id) && (*value as u64) >= total_needed {
+                        if crate::db::WalletDb::is_drk_token(tok_id)
+                            && (*value as u64) >= total_needed
+                        {
                             selected_inputs.push((tx_hash.clone(), *idx, *value));
                             input_total = *value as u64;
                             break;
@@ -904,15 +903,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     *darkfi_money_contract::model::DARK_TOKEN_ID
                 } else {
                     {
-                        let raw = hex::decode(&token_hex).map_err(|e| {
-                            format!("Invalid token_id '{resolved_token_hex}': {e}")
-                        })?;
-                        let arr: [u8; 32] = raw.try_into().map_err(|_| {
-                            format!("Invalid token_id '{resolved_token_hex}'")
-                        })?;
-                        darkfi_money_contract::model::TokenId::from_bytes(arr).map_err(|e| {
-                            format!("Invalid token_id '{resolved_token_hex}': {e}")
-                        })?
+                        let raw = hex::decode(&token_hex)
+                            .map_err(|e| format!("Invalid token_id '{resolved_token_hex}': {e}"))?;
+                        let arr: [u8; 32] = raw
+                            .try_into()
+                            .map_err(|_| format!("Invalid token_id '{resolved_token_hex}'"))?;
+                        darkfi_money_contract::model::TokenId::from_bytes(arr)
+                            .map_err(|e| format!("Invalid token_id '{resolved_token_hex}': {e}"))?
                     }
                 };
                 let all_coins: Vec<_> = all_coins
@@ -932,8 +929,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         "no spendable coins for token '{token}'. \
                          Unspent rows exist but lack owner_secret/leaf_position/commitment. \
                          Run: moonshine -w {} --server {} sync --rebuild-merkle",
-                        args.wallet_name,
-                        config.server_url
+                        args.wallet_name, config.server_url
                     )
                     .into());
                 }
@@ -1023,12 +1019,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 if no_broadcast {
+                    let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
                     let mut marked = 0usize;
                     for nf in &built.spent_nullifiers {
-                        marked += w.db.mark_note_spent(nf).unwrap_or(0);
+                        marked += w.db.reserve_note(nf, reserved_at).unwrap_or(0);
                     }
                     for commit in &built.spent_commitments {
-                        marked += w.db.mark_note_spent_by_commitment(commit).unwrap_or(0);
+                        marked +=
+                            w.db.reserve_note_by_commitment(commit, reserved_at)
+                                .unwrap_or(0);
                     }
                     println!("Skipping broadcast (--no-broadcast).");
                     println!(
@@ -1084,7 +1083,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                         .into(),
                                 );
                             }
-                            println!("✅ Transaction broadcast successfully via lightwalletd!");
+                            println!(
+                                "Lightwalletd accepted the transaction (unconfirmed until it is in a block)."
+                            );
                             tx_status::emit(
                                 "send",
                                 "broadcast",
@@ -1102,12 +1103,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                     "UnifOMR clue hint stored (24h TTL) — confirm while LWD indexes."
                                 );
                             }
+                            let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
                             let mut marked = 0usize;
                             for nf in &built.spent_nullifiers {
-                                marked += w.db.mark_note_spent(nf).unwrap_or(0);
+                                marked += w.db.reserve_note(nf, reserved_at).unwrap_or(0);
                             }
                             for commit in &built.spent_commitments {
-                                marked += w.db.mark_note_spent_by_commitment(commit).unwrap_or(0);
+                                marked +=
+                                    w.db.reserve_note_by_commitment(commit, reserved_at)
+                                        .unwrap_or(0);
                             }
                             if marked == 0 {
                                 eprintln!(
@@ -1200,7 +1204,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         println!("Transaction Details");
                         println!("  Hash:         {}", tx.hash);
                         println!("  Block Height: {}", tx.block_height);
-                        println!("  State:        {}", tx_status::stored_state(tx.block_height));
+                        println!(
+                            "  State:        {}",
+                            tx_status::stored_state(tx.block_height)
+                        );
                         println!("  Kind:         {}", display_kind(&tx.kind, &tx.direction));
                         println!("  Direction:    {}", tx.direction);
                         println!(
@@ -1505,9 +1512,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 .with_tor(config.use_tor);
                 let mut ok = 0usize;
                 let mut last_err: Option<String> = None;
-                let key_version = wallet::CLUE_KEY_VERSION;
+                let key_version = wallet::clue_key_version_now();
                 for pk_pay in pay_pks {
-                    if wallet::clue_already_registered(network_byte, &pk_pay, &clue_pk) {
+                    if wallet::clue_already_registered_db(&w.db, network_byte, &pk_pay, &clue_pk) {
                         ok += 1;
                         continue;
                     }
@@ -1532,7 +1539,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         .await
                     {
                         Ok(()) => {
-                            wallet::mark_clue_registered(network_byte, &pk_pay, &clue_pk);
+                            wallet::mark_clue_registered_db(&w.db, network_byte, &pk_pay, &clue_pk);
                             ok += 1;
                         }
                         Err(e) => {
@@ -1701,9 +1708,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 .unwrap_or(0);
                             let age = now.saturating_sub(info.tip_fetched_unix);
                             if age > 120 {
-                                println!(
-                                    "Tip freshness: stale (last darkfid poll {age}s ago)"
-                                );
+                                println!("Tip freshness: stale (last darkfid poll {age}s ago)");
                             } else {
                                 println!("Tip freshness: {age}s ago");
                             }
@@ -2020,7 +2025,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Version => {
             println!("Moonshine CLI version {}", env!("CARGO_PKG_VERSION"));
-            println!("  Sync Scheme:  Padded trial decryption (default) / UnifOMR (0x05, experimental)");
+            println!(
+                "  Sync Scheme:  Padded trial decryption (default) / UnifOMR (0x05, experimental)"
+            );
             println!("  Privacy:      Block range padding, jitter, error redaction, ephemeral block cache");
         }
         Command::ResetAttestPin => {

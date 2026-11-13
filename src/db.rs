@@ -458,10 +458,7 @@ impl WalletDb {
     }
 
     /// Synced compact DAO calls (most recent first).
-    pub fn list_dao_calls(
-        &self,
-        limit: u32,
-    ) -> SqlResult<Vec<(u32, Vec<u8>, u32, Vec<u8>)>> {
+    pub fn list_dao_calls(&self, limit: u32) -> SqlResult<Vec<(u32, Vec<u8>, u32, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
             "SELECT height, tx_hash, kind, bulla FROM dao_calls \
              ORDER BY height DESC LIMIT ?1",
@@ -628,9 +625,9 @@ impl WalletDb {
     }
 
     pub fn get_deploy_auth(&self, contract_id: &str) -> SqlResult<Option<(Vec<u8>, bool)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT secret_key, is_locked FROM deploy_auths WHERE contract_id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT secret_key, is_locked FROM deploy_auths WHERE contract_id = ?1")?;
         let mut rows = stmt.query_map([contract_id], |row| {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? != 0))
         })?;
@@ -661,6 +658,12 @@ impl WalletDb {
         let _ = self
             .conn
             .execute("ALTER TABLE notes ADD COLUMN spent_height INTEGER", []);
+        // Height of the wallet tip when a broadcast reserved the note. Cleared
+        // once the nullifier is seen on chain. Sync drops the reservation if
+        // the chain moves on without that nullifier (mempool GC).
+        let _ = self
+            .conn
+            .execute("ALTER TABLE notes ADD COLUMN reserved_height INTEGER", []);
         let _ = self.conn.execute(
             "ALTER TABLE transactions ADD COLUMN kind TEXT NOT NULL DEFAULT 'transfer'",
             [],
@@ -956,10 +959,52 @@ impl WalletDb {
     ) -> SqlResult<usize> {
         let rows = self.conn.execute(
             "UPDATE notes SET spent = 1, \
-             spent_height = CASE WHEN ?2 IS NULL THEN spent_height ELSE COALESCE(spent_height, ?2) END \
+             spent_height = CASE WHEN ?2 IS NULL THEN spent_height ELSE COALESCE(spent_height, ?2) END, \
+             reserved_height = CASE WHEN ?2 IS NULL THEN reserved_height ELSE NULL END \
              WHERE nullifier = ?1 \
              AND (spent = 0 OR (?2 IS NOT NULL AND spent_height IS NULL))",
             params![nullifier, spent_height],
+        )?;
+        Ok(rows)
+    }
+
+    /// Blocks after a broadcast reservation before sync may spend the note again.
+    /// Matches the mempool window in which an unconfirmed tx can still land.
+    pub const RESERVATION_GRACE_BLOCKS: u32 = 8;
+
+    /// Reserve a note at `height` so the next send cannot reuse it before the
+    /// nullifier appears. `spent_height` stays null until the chain confirms it.
+    pub fn reserve_note(&self, nullifier: &[u8], height: u32) -> SqlResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE notes SET spent = 1, reserved_height = COALESCE(reserved_height, ?2) \
+             WHERE nullifier = ?1 AND spent = 0",
+            params![nullifier, height],
+        )?;
+        Ok(rows)
+    }
+
+    /// Same reservation, keyed by the on-chain coin commitment.
+    pub fn reserve_note_by_commitment(&self, commitment: &[u8], height: u32) -> SqlResult<usize> {
+        let rows = self.conn.execute(
+            "UPDATE notes SET spent = 1, reserved_height = COALESCE(reserved_height, ?2) \
+             WHERE commitment = ?1 AND spent = 0",
+            params![commitment, height],
+        )?;
+        Ok(rows)
+    }
+
+    /// Unspend broadcast reservations the chain has moved past without a nullifier.
+    /// Confirmed spends (`spent_height` set) are left alone.
+    pub fn release_stale_reservations(&self, tip: u32, grace: u32) -> SqlResult<usize> {
+        if tip <= grace {
+            return Ok(0);
+        }
+        let oldest_kept = tip - grace;
+        let rows = self.conn.execute(
+            "UPDATE notes SET spent = 0, reserved_height = NULL \
+             WHERE spent = 1 AND spent_height IS NULL AND reserved_height IS NOT NULL \
+             AND reserved_height < ?1",
+            params![oldest_kept],
         )?;
         Ok(rows)
     }
@@ -1653,6 +1698,60 @@ mod tests {
     }
 
     #[test]
+    fn test_release_stale_reservations_keeps_confirmed_spends() {
+        let db = WalletDb::in_memory().unwrap();
+        db.insert_note(
+            "reserved",
+            0,
+            1000,
+            "DRK",
+            &[1],
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.insert_note(
+            "confirmed",
+            0,
+            2000,
+            "DRK",
+            &[2],
+            11,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[2]),
+            Some(&[8u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(db.reserve_note(&[1], 100).unwrap(), 1);
+        assert_eq!(db.mark_note_spent_at(&[2], Some(100)).unwrap(), 1);
+        // Still inside the grace window.
+        assert_eq!(db.release_stale_reservations(107, 8).unwrap(), 0);
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 0);
+        // Chain moved on; the unconfirmed reservation is spendable again.
+        assert_eq!(db.release_stale_reservations(109, 8).unwrap(), 1);
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 1000);
+        // Confirmed spend stays spent.
+        assert_eq!(db.release_stale_reservations(200, 8).unwrap(), 0);
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 1000);
+    }
+
+    #[test]
     fn test_mark_spent_by_commitment_and_loc() {
         let db = WalletDb::in_memory().unwrap();
         let commit_a = [0xAAu8; 32];
@@ -2088,7 +2187,8 @@ mod tests {
         )
         .unwrap();
         // Compact sync stores FuncId::none() as 32 zero bytes, not NULL/empty.
-        db.set_spend_hook_bytes("tx-zero-hook", 0, &[0u8; 32]).unwrap();
+        db.set_spend_hook_bytes("tx-zero-hook", 0, &[0u8; 32])
+            .unwrap();
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 2_000_000_000);
         let listed = db.list_token_balances().unwrap();
         assert_eq!(listed.len(), 1);

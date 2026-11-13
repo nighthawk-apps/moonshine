@@ -454,6 +454,17 @@ impl SyncEngine {
         let notes_spent = self
             .apply_nullifiers_range(&mut client, scan_start, scan_end, tip_height)
             .await?;
+        match self
+            .db
+            .release_stale_reservations(tip_height, crate::db::WalletDb::RESERVATION_GRACE_BLOCKS)
+        {
+            Ok(n) if n > 0 => eprintln!(
+                "  released {n} unconfirmed reservation(s); those txs did not land within {} blocks",
+                crate::db::WalletDb::RESERVATION_GRACE_BLOCKS
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("  warning: release stale reservations failed: {e}"),
+        }
 
         // Tip advance: commitments + nullifiers done; sparse fetches succeeded.
         // A force-trial backfill must not rewind a cursor that is already at the tip.
