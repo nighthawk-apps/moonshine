@@ -171,6 +171,9 @@ enum Command {
 enum WalletSubcommand {
     Create {
         name: String,
+        /// Wallet birthday height. Sync starts here instead of genesis.
+        #[arg(long)]
+        birthday: Option<u32>,
     },
     Import {
         name: String,
@@ -284,8 +287,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     match args.cmd {
         Command::Wallet { sub } => match sub {
-            WalletSubcommand::Create { name } => {
+            WalletSubcommand::Create { name, birthday } => {
                 wallet::Wallet::create(&name, &config.network)?;
+                if let Some(height) = birthday {
+                    let w = wallet::Wallet::open(&name)?;
+                    w.db.set_birthday_height(height)?;
+                    w.db.set_sync_height(height.saturating_sub(1))?;
+                    println!("Set wallet birthday to height {}.", height);
+                }
             }
             WalletSubcommand::Import {
                 name,

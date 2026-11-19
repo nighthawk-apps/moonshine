@@ -18,7 +18,7 @@ Cargo git deps inside the pin (also HTTP 504 on git.dark.fi):
 | RandomX `0e31d5a` | `https://codeberg.org/darkrenaissance/RandomX` |
 | `rust-url` branch `v258` | `https://github.com/darkrenaissance/rust-url` |
 
-Current pin: `44ec78b6efbf1d3e797f99bffe95195994b2488d` (`nighthawk-testnet`). The crates path-depend on `../darkfi-nighthawk-testnet`, so this is the checkout those builds use, not a git `rev`.
+Current pin: `9d7ceaf77da7ccfd29ead3ba168fab284decd8c8` (`nighthawk-testnet`, includes iOS rusage skip). The crates path-depend on `../darkfi-nighthawk-testnet`, so this is the checkout those builds use, not a git `rev`.
 
 ## Wallet crypto note
 

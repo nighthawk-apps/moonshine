@@ -2504,7 +2504,7 @@ fn batch_open_blocks(
     secrets: &[Vec<u8>],
     blocks: &[crate::client::proto::CompactBlock],
 ) -> TrialHits {
-    use darkfi_sdk::crypto::diffie_hellman::sapling_ka_agree_batch;
+    use darkfi_sdk::crypto::diffie_hellman::sapling_ka_agree_batch as note_key_agree_batch;
     use darkfi_sdk::crypto::note::AeadEncryptedNote;
     use darkfi_sdk::crypto::SecretKey;
     use darkfi_serial::Decodable;
@@ -2581,7 +2581,7 @@ fn batch_open_blocks(
                 .iter()
                 .map(|index| jobs[*index].note.ephem_public)
                 .collect();
-            let shared = sapling_ka_agree_batch(&secret, &epks);
+            let shared = note_key_agree_batch(&secret, &epks);
             indexes
                 .iter()
                 .zip(shared)
