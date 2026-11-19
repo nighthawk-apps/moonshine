@@ -476,6 +476,58 @@ impl LightwalletClient {
         Ok(response.into_inner())
     }
 
+    /// Fetch a raw serialized transaction by hash (mempool or mined chain).
+    pub async fn get_transaction(
+        &mut self,
+        tx_hash: &[u8],
+    ) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        if tx_hash.len() != 32 {
+            return Err(format!("tx_hash must be 32 bytes, got {}", tx_hash.len()).into());
+        }
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        match client
+            .get_transaction(proto::TxHash {
+                hash: tx_hash.to_vec(),
+            })
+            .await
+        {
+            Ok(resp) => {
+                let data = resp.into_inner().data;
+                if data.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(data))
+                }
+            }
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(format!("GetTransaction RPC: {status}").into()),
+        }
+    }
+
+    /// Confirm `tx_hash` landed in lightwalletd's mempool or chain before reporting Broadcasted.
+    pub async fn confirm_transaction_in_mempool(
+        &mut self,
+        tx_hash: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        let mut last_err = "transaction not found in lightwalletd mempool".to_string();
+        for (attempt, delay_ms) in [0u64, 400, 800, 1200].into_iter().enumerate() {
+            if attempt > 0 && delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            match self.get_transaction(tx_hash).await {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    last_err = "transaction not found in lightwalletd mempool".to_string();
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+        Err(last_err.into())
+    }
+
     /// Stream compact blocks over a contiguous range.
     pub async fn get_block_range(
         &mut self,

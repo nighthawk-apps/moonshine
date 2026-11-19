@@ -33,7 +33,9 @@ pub fn phase(phase: &'static str) {
 pub fn emit_fail(reason: &str) {
     SCOPE.with(|slot| {
         if let Some((kind, phase)) = *slot.borrow() {
-            emit(kind, phase, "fail", "failed", "", None, "", None, "", reason);
+            emit(
+                kind, phase, "fail", "failed", "", None, "", None, "", reason,
+            );
         }
     });
 }
@@ -53,12 +55,8 @@ pub fn emit(
 ) {
     let hash = blank(hash);
     let token = blank(token);
-    let height = height
-        .map(|h| h.to_string())
-        .unwrap_or_else(|| "-".into());
-    let amount = amount
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "-".into());
+    let height = height.map(|h| h.to_string()).unwrap_or_else(|| "-".into());
+    let amount = amount.map(|a| a.to_string()).unwrap_or_else(|| "-".into());
     println!(
         "tx-status kind={kind} phase={phase} result={result} state={state} hash={hash} height={height}{} amount={amount}{}{}",
         field("token", token),

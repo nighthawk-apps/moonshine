@@ -44,12 +44,13 @@ parent/
 Reuse the Android vendored tree (same pin) instead of a second clone:
 
 ```bash
-# from the parent/ directory that contains moonshine/
-ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
-# Cargo git deps inside that tree (git.dark.fi returns HTTP 504):
-#   kvdb-overlay  https://gitlab.com/nighthawk24/kvdb-overlay  accd2689
-#   RandomX       https://codeberg.org/darkrenaissance/RandomX 0e31d5a
-#   rust-url      https://github.com/darkrenaissance/rust-url  branch v258
+# Clean setup on a new Mac:
+brew install protobuf
+
+# Sibling darkfi checkout at required pin (44ec78b6e):
+git -C ../darkfi worktree add --detach ../darkfi-nighthawk-testnet origin/nighthawk-testnet
+# Or reuse the Android pin:
+# ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
 ```
 
 Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
@@ -86,13 +87,16 @@ cargo test
 
 ## Configuration
 
-`~/.config/moonshine/config.toml` (created on first run):
+`~/.config/moonshine/config.toml` (created on first run; default testnet lightwalletd is Mac Studio ngrok TLS with Tor enabled):
 
 ```toml
-server_url = "http://127.0.0.1:9067"
+server_url = "https://epidermis-sandbox-marshland.ngrok-free.dev"
 network = "testnet"
-use_tor = false
+tls_pin_sha256 = "c02faee24a8cf271aa91c28b942949ba10ec4413c6d427a598b15a5467978824"
+use_tor = true
 ```
+
+`moonshine tx send` and `moonshine tx broadcast` report **Broadcasted** only after confirming the transaction landed in lightwalletd's mempool via `GetTransaction`.
 
 ```bash
 # Local LWD (Tor auto-skipped for loopback):

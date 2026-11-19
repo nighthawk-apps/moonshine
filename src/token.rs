@@ -1,6 +1,7 @@
 //! Money token mint / freeze — light-client builders via lightwalletd zkas.
 
 use crate::db::WalletDb;
+use darkfi::zk::halo2::Field;
 use darkfi::{
     tx::{ContractCallLeaf, TransactionBuilder},
     zk::{proof::ProvingKey, vm::ZkCircuit, vm_heap::empty_witnesses},
@@ -15,7 +16,6 @@ use darkfi_money_contract::{
     MoneyFunction, MONEY_CONTRACT_ZKAS_AUTH_TOKEN_FREEZE_NS_V1,
     MONEY_CONTRACT_ZKAS_AUTH_TOKEN_MINT_NS_V1, MONEY_CONTRACT_ZKAS_TOKEN_MINT_NS_V1,
 };
-use darkfi::zk::halo2::Field;
 use darkfi_sdk::{
     crypto::{
         contract_id::MONEY_CONTRACT_ID, poseidon_hash, BaseBlind, Blind, FuncId, FuncRef, Keypair,
@@ -106,7 +106,10 @@ fn load_authority(
     token_or_alias: &str,
 ) -> Result<(TokenId, SecretKey, BaseBlind), Box<dyn Error>> {
     let Some((tid, auth_bytes, blind_bytes, frozen)) = db.get_token_mint(token_or_alias)? else {
-        return Err(format!("unknown token mint '{token_or_alias}' — generate-mint or import first").into());
+        return Err(format!(
+            "unknown token mint '{token_or_alias}' — generate-mint or import first"
+        )
+        .into());
     };
     if frozen {
         return Err(format!("token mint '{tid}' is frozen in this wallet").into());
@@ -237,7 +240,11 @@ pub async fn build_freeze_builder(
         data,
     };
     let tx_builder = TransactionBuilder::new(
-        ContractCallLeaf::new(freeze_call, freeze_debris.proofs, vec![mint_authority.secret]),
+        ContractCallLeaf::new(
+            freeze_call,
+            freeze_debris.proofs,
+            vec![mint_authority.secret],
+        ),
         vec![],
     )?;
     Ok((tx_builder, token_id))

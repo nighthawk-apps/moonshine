@@ -55,10 +55,12 @@ fn default_use_tor() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // MacBook Pro loopback LWD (not Studio/ngrok). Remote HTTPS still needs a pin.
-            server_url: "http://127.0.0.1:9067".to_string(),
+            // Default Mac Studio ngrok TLS endpoint with pinned leaf certificate.
+            server_url: "https://epidermis-sandbox-marshland.ngrok-free.dev".to_string(),
             network: "testnet".to_string(),
-            tls_pin_sha256: None,
+            tls_pin_sha256: Some(
+                "c02faee24a8cf271aa91c28b942949ba10ec4413c6d427a598b15a5467978824".to_string(),
+            ),
             use_tor: default_use_tor(),
             explorer_url: None,
             experimental_unifomr: false,

@@ -87,6 +87,9 @@ mod tests {
 
     #[test]
     fn bare_address_omits_query() {
-        assert_eq!(build_payment_uri("drk1abc", None, Some("  ")), "drk:drk1abc");
+        assert_eq!(
+            build_payment_uri("drk1abc", None, Some("  ")),
+            "drk:drk1abc"
+        );
     }
 }

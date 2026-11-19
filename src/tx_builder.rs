@@ -317,8 +317,7 @@ pub async fn build_transaction_extended(
                 };
                 // Fee must be paid in native DRK (upstream 0f985c7cf), not the
                 // transfer token — custom-token change cannot cover fees.
-                if note.value < fee
-                    || note.token_id != *darkfi_money_contract::model::DARK_TOKEN_ID
+                if note.value < fee || note.token_id != *darkfi_money_contract::model::DARK_TOKEN_ID
                 {
                     continue;
                 }

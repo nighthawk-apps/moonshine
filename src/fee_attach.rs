@@ -19,11 +19,11 @@ use darkfi_money_contract::{
     MoneyFunction, MONEY_CONTRACT_ZKAS_FEE_NS_V1,
 };
 use darkfi_sdk::{
+    crypto::pasta_prelude::PrimeField,
     crypto::{
         contract_id::MONEY_CONTRACT_ID, note::AeadEncryptedNote, poseidon_hash, Blind, FuncId,
         MerkleNode, MerkleTree, PublicKey, SecretKey,
     },
-    crypto::pasta_prelude::PrimeField,
     pasta::pallas,
     tx::ContractCall,
 };
@@ -60,24 +60,22 @@ pub async fn finish_with_native_fee(
 
     let spent_nullifiers = collect_spent_nullifiers(&mut tx_builder).await?;
 
-    let (coin, fee_tree, is_tx_local) =
-        if let Some((coin, local_tree)) =
-            mark_tx_local_output_for_fee(&mut tx_builder, wallet_secrets, &spent_nullifiers, fee)?
-        {
-            (coin, local_tree, true)
-        } else {
-            let coin = fee_coin.ok_or(
-                "Not enough native tokens to pay for fee (need leftover DRK or change ≥ fee)",
-            )?;
-            let tree = tree.ok_or("Money Merkle tree missing for fee coin")?;
-            if coin.note.value < fee {
-                return Err("fee coin too small".into());
-            }
-            if spent_nullifiers.contains(&coin.nullifier()) {
-                return Err("fee coin already spent in this transaction".into());
-            }
-            (coin, tree.clone(), false)
-        };
+    let (coin, fee_tree, is_tx_local) = if let Some((coin, local_tree)) =
+        mark_tx_local_output_for_fee(&mut tx_builder, wallet_secrets, &spent_nullifiers, fee)?
+    {
+        (coin, local_tree, true)
+    } else {
+        let coin = fee_coin
+            .ok_or("Not enough native tokens to pay for fee (need leftover DRK or change ≥ fee)")?;
+        let tree = tree.ok_or("Money Merkle tree missing for fee coin")?;
+        if coin.note.value < fee {
+            return Err("fee coin too small".into());
+        }
+        if spent_nullifiers.contains(&coin.nullifier()) {
+            return Err("fee coin already spent in this transaction".into());
+        }
+        (coin, tree.clone(), false)
+    };
 
     let expected_root = if is_tx_local {
         fee_tree.root(0)

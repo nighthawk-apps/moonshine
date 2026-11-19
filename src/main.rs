@@ -1083,8 +1083,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                         .into(),
                                 );
                             }
+                            let confirm_hash: [u8; 32] = if resp.tx_hash.len() == 32 {
+                                resp.tx_hash
+                                    .clone()
+                                    .try_into()
+                                    .unwrap_or(*tx.hash().inner())
+                            } else {
+                                *tx.hash().inner()
+                            };
+                            if let Err(e) = broadcast_client
+                                .confirm_transaction_in_mempool(&confirm_hash)
+                                .await
+                            {
+                                eprintln!("TX hex written to {}", last_tx_path.display());
+                                return Err(format!(
+                                    "Transaction not confirmed in lightwalletd mempool ({e}). Refusing to mark as Broadcasted."
+                                )
+                                .into());
+                            }
                             println!(
-                                "Lightwalletd accepted the transaction (unconfirmed until it is in a block)."
+                                "Broadcasted (confirmed in lightwalletd mempool; awaiting block confirmation)."
                             );
                             tx_status::emit(
                                 "send",
@@ -1359,28 +1377,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         };
                         tx_status::phase("broadcast");
                         let tx_hash = tx_hash_hex(&raw_tx);
+                        let fallback_hash_bytes = tx_hash_bytes(&raw_tx);
                         match client
-                            .send_transaction(raw_tx, omr_clue, vec![], vec![], 0)
+                            .send_transaction(raw_tx, omr_clue.clone(), vec![], vec![], 0)
                             .await
                         {
                             Ok(resp) => {
-                                if resp.error.is_empty() || resp.error == "0" {
-                                    println!(
-                                        "Broadcast OK via lightwalletd (UnifOMR clue hint stored, 24h TTL)"
-                                    );
-                                    tx_status::emit(
-                                        "broadcast",
-                                        "broadcast",
-                                        "success",
-                                        "confirming",
-                                        &tx_hash,
-                                        Some(0),
-                                        "",
-                                        None,
-                                        "",
-                                        "",
-                                    );
-                                } else {
+                                if !resp.error.is_empty() && resp.error != "0" {
                                     tx_status::emit(
                                         "broadcast",
                                         "broadcast",
@@ -1394,6 +1397,64 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                         &resp.error,
                                     );
                                     eprintln!("Broadcast error: {}", resp.error);
+                                } else if !omr_clue.is_empty() && !resp.clue_accepted {
+                                    let reason = "lightwalletd accepted the tx but rejected the UnifOMR clue (clue_accepted=false)";
+                                    tx_status::emit(
+                                        "broadcast",
+                                        "broadcast",
+                                        "fail",
+                                        "failed",
+                                        &tx_hash,
+                                        None,
+                                        "",
+                                        None,
+                                        "",
+                                        reason,
+                                    );
+                                    eprintln!("Broadcast error: {reason}");
+                                } else {
+                                    let hash_bytes = if resp.tx_hash.len() == 32 {
+                                        resp.tx_hash.clone()
+                                    } else {
+                                        fallback_hash_bytes.unwrap_or_default()
+                                    };
+                                    match client.confirm_transaction_in_mempool(&hash_bytes).await {
+                                        Ok(()) => {
+                                            println!(
+                                                "Broadcasted via lightwalletd (confirmed in mempool; UnifOMR clue hint stored, 24h TTL)"
+                                            );
+                                            tx_status::emit(
+                                                "broadcast",
+                                                "broadcast",
+                                                "success",
+                                                "confirming",
+                                                &tx_hash,
+                                                Some(0),
+                                                "",
+                                                None,
+                                                "",
+                                                "",
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let reason = format!(
+                                                "not confirmed in lightwalletd mempool: {e}"
+                                            );
+                                            tx_status::emit(
+                                                "broadcast",
+                                                "broadcast",
+                                                "fail",
+                                                "failed",
+                                                &tx_hash,
+                                                None,
+                                                "",
+                                                None,
+                                                "",
+                                                &reason,
+                                            );
+                                            eprintln!("Broadcast error: {reason}");
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -2416,6 +2477,14 @@ fn tx_hash_hex(raw: &[u8]) -> String {
         Ok(tx) => format!("{}", tx.hash()),
         Err(_) => "-".into(),
     }
+}
+
+fn tx_hash_bytes(raw: &[u8]) -> Option<Vec<u8>> {
+    use darkfi::tx::Transaction;
+    use darkfi_serial::Decodable;
+    Transaction::decode(&mut std::io::Cursor::new(raw))
+        .ok()
+        .map(|tx| tx.hash().inner().to_vec())
 }
 
 fn display_kind<'a>(kind: &'a str, direction: &'a str) -> &'a str {

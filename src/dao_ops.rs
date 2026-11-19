@@ -54,7 +54,8 @@ pub fn create_dao(
     let proposals_sec_b58 = bs58::encode(darkfi_serial::serialize(&proposals.secret)).into_string();
     let votes_sec_b58 = bs58::encode(darkfi_serial::serialize(&votes.secret)).into_string();
     let exec_sec_b58 = bs58::encode(darkfi_serial::serialize(&exec.secret)).into_string();
-    let early_exec_sec_b58 = bs58::encode(darkfi_serial::serialize(&early_exec.secret)).into_string();
+    let early_exec_sec_b58 =
+        bs58::encode(darkfi_serial::serialize(&early_exec.secret)).into_string();
     let bulla_blind_b58 = bs58::encode(darkfi_serial::serialize(&bulla_blind)).into_string();
 
     // Emit both drk-compatible keys (*_secret_key, *_public_key) and Moonshine keys
