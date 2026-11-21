@@ -13,7 +13,7 @@ under DAO control, vote, and pay those funds out early.
 
 The long command log below is from a real `drk` run on 31 October 2026 against
 `darkfid` built from the DarkFi pin Moonshine uses (`nighthawk24/darkfi`, branch
-`nighthawk-testnet`, commit `9d7ceaf77fbf1d3e797f99bffe95195994b2488d`). See
+`nighthawk-testnet`, commit `9d7ceaf77da7ccfd29ead3ba168fab284decd8c8`). See
 [darkfi-pin.md](darkfi-pin.md). A Moonshine 3.1.6 localnet path (token mint → DAO
 mint → Deployooor deploy/lock through `darkfi-lightwalletd`) was verified on
 7 November 2026.
