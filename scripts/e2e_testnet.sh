@@ -29,7 +29,12 @@ MOONSHINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DARKFI_DIR="$(cd "$MOONSHINE_DIR/../darkfi-nighthawk-testnet" && pwd)"
 LIGHTWALLETD_DIR="$(cd "$MOONSHINE_DIR/../darkfi-lightwalletd" && pwd)"
 ANDROID_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-android-wallet" && pwd)"
-IOS_FFI_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-ios-wallet/rust/darkfi-mobile-ffi" && pwd)"
+IOS_DIR="$MOONSHINE_DIR/../nighthawk-ios-wallet"
+IOS_FFI_DIR="$IOS_DIR/rust/darkfi-mobile-ffi"
+IOS_BUILD_SCRIPT="$IOS_DIR/scripts/build-darkfi-mobile-ffi-ios.sh"
+if [ -d "$IOS_FFI_DIR" ]; then
+    IOS_FFI_DIR="$(cd "$IOS_FFI_DIR" && pwd)"
+fi
 # Prefer an already-running testnet stack (do not kill external darkfid).
 KEEP_EXTERNAL_STACK=false
 EXTERNAL_LIGHTWALLETD=false
@@ -190,7 +195,7 @@ if [ "$SKIP_MOBILE_TESTS" = false ]; then
         report PASS "android mobile-ffi: $FFI_TOTAL tests passed"
     fi
 
-    if [ -d "$IOS_FFI_DIR" ]; then
+    if [ -f "$IOS_FFI_DIR/Cargo.toml" ]; then
         echo "  Running iOS mobile FFI unit tests..."
         cd "$IOS_FFI_DIR"
         IOS_FFI_OUTPUT=$(cargo test --lib 2>&1)
@@ -204,6 +209,15 @@ if [ "$SKIP_MOBILE_TESTS" = false ]; then
             report FAIL "ios mobile-ffi: tests failed"
         else
             report PASS "ios mobile-ffi: $IOS_FFI_TOTAL tests passed"
+        fi
+    elif [ -f "$IOS_BUILD_SCRIPT" ]; then
+        echo "  Verifying unified iOS mobile FFI build script..."
+        if bash -n "$IOS_BUILD_SCRIPT" && \
+           grep -q "nighthawk-android-wallet/rust/darkfi-mobile-ffi" "$IOS_BUILD_SCRIPT" && \
+           ! echo "$FFI_RESULTS" | grep -q "FAILED"; then
+            report PASS "ios mobile-ffi: unified via shared crate ($FFI_TOTAL tests passed)"
+        else
+            report FAIL "ios mobile-ffi: unified shared crate or build script check failed"
         fi
     fi
 else
