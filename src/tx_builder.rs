@@ -226,8 +226,7 @@ pub async fn build_transaction_extended(
     let burn_pk = ProvingKey::build(burn_zkbin.k, &burn_circuit);
     let fee_pk = ProvingKey::build(fee_zkbin.k, &fee_circuit);
 
-    // Transfer call (upstream make_transfer_call: no payment_memo arg;
-    // notes currently use empty memo in money client builder).
+    // Transfer call. The pinned DarkFi builder takes the recipient memo.
 
     let mut spendable = Vec::with_capacity(all_coins.len());
     for coin in all_coins {
@@ -278,8 +277,8 @@ pub async fn build_transaction_extended(
         burn_zkbin,
         burn_pk,
         half_split,
+        payment_memo.unwrap_or_default(),
     )?;
-    let _ = payment_memo; // retained in local tx history by caller when present
 
     let mut spent_commitments: Vec<Vec<u8>> = spent_coins.iter().map(own_coin_commitment).collect();
     let mut spent_nullifiers: Vec<Vec<u8>> = spent_coins.iter().map(own_coin_nullifier).collect();
