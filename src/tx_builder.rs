@@ -82,7 +82,7 @@ pub(crate) fn assert_witness_at_tip(
     if witnessed != tip_root {
         return Err(format!(
             "Merkle witness for leaf {position} hashes to {} but tree tip is {}. \
-             Rebuild with: moonshine sync --rebuild-merkle --allow-trial",
+             Rebuild with: moonshine sync --rebuild-merkle --force-trial",
             hex::encode(witnessed.to_bytes()),
             hex::encode(tip_root.to_bytes()),
         )
@@ -242,7 +242,7 @@ pub async fn build_transaction_extended(
     if spendable.is_empty() {
         return Err(
             "No spendable coins with a valid Merkle witness. Rebuild with: \
-             moonshine sync --rebuild-merkle --allow-trial"
+             moonshine sync --rebuild-merkle --force-trial"
                 .into(),
         );
     }

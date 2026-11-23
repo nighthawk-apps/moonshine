@@ -1,6 +1,6 @@
 # Moonshine Wallet CLI
 
-**Moonshine 3.1.18** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. DarkFi pin `9d7ceaf77`. Same release as Android/iOS 3.01.18 and desktop 3.1.18. Aligns with lightwalletd 0.3.11.
+**Moonshine 3.1.19** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. DarkFi pin `9d7ceaf77`. Same release as Android/iOS 3.01.19 and desktop 3.1.19. Aligns with lightwalletd 0.3.12.
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 

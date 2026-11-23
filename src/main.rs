@@ -105,10 +105,6 @@ enum Command {
                     stay invisible. Default is padded trial decryption."
         )]
         unifomr: bool,
-        #[arg(long, hide = true, help = "Deprecated alias of trial decryption")]
-        allow_trial: bool,
-        #[arg(long, hide = true, help = "Deprecated alias of --unifomr")]
-        strict_omr: bool,
         /// Rebuild the Money Merkle tree from LWD `GetNoteCommitments` (height 0..=tip).
         /// Sync/spend also do this automatically when a birthday rescan skipped
         /// earlier commitments (Money Custom(5) / TransferMerkleRootNotFound).
@@ -1522,8 +1518,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Sync {
             force_trial,
             unifomr,
-            allow_trial: _deprecated_allow,
-            strict_omr: deprecated_strict,
             rebuild_merkle,
         } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
@@ -1536,8 +1530,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
-            let strict_omr =
-                (unifomr || deprecated_strict || config.experimental_unifomr) && !force_trial;
+            let strict_omr = (unifomr || config.experimental_unifomr) && !force_trial;
             if !strict_omr {
                 println!("Syncing with padded trial decryption...");
             } else {
