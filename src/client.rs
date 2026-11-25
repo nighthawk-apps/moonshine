@@ -50,9 +50,10 @@ const MAX_GRPC_MESSAGE_BYTES: usize = 160 * 1024 * 1024;
 /// Must be ≥ lightwalletd `request_timeout_s` (1800). Per-message SIMD encode
 /// of one Param2 chunk (D=4096, ℓ=2) can exceed 5 minutes.
 const GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+const GRPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Exact-host loopback check. `https://localhost.evil.com` is remote.
-fn host_is_loopback(server_url: &str) -> bool {
+pub fn host_is_loopback(server_url: &str) -> bool {
     let rest = server_url.split("://").nth(1).unwrap_or(server_url);
     let authority = rest.split('/').next().unwrap_or(rest);
     let hostport = authority
@@ -288,6 +289,7 @@ impl LightwalletClient {
             self.connect_with_pin(pin_hash).await?
         } else {
             let endpoint = tonic::transport::Endpoint::from_shared(self.server_url.clone())?
+                .connect_timeout(GRPC_CONNECT_TIMEOUT)
                 .timeout(GRPC_TIMEOUT);
             let channel = endpoint.connect().await?;
             DarkFiLightWalletClient::new(channel)
@@ -366,6 +368,7 @@ impl LightwalletClient {
             uri
         };
         let channel = tonic::transport::Endpoint::from_shared(origin)?
+            .connect_timeout(GRPC_CONNECT_TIMEOUT)
             .timeout(GRPC_TIMEOUT)
             .connect_with_connector(connector)
             .await?;
@@ -835,5 +838,17 @@ mod tests {
         assert!(host_is_loopback("http://[::1]:9067"));
         assert!(!host_is_loopback("https://localhost.evil.com:443"));
         assert!(!host_is_loopback("https://lwd.example:9067"));
+    }
+
+    #[test]
+    fn parse_tls_pin_hex_validates_length_and_chars() {
+        let valid = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let bytes = parse_tls_pin_hex(valid).unwrap();
+        assert_eq!(bytes[0], 0xaa);
+        assert_eq!(bytes[31], 0x99);
+        let colon_fmt = "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99";
+        assert_eq!(parse_tls_pin_hex(colon_fmt).unwrap(), bytes);
+        assert!(parse_tls_pin_hex("short").is_err());
+        assert!(parse_tls_pin_hex(&format!("{valid}00")).is_err());
     }
 }

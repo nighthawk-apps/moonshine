@@ -134,13 +134,62 @@ mod tests {
         )
         .unwrap();
 
-        db.mark_note_spent(&[1]).unwrap();
-        db.mark_note_spent(&[2]).unwrap();
+        db.insert_note(
+            "tx4_recent_spend",
+            0,
+            400,
+            "DRK",
+            &[4],
+            50,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[4]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.insert_note(
+            "tx5_reserved",
+            0,
+            500,
+            "DRK",
+            &[5],
+            50,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[5]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+
+        db.mark_note_spent_at(&[1], Some(150)).unwrap();
+        db.mark_note_spent_at(&[2], Some(250)).unwrap();
+        // Old coin spent recently (above cutoff 4000) must NOT be pruned.
+        db.mark_note_spent_at(&[4], Some(4500)).unwrap();
+        // Unconfirmed broadcast reservation (spent_height IS NULL) must NOT be pruned.
+        db.reserve_note(&[5], 4999).unwrap();
 
         let result = prune_wallet(&db).unwrap();
         assert_eq!(result.notes_pruned, 2);
 
         // Unspent note at height 4500 should still exist
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 300);
+        // Reorg above 4200 must unspend tx4 (proving it was not pruned).
+        db.invalidate_above_height(4200).unwrap();
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 400);
+        // Releasing stale reservation restores tx5 (proving it was not pruned).
+        assert_eq!(db.release_stale_reservations(5020, 8).unwrap(), 1);
+        assert_eq!(db.confirmed_balance("DRK").unwrap(), 900);
     }
 }

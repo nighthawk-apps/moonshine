@@ -26,6 +26,8 @@
 //! with a passphrase from `MOONSHINE_WALLET_PASS` or `{path}.pass` (0600).
 
 use rusqlite::{params, Connection, Result as SqlResult};
+use std::path::Path;
+use zeroize::Zeroize;
 
 /// Local wallet database backed by SQLCipher.
 pub struct WalletDb {
@@ -34,19 +36,46 @@ pub struct WalletDb {
     wrap_key: [u8; 32],
 }
 
+impl Drop for WalletDb {
+    fn drop(&mut self) {
+        self.wrap_key.zeroize();
+    }
+}
+
+/// `(height, tx_hash, kind, bulla)` from `dao_calls`.
+pub type DaoCallRow = (u32, Vec<u8>, u32, Vec<u8>);
+/// `(height, tx_hash, kind, bulla, payload)` from `dao_calls`.
+pub type DaoCallFullRow = (u32, Vec<u8>, u32, Vec<u8>, Vec<u8>);
+/// `(token_id, mint_authority, token_blind, alias, is_frozen, freeze_height)`.
+pub type TokenMintRow = (String, Vec<u8>, Vec<u8>, Option<String>, bool, Option<u32>);
+/// `(token_id, mint_authority, token_blind, is_frozen)`.
+pub type TokenMintLookup = (String, Vec<u8>, Vec<u8>, bool);
+/// `(name, bulla, tx_hash)` from `dao_records`.
+pub type DaoRecordRow = (String, Option<String>, Option<String>);
+
 impl WalletDb {
     /// Open or create the wallet database at the given path.
     pub fn open(path: &str) -> SqlResult<Self> {
         let passphrase = crate::secret_wrap::load_or_create_passphrase(path)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                crate::secret_wrap::ensure_dir_0700(parent)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            }
+        }
         let conn = Connection::open(path)?;
+        crate::secret_wrap::set_file_mode_0600(Path::new(path))
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
         // SQLCipher: unlock / encrypt the database with the wallet passphrase.
-        conn.pragma_update(None, "key", &passphrase)?;
+        conn.pragma_update(None, "key", passphrase.as_str())?;
         let mut db = Self {
             conn,
             wrap_key: [0u8; 32],
         };
         db.initialize()?;
+        let _ = crate::secret_wrap::set_file_mode_0600(Path::new(&format!("{path}-wal")));
+        let _ = crate::secret_wrap::set_file_mode_0600(Path::new(&format!("{path}-shm")));
         // The wrap key lives inside the encrypted DB. A legacy `{path}.wrapkey`
         // file is imported once, then removed so the key is not sitting beside
         // the ciphertext.
@@ -56,7 +85,7 @@ impl WalletDb {
             crate::secret_wrap::delete_legacy_wrap_key(path);
             return Ok(db);
         }
-        let wrap_key = match crate::secret_wrap::read_legacy_wrap_key(path)
+        let mut wrap_key = match crate::secret_wrap::read_legacy_wrap_key(path)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
         {
             Some(key) => key,
@@ -76,14 +105,18 @@ impl WalletDb {
                     "wrap key missing from wallet_meta after store".into(),
                 )
             })?;
-        let check = crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase)
+        let mut check = crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
         if check != wrap_key {
+            wrap_key.zeroize();
+            check.zeroize();
             return Err(rusqlite::Error::ToSqlConversionFailure(
                 "wrap key round-trip mismatch".into(),
             ));
         }
         db.wrap_key = wrap_key;
+        wrap_key.zeroize();
+        check.zeroize();
         crate::secret_wrap::delete_legacy_wrap_key(path);
         Ok(db)
     }
@@ -458,7 +491,7 @@ impl WalletDb {
     }
 
     /// Synced compact DAO calls (most recent first).
-    pub fn list_dao_calls(&self, limit: u32) -> SqlResult<Vec<(u32, Vec<u8>, u32, Vec<u8>)>> {
+    pub fn list_dao_calls(&self, limit: u32) -> SqlResult<Vec<DaoCallRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT height, tx_hash, kind, bulla FROM dao_calls \
              ORDER BY height DESC LIMIT ?1",
@@ -498,17 +531,18 @@ impl WalletDb {
         alias: Option<&str>,
     ) -> SqlResult<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO token_mints \
-             (token_id, mint_authority, token_blind, alias, is_frozen) \
-             VALUES (?1, ?2, ?3, ?4, 0)",
+            "INSERT INTO token_mints (token_id, mint_authority, token_blind, alias, is_frozen) \
+             VALUES (?1, ?2, ?3, ?4, 0) \
+             ON CONFLICT(token_id) DO UPDATE SET \
+               mint_authority = excluded.mint_authority, \
+               token_blind = excluded.token_blind, \
+               alias = COALESCE(excluded.alias, token_mints.alias)",
             rusqlite::params![token_id, mint_authority, token_blind, alias],
         )?;
         Ok(())
     }
 
-    pub fn list_token_mints(
-        &self,
-    ) -> SqlResult<Vec<(String, Vec<u8>, Vec<u8>, Option<String>, bool, Option<u32>)>> {
+    pub fn list_token_mints(&self) -> SqlResult<Vec<TokenMintRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT token_id, mint_authority, token_blind, alias, is_frozen, freeze_height \
              FROM token_mints ORDER BY alias IS NULL, alias, token_id",
@@ -526,13 +560,12 @@ impl WalletDb {
         rows.collect()
     }
 
-    pub fn get_token_mint(
-        &self,
-        token_or_alias: &str,
-    ) -> SqlResult<Option<(String, Vec<u8>, Vec<u8>, bool)>> {
+    pub fn get_token_mint(&self, token_or_alias: &str) -> SqlResult<Option<TokenMintLookup>> {
         let mut stmt = self.conn.prepare(
             "SELECT token_id, mint_authority, token_blind, is_frozen FROM token_mints \
-             WHERE token_id = ?1 OR alias = ?1 LIMIT 1",
+             WHERE token_id = ?1 OR alias = ?1 \
+             ORDER BY is_frozen ASC, token_id ASC \
+             LIMIT 1",
         )?;
         let mut rows = stmt.query_map([token_or_alias], |row| {
             Ok((
@@ -575,7 +608,7 @@ impl WalletDb {
         Ok(())
     }
 
-    pub fn list_dao_records(&self) -> SqlResult<Vec<(String, Option<String>, Option<String>)>> {
+    pub fn list_dao_records(&self) -> SqlResult<Vec<DaoRecordRow>> {
         let mut stmt = self
             .conn
             .prepare("SELECT name, bulla, tx_hash FROM dao_records ORDER BY name")?;
@@ -603,8 +636,10 @@ impl WalletDb {
 
     pub fn insert_deploy_auth(&self, contract_id: &str, secret_key: &[u8]) -> SqlResult<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO deploy_auths (contract_id, secret_key, is_locked) \
-             VALUES (?1, ?2, 0)",
+            "INSERT INTO deploy_auths (contract_id, secret_key, is_locked) \
+             VALUES (?1, ?2, 0) \
+             ON CONFLICT(contract_id) DO UPDATE SET \
+               secret_key = excluded.secret_key",
             rusqlite::params![contract_id, secret_key],
         )?;
         Ok(())
@@ -708,14 +743,16 @@ impl WalletDb {
             Vec<u8>,
         )>,
     > {
-        let mut stmt = self.conn.prepare(
+        let is_unhooked = Self::sql_note_unhooked("");
+        let query = format!(
             "SELECT tx_hash, output_index, value_raw, token_id, coin_blind, value_blind, token_blind, \
              spend_hook, spend_hook_bytes, user_data, leaf_position, commitment, owner_secret \
              FROM notes WHERE spent = 0 AND leaf_position IS NOT NULL \
              AND commitment IS NOT NULL AND length(commitment) = 32 \
-             AND owner_secret IS NOT NULL \
-             ORDER BY block_height",
-        )?;
+             AND owner_secret IS NOT NULL AND {is_unhooked} \
+             ORDER BY block_height"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
             let hook_i: u8 = row.get::<_, Option<u8>>(7)?.unwrap_or(0);
             let hook_bytes: Option<Vec<u8>> = row.get(8)?;
@@ -854,9 +891,11 @@ impl WalletDb {
         rows.collect()
     }
 
-    /// Retrieve all address secret keys for trial decryption.
+    /// Retrieve all address secret keys for trial decryption (default address first).
     pub fn get_all_secrets(&self) -> SqlResult<Vec<Vec<u8>>> {
-        let mut stmt = self.conn.prepare("SELECT secret_key FROM addresses")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT secret_key FROM addresses ORDER BY is_default DESC, id ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -866,6 +905,19 @@ impl WalletDb {
             out.push(plain);
         }
         Ok(out)
+    }
+
+    /// All wallet address secrets (default first) plus deduplicated DAO treasury `notes_secret` keys
+    /// for trial decryption across every sync / rebuild path.
+    pub fn get_all_trial_decrypt_secrets(&self) -> SqlResult<Vec<Vec<u8>>> {
+        let mut secrets = self.get_all_secrets()?;
+        let dao_secrets = self.get_all_dao_notes_secrets().unwrap_or_default();
+        for ds in dao_secrets {
+            if !secrets.iter().any(|sk| sk == &ds) {
+                secrets.push(ds);
+            }
+        }
+        Ok(secrets)
     }
 
     /// Retrieve addresses with secrets for multi-pubkey OMR (S17).
@@ -943,6 +995,9 @@ impl WalletDb {
     }
 
     /// Mark a note as spent when its **nullifier** appears on-chain.
+    ///
+    /// Release builds call [`Self::mark_note_spent_at`]. This wrapper stays for tests.
+    #[allow(dead_code)]
     pub fn mark_note_spent(&self, nullifier: &[u8]) -> SqlResult<usize> {
         self.mark_note_spent_at(nullifier, None)
     }
@@ -1012,6 +1067,10 @@ impl WalletDb {
     /// Mark a note spent by on-chain coin commitment (32-byte leaf).
     /// Used right after a successful broadcast so the next send cannot
     /// republish the same nullifier before `GetNullifiers` sees it.
+    ///
+    /// Callers reserve by commitment via [`Self::reserve_note_by_commitment`].
+    /// This wrapper stays for tests and for a height-less spend.
+    #[allow(dead_code)]
     pub fn mark_note_spent_by_commitment(&self, commitment: &[u8]) -> SqlResult<usize> {
         let rows = self.conn.execute(
             "UPDATE notes SET spent = 1 WHERE commitment = ?1 AND spent = 0",
@@ -1146,23 +1205,39 @@ impl WalletDb {
     pub fn list_token_balances(&self) -> SqlResult<Vec<(String, Option<String>, i64)>> {
         let is_unhooked = Self::sql_note_unhooked("n");
         let query = format!(
-            "SELECT n.token_id, m.alias, SUM(n.value_raw) as total \
+            "SELECT n.token_id, SUM(n.value_raw) as total \
              FROM notes n \
-             LEFT JOIN token_mints m ON (n.token_id = m.token_id) \
              WHERE n.spent = 0 AND {is_unhooked} \
              GROUP BY n.token_id \
              HAVING total > 0"
         );
+        // Map both Base58 token_mints.token_id and 64-char hex notes.token_id to alias.
+        let mut alias_by_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (mint_tid, _, _, alias, _, _) in self.list_token_mints()? {
+            if let Some(a) = alias {
+                alias_by_id
+                    .entry(mint_tid.clone())
+                    .or_insert_with(|| a.clone());
+                if let Some(hex_id) = Self::token_id_hex(&mint_tid) {
+                    alias_by_id.entry(hex_id).or_insert(a);
+                }
+            }
+        }
         let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
             let token_id: String = row.get(0)?;
-            let alias: Option<String> = row.get(1)?;
-            let total: i64 = row.get(2)?;
-            Ok((token_id, alias, total))
+            let total: i64 = row.get(1)?;
+            Ok((token_id, total))
         })?;
         let mut list = Vec::new();
         for r in rows {
-            list.push(r?);
+            let (token_id, total) = r?;
+            let alias = alias_by_id
+                .get(&token_id)
+                .or_else(|| Self::token_id_hex(&token_id).and_then(|h| alias_by_id.get(&h)))
+                .cloned();
+            list.push((token_id, alias, total));
         }
         list.sort_by(|a, b| {
             let a_is_drk = Self::is_drk_token(&a.0);
@@ -1197,7 +1272,7 @@ impl WalletDb {
         Ok(token_or_alias.to_string())
     }
 
-    /// Unspent coins held by a DAO treasury matching spend_hook and user_data (bulla).
+    /// Unspent coins held by a DAO treasury matching BOTH spend_hook and user_data (bulla).
     pub fn list_unspent_for_dao(
         &self,
         dao_spend_hook: &[u8],
@@ -1205,7 +1280,7 @@ impl WalletDb {
     ) -> SqlResult<Vec<(String, u32, i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT tx_hash, output_index, value_raw, token_id FROM notes \
-             WHERE spent = 0 AND (spend_hook_bytes = ?1 OR user_data = ?2) \
+             WHERE spent = 0 AND spend_hook_bytes = ?1 AND user_data = ?2 \
              ORDER BY block_height",
         )?;
         let rows = stmt.query_map(params![dao_spend_hook, dao_bulla], |row| {
@@ -1221,6 +1296,7 @@ impl WalletDb {
 
     /// Retrieve notes secrets from all stored DAO records so SyncEngine can trial-decrypt treasury notes.
     pub fn get_all_dao_notes_secrets(&self) -> SqlResult<Vec<Vec<u8>>> {
+        use darkfi_sdk::crypto::pasta_prelude::PrimeField;
         let mut stmt = self.conn.prepare("SELECT params_toml FROM dao_records")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut secrets = Vec::new();
@@ -1232,8 +1308,14 @@ impl WalletDb {
                         .get("notes_secret")
                         .or_else(|| table.get("notes_secret_key"))
                         .and_then(|v| v.as_str());
-                    if let Some(b58) = sec {
-                        if let Ok(bytes) = bs58::decode(b58).into_vec() {
+                    if let Some(raw) = sec {
+                        if let Ok(sk) = crate::dao_ops::sk_from_b58(raw) {
+                            secrets.push(sk.inner().to_repr().to_vec());
+                        } else if let Ok(bytes) = bs58::decode(raw).into_vec() {
+                            if bytes.len() >= 32 {
+                                secrets.push(bytes[..32].to_vec());
+                            }
+                        } else if let Ok(bytes) = hex::decode(raw.trim_start_matches("0x")) {
                             if bytes.len() >= 32 {
                                 secrets.push(bytes[..32].to_vec());
                             }
@@ -1246,10 +1328,7 @@ impl WalletDb {
     }
 
     /// Synced compact DAO calls including payload (ordered by height ascending for tree/replay).
-    pub fn list_dao_calls_full(
-        &self,
-        limit: u32,
-    ) -> SqlResult<Vec<(u32, Vec<u8>, u32, Vec<u8>, Vec<u8>)>> {
+    pub fn list_dao_calls_full(&self, limit: u32) -> SqlResult<Vec<DaoCallFullRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT height, tx_hash, kind, bulla, payload FROM dao_calls \
              ORDER BY height ASC LIMIT ?1",
@@ -1266,33 +1345,118 @@ impl WalletDb {
         rows.collect()
     }
 
+    const META_LAST_SYNCED_HASH: &'static str = "last_synced_hash";
+    const META_SYNCED_BLOCK_ANCHORS: &'static str = "synced_block_anchors";
+    const MAX_BLOCK_ANCHORS: usize = 128;
+
+    /// Record a canonical `(height, hash)` anchor for reorg continuity checks.
+    pub fn record_synced_block_hash(&self, height: u32, hash: &[u8]) -> SqlResult<()> {
+        if hash.len() != 32 {
+            return Ok(());
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(hash);
+
+        let mut anchors = self.get_synced_block_anchors()?;
+        anchors.retain(|(h, _)| *h != height);
+        anchors.push((height, hash_arr));
+        anchors.sort_by_key(|(h, _)| *h);
+        if anchors.len() > Self::MAX_BLOCK_ANCHORS {
+            let drop_n = anchors.len() - Self::MAX_BLOCK_ANCHORS;
+            anchors.drain(..drop_n);
+        }
+
+        let mut encoded = Vec::with_capacity(anchors.len() * 36);
+        for (h, bh) in &anchors {
+            encoded.extend_from_slice(&h.to_le_bytes());
+            encoded.extend_from_slice(bh);
+        }
+        self.set_meta(Self::META_SYNCED_BLOCK_ANCHORS, &encoded)?;
+
+        // Update `last_synced_hash` if this height is >= previously recorded one.
+        let update_last = match self.get_last_synced_hash()? {
+            Some((prev_h, _)) => height >= prev_h,
+            None => true,
+        };
+        if update_last {
+            let mut last = Vec::with_capacity(36);
+            last.extend_from_slice(&height.to_le_bytes());
+            last.extend_from_slice(&hash_arr);
+            self.set_meta(Self::META_LAST_SYNCED_HASH, &last)?;
+        }
+        Ok(())
+    }
+
+    /// Return the latest recorded `(height, hash)` pair, if any.
+    pub fn get_last_synced_hash(&self) -> SqlResult<Option<(u32, [u8; 32])>> {
+        let Some(bytes) = self.get_meta(Self::META_LAST_SYNCED_HASH)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 36 {
+            return Ok(None);
+        }
+        let h = u32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]));
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes[4..36]);
+        Ok(Some((h, arr)))
+    }
+
+    /// Return stored `(height, hash)` anchors in ascending height order.
+    pub fn get_synced_block_anchors(&self) -> SqlResult<Vec<(u32, [u8; 32])>> {
+        let Some(bytes) = self.get_meta(Self::META_SYNCED_BLOCK_ANCHORS)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(bytes.len() / 36);
+        for chunk in bytes.as_chunks::<36>().0 {
+            let h = u32::from_le_bytes(chunk[..4].try_into().unwrap_or([0; 4]));
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&chunk[4..36]);
+            out.push((h, arr));
+        }
+        out.sort_by_key(|(h, _)| *h);
+        Ok(out)
+    }
+
     /// Clear notes/tx history and Merkle tree, then rewind sync height (rescan).
     pub fn reset_for_rescan(&self, height: u32) -> SqlResult<()> {
-        self.conn.execute("DELETE FROM notes", [])?;
-        self.conn.execute("DELETE FROM transactions", [])?;
-        self.conn.execute(
-            "DELETE FROM wallet_meta WHERE key = 'tree_state' OR key = ?1",
-            params![Self::META_MERKLE_FROM_GENESIS],
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM notes", [])?;
+        tx.execute("DELETE FROM transactions", [])?;
+        tx.execute(
+            "DELETE FROM wallet_meta WHERE key IN \
+             ('tree_state', 'tree_applied_height', ?1, 'trial_synced_height', ?2, ?3)",
+            params![
+                Self::META_MERKLE_FROM_GENESIS,
+                Self::META_LAST_SYNCED_HASH,
+                Self::META_SYNCED_BLOCK_ANCHORS
+            ],
         )?;
-        self.set_sync_height(height)?;
-        self.conn.execute(
-            "DELETE FROM wallet_meta WHERE key = 'trial_synced_height'",
-            [],
+        tx.execute(
+            "UPDATE sync_state SET last_synced_height = ?1, last_sync_timestamp = datetime('now') WHERE id = 1",
+            params![height],
         )?;
-        self.conn.execute("DELETE FROM dao_calls", [])?;
-        self.conn.execute("DELETE FROM func_events", [])?;
+        tx.execute("DELETE FROM dao_calls", [])?;
+        tx.execute("DELETE FROM func_events", [])?;
+        tx.commit()?;
         Ok(())
     }
 
     /// Invalidate notes and transactions above a given height (reorg recovery).
     ///
-    /// Unlike `reset_for_rescan` which wipes everything, this preserves data
-    /// from confirmed blocks below the fork point.
+    /// Runs inside an atomic SQLite transaction. Preserves confirmed data below
+    /// the fork point while clearing the Merkle frontier (`tree_state`,
+    /// `tree_applied_height`, `merkle_from_genesis`, and unspent `leaf_position`)
+    /// so the next sync rebuilds a consistent Money tree without corrupting roots.
     pub fn invalidate_above_height(&self, height: u32) -> SqlResult<(u32, u32)> {
-        let notes_deleted = self
-            .conn
-            .execute("DELETE FROM notes WHERE block_height > ?1", params![height])?;
-        let txs_deleted = self.conn.execute(
+        // Snapshot anchors before opening the transaction so we can prune above `height`.
+        let mut anchors = self.get_synced_block_anchors()?;
+        anchors.retain(|(h, _)| *h <= height);
+        let prev_trial = self.get_meta("trial_synced_height")?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let notes_deleted =
+            tx.execute("DELETE FROM notes WHERE block_height > ?1", params![height])?;
+        let txs_deleted = tx.execute(
             "DELETE FROM transactions WHERE block_height > ?1",
             params![height],
         )?;
@@ -1300,38 +1464,65 @@ impl WalletDb {
         // `block_height` is the note's creation height, not its spend height.
         // Rows with a null `spent_height` (legacy, or reserved at broadcast)
         // stay spent so a reorg cannot resurrect historically spent coins.
-        self.conn.execute(
+        tx.execute(
             "UPDATE notes SET spent = 0, spent_height = NULL \
              WHERE spent = 1 AND spent_height IS NOT NULL AND spent_height > ?1",
             params![height],
         )?;
-        // The Merkle frontier included the orphaned blocks. Drop it so the
-        // next sync rebuilds from the fork instead of appending onto it.
-        self.conn
-            .execute("DELETE FROM wallet_meta WHERE key = 'tree_state'", [])?;
-        self.clamp_height_meta("trial_synced_height", height)?;
-        self.clamp_height_meta("tree_applied_height", height)?;
-        self.set_sync_height(height)?;
-        self.conn
-            .execute("DELETE FROM dao_calls WHERE height > ?1", params![height])?;
-        self.conn
-            .execute("DELETE FROM func_events WHERE height > ?1", params![height])?;
+        // Clear cached leaf positions on surviving unspent notes because the
+        // Merkle frontier is dropped below and will be rebuilt on next sync.
+        tx.execute("UPDATE notes SET leaf_position = NULL WHERE spent = 0", [])?;
+        // The Merkle frontier included the orphaned blocks. Drop tree_state,
+        // tree_applied_height, and merkle_from_genesis together so ensure_genesis_merkle
+        // rebuilds cleanly from genesis instead of appending onto an empty/stale tree.
+        tx.execute(
+            "DELETE FROM wallet_meta WHERE key IN ('tree_state', 'tree_applied_height', ?1)",
+            params![Self::META_MERKLE_FROM_GENESIS],
+        )?;
+        if anchors.is_empty() {
+            tx.execute(
+                "DELETE FROM wallet_meta WHERE key IN (?1, ?2)",
+                params![Self::META_LAST_SYNCED_HASH, Self::META_SYNCED_BLOCK_ANCHORS],
+            )?;
+        } else {
+            let mut encoded = Vec::with_capacity(anchors.len() * 36);
+            for (h, bh) in &anchors {
+                encoded.extend_from_slice(&h.to_le_bytes());
+                encoded.extend_from_slice(bh);
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO wallet_meta (key, value) VALUES (?1, ?2)",
+                params![Self::META_SYNCED_BLOCK_ANCHORS, encoded],
+            )?;
+            if let Some((last_h, last_bh)) = anchors.last() {
+                let mut last = Vec::with_capacity(36);
+                last.extend_from_slice(&last_h.to_le_bytes());
+                last.extend_from_slice(last_bh);
+                tx.execute(
+                    "INSERT OR REPLACE INTO wallet_meta (key, value) VALUES (?1, ?2)",
+                    params![Self::META_LAST_SYNCED_HASH, last],
+                )?;
+            }
+        }
+        if let Some(bytes) = prev_trial {
+            if bytes.len() == 4 {
+                let current = u32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 4]));
+                if current > height {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO wallet_meta (key, value) VALUES ('trial_synced_height', ?1)",
+                        params![height.to_le_bytes().as_slice()],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE sync_state SET last_synced_height = ?1, last_sync_timestamp = datetime('now') WHERE id = 1",
+            params![height],
+        )?;
+        tx.execute("DELETE FROM dao_calls WHERE height > ?1", params![height])?;
+        tx.execute("DELETE FROM func_events WHERE height > ?1", params![height])?;
+        tx.commit()?;
         Ok((notes_deleted as u32, txs_deleted as u32))
-    }
-
-    /// If `key` stores a height above `height`, lower it to `height`.
-    fn clamp_height_meta(&self, key: &str, height: u32) -> SqlResult<()> {
-        let Some(bytes) = self.get_meta(key)? else {
-            return Ok(());
-        };
-        if bytes.len() != 4 {
-            return Ok(());
-        }
-        let current = u32::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 4]));
-        if current > height {
-            self.set_meta(key, &height.to_le_bytes())?;
-        }
-        Ok(())
     }
 
     pub fn delete_meta(&self, key: &str) -> SqlResult<()> {
@@ -1340,11 +1531,14 @@ impl WalletDb {
         Ok(())
     }
 
-    /// List unspent notes.
+    /// List unspent, unhooked wallet notes (excludes contract-hooked / DAO treasury notes).
     pub fn list_unspent(&self) -> SqlResult<Vec<(String, u32, i64, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT tx_hash, output_index, value_raw, token_id FROM notes WHERE spent = 0 ORDER BY block_height",
-        )?;
+        let is_unhooked = Self::sql_note_unhooked("");
+        let query = format!(
+            "SELECT tx_hash, output_index, value_raw, token_id FROM notes \
+             WHERE spent = 0 AND {is_unhooked} ORDER BY block_height"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1508,10 +1702,11 @@ impl WalletDb {
     // Pruning
     // =========================================================================
 
-    /// Prune spent notes below a given height (data minimization).
+    /// Prune confirmed spent notes whose spend height is below `height` (data minimization).
+    /// Unconfirmed reservations (`spent_height IS NULL`) and recently spent old coins are preserved.
     pub fn prune_spent_below(&self, height: u32) -> SqlResult<usize> {
         let rows = self.conn.execute(
-            "DELETE FROM notes WHERE spent = 1 AND block_height < ?1",
+            "DELETE FROM notes WHERE spent = 1 AND spent_height IS NOT NULL AND spent_height < ?1",
             params![height],
         )?;
         Ok(rows)
@@ -1854,13 +2049,95 @@ mod tests {
             Some(&[9u8; 32]),
         )
         .unwrap();
-        db.mark_note_spent(&[1]).unwrap();
+        db.mark_note_spent_at(&[1], Some(52)).unwrap();
 
         let pruned = db.prune_spent_below(55).unwrap();
         assert_eq!(pruned, 1);
 
         // Unspent note still there
         assert_eq!(db.confirmed_balance("DRK").unwrap(), 200);
+    }
+
+    #[test]
+    fn test_prune_spent_below_preserves_reserved_and_recently_spent_old_coins() {
+        let db = WalletDb::in_memory().unwrap();
+        // Old coin (height 10) reserved at broadcast (spent_height IS NULL).
+        db.insert_note(
+            "tx_reserved",
+            0,
+            100,
+            "DRK",
+            &[1],
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.reserve_note(&[1], 1000).unwrap();
+
+        // Old coin (height 10) spent recently at height 950.
+        db.insert_note(
+            "tx_recent",
+            0,
+            200,
+            "DRK",
+            &[2],
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[2]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.mark_note_spent_at(&[2], Some(950)).unwrap();
+
+        // Old coin (height 10) spent long ago at height 100.
+        db.insert_note(
+            "tx_old",
+            0,
+            300,
+            "DRK",
+            &[3],
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[3]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.mark_note_spent_at(&[3], Some(100)).unwrap();
+
+        let pruned = db.prune_spent_below(500).unwrap();
+        assert_eq!(pruned, 1, "only tx_old spent at 100 should be pruned");
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "reserved and recently spent old coins must remain"
+        );
     }
 
     #[test]
@@ -2133,26 +2410,224 @@ mod tests {
     }
 
     #[test]
-    fn test_invalidate_clamps_scan_cursors() {
+    fn test_invalidate_clears_merkle_state_and_clamps_trial_cursor() {
         let db = WalletDb::in_memory().unwrap();
+        db.set_meta("tree_state", &[0xAA; 16]).unwrap();
+        db.set_merkle_from_genesis(true).unwrap();
         db.set_meta("trial_synced_height", &6_000u32.to_le_bytes())
             .unwrap();
         db.set_meta("tree_applied_height", &6_000u32.to_le_bytes())
             .unwrap();
+        db.record_synced_block_hash(90, &[0x11; 32]).unwrap();
+        db.record_synced_block_hash(120, &[0x22; 32]).unwrap();
+        db.insert_note(
+            "tx_keep",
+            0,
+            500,
+            "DRK",
+            &[7],
+            50,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(42),
+            Some(&[8u8; 32]),
+            Some(&[7]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+
         db.invalidate_above_height(100).unwrap();
+        assert_eq!(db.get_meta("tree_state").unwrap(), None);
+        assert_eq!(db.get_meta("tree_applied_height").unwrap(), None);
+        assert!(!db.merkle_from_genesis());
         assert_eq!(
             db.get_meta("trial_synced_height").unwrap().unwrap(),
             100u32.to_le_bytes()
         );
-        assert_eq!(
-            db.get_meta("tree_applied_height").unwrap().unwrap(),
-            100u32.to_le_bytes()
-        );
-        db.invalidate_above_height(150).unwrap();
-        assert_eq!(
-            db.get_meta("tree_applied_height").unwrap().unwrap(),
-            100u32.to_le_bytes()
-        );
+        assert_eq!(db.get_last_synced_hash().unwrap(), Some((90, [0x11; 32])));
+        let leaf_pos: Option<u32> = db
+            .conn
+            .query_row(
+                "SELECT leaf_position FROM notes WHERE tx_hash = 'tx_keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaf_pos, None, "leaf_position must be cleared on reorg");
+    }
+
+    #[test]
+    fn test_list_unspent_for_dao_requires_both_hook_and_bulla() {
+        let db = WalletDb::in_memory().unwrap();
+        let hook_dao = [0xA1u8; 32];
+        let hook_other = [0xB2u8; 32];
+        let bulla_a = [0x11u8; 32];
+        let bulla_b = [0x22u8; 32];
+
+        // DAO A treasury coin (matches hook_dao + bulla_a).
+        db.insert_note(
+            "tx_dao_a",
+            0,
+            1000,
+            "DRK",
+            &[1],
+            10,
+            None,
+            None,
+            None,
+            None,
+            Some(hook_dao[0]),
+            Some(&bulla_a),
+            Some(1),
+            Some(&[1u8; 32]),
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.set_spend_hook_bytes("tx_dao_a", 0, &hook_dao).unwrap();
+
+        // DAO B treasury coin (same hook_dao, different bulla_b).
+        db.insert_note(
+            "tx_dao_b",
+            0,
+            2000,
+            "DRK",
+            &[2],
+            11,
+            None,
+            None,
+            None,
+            None,
+            Some(hook_dao[0]),
+            Some(&bulla_b),
+            Some(2),
+            Some(&[2u8; 32]),
+            Some(&[2]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.set_spend_hook_bytes("tx_dao_b", 0, &hook_dao).unwrap();
+
+        // Unrelated hooked coin sharing bulla_a but different spend_hook.
+        db.insert_note(
+            "tx_other_hook",
+            0,
+            3000,
+            "DRK",
+            &[3],
+            12,
+            None,
+            None,
+            None,
+            None,
+            Some(hook_other[0]),
+            Some(&bulla_a),
+            Some(3),
+            Some(&[3u8; 32]),
+            Some(&[3]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.set_spend_hook_bytes("tx_other_hook", 0, &hook_other)
+            .unwrap();
+
+        let dao_a_coins = db.list_unspent_for_dao(&hook_dao, &bulla_a).unwrap();
+        assert_eq!(dao_a_coins.len(), 1);
+        assert_eq!(dao_a_coins[0].0, "tx_dao_a");
+        assert_eq!(dao_a_coins[0].2, 1000);
+
+        let dao_b_coins = db.list_unspent_for_dao(&hook_dao, &bulla_b).unwrap();
+        assert_eq!(dao_b_coins.len(), 1);
+        assert_eq!(dao_b_coins[0].0, "tx_dao_b");
+        assert_eq!(dao_b_coins[0].2, 2000);
+
+        // Hooked DAO coins must never appear in ordinary spendable queries.
+        assert!(db.list_unspent().unwrap().is_empty());
+        assert!(db.list_unspent_full().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_list_token_balances_resolves_alias_across_hex_and_base58() {
+        use darkfi_money_contract::model::TokenId;
+        use std::str::FromStr;
+
+        let db = WalletDb::in_memory().unwrap();
+        let b58_id = "DkKtPmBw2LKCpo5KXq5RKR7Cp3V4pTzVchtJ4kJaPjpK";
+        let id = TokenId::from_str(b58_id).unwrap();
+        let hex_id = hex::encode(id.to_bytes());
+
+        db.insert_token_mint(b58_id, &[1u8; 32], &[2u8; 32], Some("ANON"))
+            .unwrap();
+        db.insert_note(
+            "tx_tok",
+            0,
+            555_000,
+            &hex_id,
+            &[1],
+            50,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            None,
+            Some(1),
+            Some(&[7u8; 32]),
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+
+        let balances = db.list_token_balances().unwrap();
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].0, hex_id);
+        assert_eq!(balances[0].1.as_deref(), Some("ANON"));
+        assert_eq!(balances[0].2, 555_000);
+    }
+
+    #[test]
+    fn test_reimport_preserves_freeze_and_lock_state_and_prefers_unfrozen() {
+        let db = WalletDb::in_memory().unwrap();
+        db.insert_token_mint("tok_a", &[1u8; 32], &[2u8; 32], Some("SHARED"))
+            .unwrap();
+        db.set_token_frozen("tok_a", Some(123)).unwrap();
+        // Re-importing must preserve is_frozen and freeze_height.
+        db.insert_token_mint("tok_a", &[1u8; 32], &[2u8; 32], None)
+            .unwrap();
+        let rows = db.list_token_mints().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3.as_deref(), Some("SHARED"));
+        assert!(rows[0].4, "is_frozen must be preserved on re-import");
+        assert_eq!(rows[0].5, Some(123), "freeze_height must be preserved");
+
+        // Second mint sharing alias "SHARED" (unfrozen) must win get_token_mint.
+        db.insert_token_mint("tok_b", &[3u8; 32], &[4u8; 32], Some("SHARED"))
+            .unwrap();
+        let picked = db.get_token_mint("SHARED").unwrap().unwrap();
+        assert_eq!(picked.0, "tok_b");
+        assert!(!picked.3);
+
+        // Same preservation check for deploy_auths.
+        db.insert_deploy_auth("cid_1", &[5u8; 32]).unwrap();
+        db.set_deploy_locked("cid_1", Some(456)).unwrap();
+        db.insert_deploy_auth("cid_1", &[5u8; 32]).unwrap();
+        let auths = db.list_deploy_auths().unwrap();
+        assert_eq!(auths, vec![("cid_1".to_string(), true, Some(456))]);
+    }
+
+    #[test]
+    fn test_get_all_secrets_orders_default_first() {
+        let db = WalletDb::in_memory().unwrap();
+        db.insert_address("addr_first", &[1u8; 32]).unwrap();
+        db.insert_address("addr_second", &[2u8; 32]).unwrap();
+        db.set_default_address("addr_second").unwrap();
+        let secrets = db.get_all_secrets().unwrap();
+        assert_eq!(secrets[0], vec![2u8; 32]);
+        assert_eq!(secrets[1], vec![1u8; 32]);
     }
 
     #[test]

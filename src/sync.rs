@@ -100,6 +100,43 @@ pub fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &
     *hasher.finalize().as_bytes()
 }
 
+/// Shared lightwalletd preflight: checks proto major version (`get_light_info`),
+/// TOFU directory attestation pin (when a wallet DB is supplied), and `chain_name`
+/// network alignment before any write/spend/rebuild operation.
+pub async fn preflight_server_opt(
+    client: &mut LightwalletClient,
+    db: Option<&WalletDb>,
+    server_url: &str,
+    network: &str,
+) -> Result<crate::client::proto::LightInfo, Box<dyn std::error::Error>> {
+    let info = client.get_light_info().await?;
+    if let Some(db) = db {
+        crate::wallet::check_directory_attest_pin(db, server_url, &info.directory_attest_pubkey)?;
+    }
+    ensure_chain_matches_network(
+        &info.chain_name,
+        crate::wallet::Wallet::network_byte(network),
+    )?;
+    Ok(info)
+}
+
+/// Shared lightwalletd preflight with wallet DB attestation pinning.
+pub async fn preflight_server(
+    client: &mut LightwalletClient,
+    db: &WalletDb,
+    server_url: &str,
+    network: &str,
+) -> Result<crate::client::proto::LightInfo, Box<dyn std::error::Error>> {
+    preflight_server_opt(client, Some(db), server_url, network).await
+}
+
+/// Target height when chain tip drops below `last_synced`.
+/// Clamped to `tip_height.saturating_sub(1)` (never above `tip_height`) so
+/// `tip_height < birthday` can never loop indefinitely.
+pub fn reorg_rewind_height(tip_height: u32) -> u32 {
+    tip_height.saturating_sub(1)
+}
+
 /// Sync engine state.
 pub struct SyncEngine {
     pub db: WalletDb,
@@ -166,61 +203,64 @@ impl SyncEngine {
         let (last_synced, birthday) = self.db.get_sync_state()?;
 
         // Reorg / tip regression: invalidate notes + txs above fork point, then rewind.
+        // Never clamp above `tip_height` (avoids an infinite loop when `tip_height < birthday`).
         if tip_height < last_synced {
-            let rewind_to = tip_height.saturating_sub(1).max(birthday.saturating_sub(1));
+            let rewind_to = reorg_rewind_height(tip_height);
             tracing::warn!(
                 "Chain tip {} is below last synced {} — rewinding sync height to {}",
                 tip_height,
                 last_synced,
                 rewind_to
             );
-            if let Some(cache) = &self.block_cache {
-                if let Err(e) = cache.delete_above(rewind_to) {
-                    tracing::warn!("block cache reorg prune failed: {e}");
-                }
-            }
-            match self.db.invalidate_above_height(rewind_to) {
-                Ok((notes, txs)) => {
-                    if notes > 0 || txs > 0 {
-                        tracing::warn!(
-                            "Reorg recovery: invalidated {} notes, {} transactions above height {}",
-                            notes,
-                            txs,
-                            rewind_to
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to invalidate above {}: {e} — falling back to full rescan",
-                        rewind_to
-                    );
-                    if let Err(reset_err) = self.db.reset_for_rescan(rewind_to) {
-                        tracing::error!(
-                            "reset_for_rescan also failed: {reset_err} — setting sync height only"
-                        );
-                        self.db.set_sync_height(rewind_to)?;
-                    }
-                }
-            }
+            self.perform_reorg_rewind(rewind_to)?;
             return Ok(SyncResult {
                 blocks_scanned: 0,
                 notes_found: 0,
                 notes_spent: 0,
                 tip_height,
                 tip_stale,
+                rewound: true,
             });
         }
 
-        // First sync (cursor 0): install the greatest snapshot <= birthday, or
-        // the latest snapshot when the wallet has no birthday. NOT_FOUND and a
-        // tip-only server fall through to commitment replay.
+        // Same-height and longer-chain reorg detection: verify hash continuity at `last_synced`.
+        if last_synced > 0 {
+            if let Some(ancestor) = self
+                .detect_hash_reorg_ancestor(&mut client, last_synced, &tip)
+                .await?
+            {
+                tracing::warn!(
+                    "Chain reorg detected at synced height {} — rewinding to common ancestor {}",
+                    last_synced,
+                    ancestor
+                );
+                self.perform_reorg_rewind(ancestor)?;
+                return Ok(SyncResult {
+                    blocks_scanned: 0,
+                    notes_found: 0,
+                    notes_spent: 0,
+                    tip_height,
+                    tip_stale,
+                    rewound: true,
+                });
+            }
+        }
+
+        // Fresh/birthday/rescanned wallet with no owned notes and no tree yet:
+        // install the greatest snapshot <= birthday, or the latest snapshot when
+        // the wallet has no birthday. NOT_FOUND and a tip-only server fall through
+        // to commitment replay.
         //
         // The snapshot only seeds the Money Merkle tree. Do **not** advance the
         // note cursor to the tip — trial decrypt (the default) still has to walk
         // birthday..=tip or a tip snapshot would hide every prior payment until
         // `--force-trial`.
-        if last_synced == 0 && !self.db.merkle_from_genesis() && tip_height > 0 {
+        let no_owned_notes = self.db.list_owned_commitments()?.is_empty();
+        if !self.db.merkle_from_genesis()
+            && self.tree_applied_recorded().is_none()
+            && no_owned_notes
+            && tip_height > 0
+        {
             let _ = self.try_install_checkpoint(&mut client, birthday).await?;
         }
         let (last_synced, birthday) = self.db.get_sync_state()?;
@@ -233,12 +273,18 @@ impl SyncEngine {
             self.force_trial && trial_cursor.unwrap_or(birthday.saturating_sub(1)) < tip_height;
 
         if last_synced >= tip_height && !force_backfill {
-            if !self.db.merkle_from_genesis() || self.tree_applied_height() < last_synced {
+            if !self.db.merkle_from_genesis()
+                || self.db.get_meta("tree_state")?.is_none()
+                || self.tree_applied_height() < last_synced
+            {
                 eprintln!(
                     "Money Merkle tree is missing pre-birthday / height-0 leaves; \
                      rebuilding from genesis so spend roots match the chain..."
                 );
                 self.rebuild_money_tree_from_genesis().await?;
+            }
+            if last_synced == tip_height && tip.hash.len() == 32 {
+                let _ = self.db.record_synced_block_hash(tip_height, &tip.hash);
             }
             return Ok(SyncResult {
                 blocks_scanned: 0,
@@ -246,6 +292,7 @@ impl SyncEngine {
                 notes_spent: 0,
                 tip_height,
                 tip_stale,
+                rewound: false,
             });
         }
 
@@ -261,12 +308,16 @@ impl SyncEngine {
         );
         if scan_start > tip_height {
             self.db.set_sync_height(tip_height)?;
+            if tip.hash.len() == 32 {
+                let _ = self.db.record_synced_block_hash(tip_height, &tip.hash);
+            }
             return Ok(SyncResult {
                 blocks_scanned: 0,
                 notes_found: 0,
                 notes_spent: 0,
                 tip_height,
                 tip_stale,
+                rewound: false,
             });
         }
         // May be clamped down below if the server truncates the OMR digest at its
@@ -328,6 +379,7 @@ impl SyncEngine {
         //    so that discovered coins are in the DB when the tree is built (allowing
         //    inline marking of owned positions).
         let mut notes_found = 0u32;
+        let mut window_end_hash: Option<[u8; 32]> = None;
         // Default and `--force-trial` trial-decrypt the full padded window so
         // clue-less payments (`drk`, other lightwalletds) are received.
         let use_full_window_trial = self.force_trial || !self.strict_omr;
@@ -356,6 +408,13 @@ impl SyncEngine {
                 .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
                 .cloned()
                 .collect();
+            for b in &in_window {
+                if b.height == scan_end && b.hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b.hash);
+                    window_end_hash = Some(arr);
+                }
+            }
             notes_found += self.trial_decrypt_blocks(&in_window)?;
             self.store_contract_records(&mut client, padded_start, padded_end)
                 .await?;
@@ -385,6 +444,13 @@ impl SyncEngine {
                 .into_iter()
                 .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
                 .collect();
+            for b in &in_window {
+                if b.height == scan_end && b.hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b.hash);
+                    window_end_hash = Some(arr);
+                }
+            }
             let extra = self
                 .fetch_outputs_by_func(&mut client, padded_start, padded_end, MONEY_FUNC_TOKEN_MINT)
                 .await?;
@@ -434,6 +500,7 @@ impl SyncEngine {
         }
 
         if self.db.merkle_from_genesis()
+            && self.db.get_meta("tree_state")?.is_some()
             && self.tree_applied_recorded().is_none()
             && last_synced > 0
         {
@@ -470,6 +537,22 @@ impl SyncEngine {
         // A force-trial backfill must not rewind a cursor that is already at the tip.
         if scan_end > last_synced {
             self.db.set_sync_height(scan_end)?;
+            if scan_end == tip_height {
+                if tip_height > 0 && tip.prev_hash.len() == 32 {
+                    let _ = self
+                        .db
+                        .record_synced_block_hash(tip_height - 1, &tip.prev_hash);
+                }
+                if tip.hash.len() == 32 {
+                    let _ = self.db.record_synced_block_hash(tip_height, &tip.hash);
+                }
+            } else if let Some(hash) = window_end_hash {
+                let _ = self.db.record_synced_block_hash(scan_end, &hash);
+            } else if let Ok(blk) = client.get_block(scan_end).await {
+                if blk.hash.len() == 32 {
+                    let _ = self.db.record_synced_block_hash(scan_end, &blk.hash);
+                }
+            }
         }
         if self.force_trial {
             self.set_trial_cursor(scan_end)?;
@@ -486,7 +569,109 @@ impl SyncEngine {
             notes_spent,
             tip_height,
             tip_stale,
+            rewound: false,
         })
+    }
+
+    fn perform_reorg_rewind(&self, rewind_to: u32) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(cache) = &self.block_cache {
+            if let Err(e) = cache.delete_above(rewind_to) {
+                tracing::warn!("block cache reorg prune failed: {e}");
+            }
+        }
+        match self.db.invalidate_above_height(rewind_to) {
+            Ok((notes, txs)) => {
+                if notes > 0 || txs > 0 {
+                    tracing::warn!(
+                        "Reorg recovery: invalidated {} notes, {} transactions above height {}",
+                        notes,
+                        txs,
+                        rewind_to
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to invalidate above {}: {e} — falling back to full rescan",
+                    rewind_to
+                );
+                if let Err(reset_err) = self.db.reset_for_rescan(rewind_to) {
+                    tracing::error!(
+                        "reset_for_rescan also failed: {reset_err} — setting sync height only"
+                    );
+                    self.db.set_sync_height(rewind_to)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify block hash continuity at `last_synced`. Returns `Some(common_ancestor)`
+    /// when a same-height or longer-chain reorg is detected.
+    async fn detect_hash_reorg_ancestor(
+        &self,
+        client: &mut LightwalletClient,
+        last_synced: u32,
+        tip: &crate::client::proto::ChainTip,
+    ) -> Result<Option<u32>, Box<dyn std::error::Error>> {
+        let anchors = self.db.get_synced_block_anchors()?;
+        let stored_at_last = anchors
+            .iter()
+            .rev()
+            .find(|(h, _)| *h == last_synced)
+            .map(|(_, bh)| *bh)
+            .or_else(|| {
+                self.db
+                    .get_last_synced_hash()
+                    .ok()
+                    .flatten()
+                    .filter(|(h, _)| *h == last_synced)
+                    .map(|(_, bh)| bh)
+            });
+        let Some(expected_hash) = stored_at_last else {
+            return Ok(None);
+        };
+
+        let chain_matches = if tip.height == last_synced && tip.hash.len() == 32 {
+            tip.hash.as_slice() == expected_hash.as_slice()
+        } else if tip.height == last_synced.saturating_add(1) && tip.prev_hash.len() == 32 {
+            tip.prev_hash.as_slice() == expected_hash.as_slice()
+        } else {
+            match client.get_block(last_synced).await {
+                Ok(blk) if blk.hash.len() == 32 => blk.hash.as_slice() == expected_hash.as_slice(),
+                Ok(_) => true,
+                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::NotFound) => false,
+                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
+                    tracing::debug!("GetBlock unimplemented; skipping hash continuity check");
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        if chain_matches {
+            return Ok(None);
+        }
+
+        // Walk stored anchors descending to find the highest common ancestor.
+        let mut earliest_checked = last_synced;
+        for &(anchor_h, anchor_hash) in anchors.iter().rev() {
+            if anchor_h >= last_synced {
+                continue;
+            }
+            earliest_checked = anchor_h;
+            match client.get_block(anchor_h).await {
+                Ok(blk)
+                    if blk.hash.len() == 32 && blk.hash.as_slice() == anchor_hash.as_slice() =>
+                {
+                    return Ok(Some(anchor_h));
+                }
+                Ok(_) => continue,
+                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::NotFound) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Some(earliest_checked.saturating_sub(1)))
     }
 
     async fn apply_note_commitments(
@@ -497,17 +682,22 @@ impl SyncEngine {
         tip: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let owned = self.owned_commitment_set()?;
+        let stored_tree = self.db.get_meta("tree_state")?;
         // A crash after a mid-window flush left the tree ahead of the note
         // cursor. Resume at the next unapplied height instead of appending
-        // the same coins again.
-        let start = match self.tree_applied_recorded() {
-            Some(applied) if applied >= scan_start => applied.saturating_add(1),
-            _ => scan_start,
+        // the same coins again (only when tree_state is actually present).
+        let start = if stored_tree.is_some() {
+            match self.tree_applied_recorded() {
+                Some(applied) if applied >= scan_start => applied.saturating_add(1),
+                _ => scan_start,
+            }
+        } else {
+            scan_start
         };
         if start > scan_end {
             return Ok(());
         }
-        let tree_bytes = self.db.get_meta("tree_state")?.unwrap_or_else(|| {
+        let tree_bytes = stored_tree.unwrap_or_else(|| {
             let mut out = Vec::new();
             darkfi_serial::Encodable::encode(&genesis_money_tree(), &mut out).unwrap_or(0);
             out
@@ -625,12 +815,16 @@ impl SyncEngine {
         if scan_start == 0 {
             return Ok(());
         }
+        let has_tree_state = self.db.get_meta("tree_state")?.is_some();
         let applied = self.tree_applied_height();
-        if self.db.merkle_from_genesis() && applied.saturating_add(1) >= scan_start {
+        if has_tree_state
+            && self.db.merkle_from_genesis()
+            && applied.saturating_add(1) >= scan_start
+        {
             return Ok(());
         }
         let end = scan_start - 1;
-        let start_from = if self.db.merkle_from_genesis() {
+        let start_from = if has_tree_state && self.db.merkle_from_genesis() {
             applied.saturating_add(1)
         } else {
             0
@@ -643,7 +837,7 @@ impl SyncEngine {
              (note scan starts at {scan_start}; pre-history must still be in the tree)..."
         );
         let owned = self.owned_commitment_set()?;
-        let mut tree = if self.db.merkle_from_genesis() {
+        let mut tree = if has_tree_state && self.db.merkle_from_genesis() {
             self.load_money_tree()?
         } else {
             genesis_money_tree()
@@ -898,10 +1092,19 @@ impl SyncEngine {
                             hex::encode(&output.coin)
                         );
                     }
+                    let Ok(value_i64) = i64::try_from(note.value) else {
+                        tracing::error!(
+                            "Skipping note {}:{} with value {} exceeding i64::MAX",
+                            tx_hash,
+                            idx,
+                            note.value
+                        );
+                        continue;
+                    };
                     self.db.update_note_spend_fields(
                         tx_hash,
                         *idx,
-                        note.value as i64,
+                        value_i64,
                         &hex::encode(&note.token_id),
                         &note.coin_blind,
                         &note.value_blind,
@@ -963,6 +1166,14 @@ impl SyncEngine {
     ) -> Result<(u64, u32, u32), Box<dyn std::error::Error>> {
         let mut client = LightwalletClient::new(&self.server_url, self.tls_pin_sha256.clone())
             .with_tor(self.use_tor);
+
+        let info = client.get_light_info().await?;
+        crate::wallet::check_directory_attest_pin(
+            &self.db,
+            &self.server_url,
+            &info.directory_attest_pubkey,
+        )?;
+        ensure_chain_matches_network(&info.chain_name, self.network_byte)?;
 
         let tip = client.get_chain_tip().await?.height;
         match self.restore_commitments_from_compact(&mut client).await {
@@ -1144,9 +1355,9 @@ impl SyncEngine {
         } else {
             tip
         };
-        // Prevent the following `sync_once` from re-appending heights already
-        // included in this rebuild (that would duplicate leaves and break spends).
-        self.db.set_sync_height(final_tip)?;
+        // Record tree_applied_height (NOT last_synced_height!) so the following
+        // `sync_once` still trial-decrypts `(old_last_synced..=tip]` without
+        // re-appending commitments already present in the rebuilt tree.
         self.set_tree_applied_height(final_tip)?;
         match self.db.recompute_owned_nullifiers() {
             Ok(n) => eprintln!("  recomputed nullifiers for {n} unspent notes"),
@@ -1631,10 +1842,19 @@ impl SyncEngine {
                         let nf = poseidon_hash([sk.inner(), coin.inner()]);
                         Some(nf.to_repr().to_vec())
                     };
+                    let Ok(value_i64) = i64::try_from(note.value) else {
+                        tracing::error!(
+                            "Skipping decrypted note {}:{} with value {} exceeding i64::MAX",
+                            tx_hash_hex,
+                            idx,
+                            note.value
+                        );
+                        continue;
+                    };
                     let _rowid = self.db.insert_note(
                         &tx_hash_hex,
                         idx as u32,
-                        note.value as i64,
+                        value_i64,
                         &hex::encode(&note.token_id),
                         &note.serial,
                         block.height,
@@ -1661,7 +1881,7 @@ impl SyncEngine {
                         &tx_hash_hex,
                         block.height,
                         "incoming",
-                        note.value as i64,
+                        value_i64,
                         &hex::encode(&note.token_id),
                         None,
                         note.memo.as_deref(),
@@ -1691,8 +1911,8 @@ impl SyncEngine {
                             &detail,
                             "",
                         );
+                        notes_found += 1;
                     }
-                    notes_found += 1;
                 }
             }
         }
@@ -2277,15 +2497,31 @@ pub async fn jittered_sleep(base_secs: u64) {
     tokio::time::sleep(Duration::from_secs(total)).await;
 }
 
-/// Redact sensitive information from error messages.
+/// Redact sensitive information (URLs, IPs, IPv6, `.onion`, `host:port`) from error messages.
 pub fn redact_sync_error(msg: &str) -> String {
     let mut result = msg.to_string();
+
+    let url_re = regex_lite::Regex::new(r"(https?|tcp(\+tls)?|grpc)://[^\s]+").unwrap();
+    result = url_re.replace_all(&result, "[redacted-url]").to_string();
+
+    let onion_re = regex_lite::Regex::new(r"[a-zA-Z2-7]{16,56}\.onion(:\d+)?").unwrap();
+    result = onion_re
+        .replace_all(&result, "[redacted-onion]")
+        .to_string();
+
+    let ipv6_re = regex_lite::Regex::new(r"\[[0-9a-fA-F:]+\](:\d+)?").unwrap();
+    result = ipv6_re.replace_all(&result, "[redacted-addr]").to_string();
 
     let ip_re = regex_lite::Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?").unwrap();
     result = ip_re.replace_all(&result, "[redacted-addr]").to_string();
 
-    let url_re = regex_lite::Regex::new(r"(https?|tcp(\+tls)?|grpc)://[^\s]+").unwrap();
-    result = url_re.replace_all(&result, "[redacted-url]").to_string();
+    let hostport_re = regex_lite::Regex::new(
+        r"\b[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9-]+)+:\d+\b",
+    )
+    .unwrap();
+    result = hostport_re
+        .replace_all(&result, "[redacted-addr]")
+        .to_string();
 
     result
 }
@@ -2300,6 +2536,9 @@ pub struct SyncResult {
     /// Served tip was last refreshed from darkfid more than two minutes ago.
     /// `false` when the server did not report a poll time.
     pub tip_stale: bool,
+    /// True when this cycle performed a reorg rewind and the caller should run
+    /// another pass to sync the canonical fork.
+    pub rewound: bool,
 }
 
 /// `0` is unknown (older server, or the poll has not succeeded). A reported
@@ -2594,12 +2833,12 @@ fn batch_open_blocks(
                     };
                     let money = money_note_from_plaintext(&plaintext)?;
                     let note = decrypted_from_money_note(money)?;
-                    if let Some(derived) = derived_coin_from_note(&note, secret_bytes) {
-                        if jobs[*index].coin.len() == 32
-                            && derived.as_slice() != jobs[*index].coin.as_slice()
-                        {
-                            return None;
-                        }
+                    // Fail closed if note attributes cannot derive a valid coin commitment.
+                    let derived = derived_coin_from_note(&note, secret_bytes)?;
+                    if jobs[*index].coin.len() == 32
+                        && derived.as_slice() != jobs[*index].coin.as_slice()
+                    {
+                        return None;
                     }
                     Some((*index, note))
                 })
@@ -2611,7 +2850,7 @@ fn batch_open_blocks(
             use rayon::prelude::*;
             pending
                 .par_chunks(BATCH_CHUNK)
-                .flat_map_iter(|chunk| open(chunk))
+                .flat_map_iter(open)
                 .collect()
         };
         for (index, note) in hits {
@@ -2629,10 +2868,12 @@ fn batch_open_blocks(
             let Some(note) = trial_decrypt_note(&encrypted, secret_bytes) else {
                 continue;
             };
-            if let Some(derived) = derived_coin_from_note(&note, secret_bytes) {
-                if coin.len() == 32 && derived.as_slice() != coin.as_slice() {
-                    continue;
-                }
+            // Fail closed if note attributes cannot derive a valid coin commitment.
+            let Some(derived) = derived_coin_from_note(&note, secret_bytes) else {
+                continue;
+            };
+            if coin.len() == 32 && derived.as_slice() != coin.as_slice() {
+                continue;
             }
             out.insert((height, tx, idx), (note, secret_bytes.clone()));
             break;
@@ -3028,5 +3269,33 @@ mod tests {
         assert!(
             snapshot_integrity_hash(height, tree, b"").as_slice() != blake3::hash(tree).as_bytes()
         );
+    }
+
+    #[test]
+    fn reorg_rewind_never_exceeds_tip_even_when_tip_below_birthday() {
+        assert_eq!(reorg_rewind_height(0), 0);
+        assert_eq!(reorg_rewind_height(1), 0);
+        assert_eq!(reorg_rewind_height(50), 49);
+        // Must never be pushed back up above tip_height when birthday = 100 > tip_height = 50.
+        assert!(reorg_rewind_height(50) < 50);
+    }
+
+    #[test]
+    fn redact_sync_error_strips_onion_ipv6_and_hostport() {
+        let onion =
+            "dial failed to abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:9067";
+        let r_onion = redact_sync_error(onion);
+        assert!(!r_onion.contains(".onion"));
+        assert!(r_onion.contains("[redacted-onion]"));
+
+        let v6 = "connect [2001:db8::1]:9067 refused";
+        let r_v6 = redact_sync_error(v6);
+        assert!(!r_v6.contains("2001:db8"));
+        assert!(r_v6.contains("[redacted-addr]"));
+
+        let hp = "connect lwd.darkfi.example:9067 reset";
+        let r_hp = redact_sync_error(hp);
+        assert!(!r_hp.contains("lwd.darkfi.example"));
+        assert!(r_hp.contains("[redacted-addr]"));
     }
 }

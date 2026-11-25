@@ -8,9 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # Do not set RUSTFLAGS=-D warnings here. Cargo applies those flags to the
+  # path-dependency DarkFi tree, and that tree has an upstream unreachable
+  # Infallible conversion. Moonshine denies its own warnings via [lints.rust].
   # Sibling path in Cargo.toml; pin must match docs/darkfi-pin.md
-  DARKFI_PIN: 9d7ceaf77da7ccfd29ead3ba168fab284decd8c8
+  DARKFI_PIN: 1919419364a406b85a68411fa8ad80919b286113
 
 # Path deps expect siblings:
 #   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not git.dark.fi master; do not use the GitHub mirror)
@@ -160,7 +162,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('moonshine/Cargo.lock') }}
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --no-deps -- -D warnings
 
   build-release:
     name: Release Build

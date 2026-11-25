@@ -9,35 +9,34 @@
 //! - `local` — wallet-only record (mint authority, DAO signing keys)
 //! - `failed` — the operation did not succeed
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
-thread_local! {
-    static SCOPE: RefCell<Option<(&'static str, &'static str)>> = const { RefCell::new(None) };
-}
+static SCOPE: Mutex<Option<(&'static str, &'static str)>> = Mutex::new(None);
 
 /// Remember the operation in flight so a later `Err` still names its kind.
 pub fn begin(kind: &'static str, phase: &'static str) {
-    SCOPE.with(|slot| *slot.borrow_mut() = Some((kind, phase)));
+    let mut slot = SCOPE.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some((kind, phase));
 }
 
 pub fn phase(phase: &'static str) {
-    SCOPE.with(|slot| {
-        let kind = slot.borrow().map(|(kind, _)| kind);
-        if let Some(kind) = kind {
-            *slot.borrow_mut() = Some((kind, phase));
-        }
-    });
+    let mut slot = SCOPE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((kind, _)) = *slot {
+        *slot = Some((kind, phase));
+    }
 }
 
 /// Print a failure line when `run` returns `Err` inside a [`begin`] scope.
 pub fn emit_fail(reason: &str) {
-    SCOPE.with(|slot| {
-        if let Some((kind, phase)) = *slot.borrow() {
-            emit(
-                kind, phase, "fail", "failed", "", None, "", None, "", reason,
-            );
-        }
-    });
+    let active = {
+        let mut slot = SCOPE.lock().unwrap_or_else(|e| e.into_inner());
+        slot.take()
+    };
+    if let Some((kind, phase)) = active {
+        emit(
+            kind, phase, "fail", "failed", "", None, "", None, "", reason,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,6 +52,10 @@ pub fn emit(
     detail: &str,
     reason: &str,
 ) {
+    if result == "fail" {
+        let mut slot = SCOPE.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = None;
+    }
     let hash = blank(hash);
     let token = blank(token);
     let height = height.map(|h| h.to_string()).unwrap_or_else(|| "-".into());

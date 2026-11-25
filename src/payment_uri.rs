@@ -3,19 +3,30 @@
 
 pub const MAX_PAYMENT_MEMO_BYTES: usize = 255;
 
-pub fn build_payment_uri(address: &str, amount: Option<&str>, memo: Option<&str>) -> String {
+pub fn build_payment_uri(
+    address: &str,
+    amount: Option<&str>,
+    memo: Option<&str>,
+) -> Result<String, String> {
     let mut query: Vec<String> = Vec::new();
     if let Some(amount) = amount.map(str::trim).filter(|s| !s.is_empty()) {
-        query.push(format!("amount={amount}"));
+        let atomic = crate::amount::parse_drk_atomic(amount)?;
+        if atomic == 0 {
+            return Err("invoice amount must be greater than 0".into());
+        }
+        query.push(format!(
+            "amount={}",
+            crate::amount::format_drk_atomic(atomic)
+        ));
     }
     if let Some(memo) = memo.map(str::trim).filter(|s| !s.is_empty()) {
         let bytes = truncate_utf8(memo.as_bytes(), MAX_PAYMENT_MEMO_BYTES);
         query.push(format!("memo={}", percent_encode(&b64_encode(bytes))));
     }
     if query.is_empty() {
-        format!("drk:{address}")
+        Ok(format!("drk:{address}"))
     } else {
-        format!("drk:{address}?{}", query.join("&"))
+        Ok(format!("drk:{address}?{}", query.join("&")))
     }
 }
 
@@ -78,7 +89,7 @@ mod tests {
 
     #[test]
     fn invoice_includes_amount_and_base64_memo() {
-        let uri = build_payment_uri("drk1abc", Some("1.5"), Some("lunch"));
+        let uri = build_payment_uri("drk1abc", Some("1.5"), Some("lunch")).unwrap();
         assert!(uri.starts_with("drk:drk1abc?"));
         assert!(uri.contains("amount=1.5"));
         // "lunch" is bHVuY2g= ; '=' is percent-encoded for the query.
@@ -88,8 +99,16 @@ mod tests {
     #[test]
     fn bare_address_omits_query() {
         assert_eq!(
-            build_payment_uri("drk1abc", None, Some("  ")),
+            build_payment_uri("drk1abc", None, Some("  ")).unwrap(),
             "drk:drk1abc"
         );
+    }
+
+    #[test]
+    fn invoice_rejects_invalid_or_zero_amount() {
+        assert!(build_payment_uri("drk1abc", Some("0"), None).is_err());
+        assert!(build_payment_uri("drk1abc", Some("-1.5"), None).is_err());
+        assert!(build_payment_uri("drk1abc", Some("1&memo=evil"), None).is_err());
+        assert!(build_payment_uri("drk1abc", Some("abc"), None).is_err());
     }
 }

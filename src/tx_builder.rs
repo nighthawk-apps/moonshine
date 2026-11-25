@@ -116,14 +116,17 @@ pub struct BuiltTransfer {
     /// Compact-block output indexes of change that decrypts to this wallet.
     /// Index 0 is the payment output and is covered by the recipient clue.
     pub self_output_indices: Vec<u32>,
+    /// Total number of non-tx-local outputs in the transaction (transfer + optional fee).
+    pub total_outputs: u32,
 }
 
-/// Compact output indexes (skipping tx-local coins) that belong to `secret`.
+/// Compact output indexes (skipping tx-local coins) that belong to `secret`,
+/// plus total non-tx-local output count.
 fn self_output_indices(
     outputs: &[darkfi_money_contract::model::Output],
     secret: &SecretKey,
     include_fee_change: bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, u32) {
     let mut idx = 0u32;
     let mut ours = Vec::new();
     for output in outputs {
@@ -137,8 +140,55 @@ fn self_output_indices(
     }
     if include_fee_change {
         ours.push(idx);
+        idx += 1;
     }
-    ours
+    (ours, idx)
+}
+
+/// Filter unhooked native DRK coins eligible to pay `FeeV1`.
+/// `FeeV1` strictly requires `*DARK_TOKEN_ID` and `FuncId::none()`.
+pub(crate) fn filter_fee_candidates(spendable: &[OwnCoin], fee: u64) -> Vec<OwnCoin> {
+    spendable
+        .iter()
+        .filter(|c| {
+            c.note.value >= fee
+                && c.note.spend_hook == FuncId::none()
+                && c.note.token_id == *darkfi_money_contract::model::DARK_TOKEN_ID
+        })
+        .cloned()
+        .collect()
+}
+
+/// Select a tx-local change output for `FeeV1` without cannibalizing payment outputs.
+///
+/// Iterates from the tail (where `make_transfer_call` appends change) and skips:
+/// - payment outputs (`idx < min_change_index`)
+/// - non-DRK coins or coins smaller than `fee`
+/// - contract-hooked notes (`spend_hook != FuncId::none()`)
+/// - outputs carrying a non-empty payment memo
+pub(crate) fn select_tx_local_fee_output(
+    outputs: &[darkfi_money_contract::model::Output],
+    secret: &SecretKey,
+    fee: u64,
+    min_change_index: usize,
+) -> Option<(usize, MoneyNote)> {
+    for (idx, output) in outputs.iter().enumerate().rev() {
+        if idx < min_change_index {
+            continue;
+        }
+        let Ok(note) = output.note.decrypt::<MoneyNote>(secret) else {
+            continue;
+        };
+        if note.value < fee
+            || note.token_id != *darkfi_money_contract::model::DARK_TOKEN_ID
+            || note.spend_hook != FuncId::none()
+            || !note.memo.is_empty()
+        {
+            continue;
+        }
+        return Some((idx, note));
+    }
+    None
 }
 
 fn own_coin_commitment(coin: &OwnCoin) -> Vec<u8> {
@@ -247,19 +297,11 @@ pub async fn build_transaction_extended(
         );
     }
 
-    let fee_candidates: Vec<OwnCoin> = spendable
-        .iter()
-        .filter(|c| {
-            c.note.value >= fee
-                && (c.note.token_id == *darkfi_money_contract::model::DARK_TOKEN_ID
-                    || c.note.token_id == TokenId::from(pallas::Base::ZERO))
-        })
-        .cloned()
-        .collect();
+    let fee_candidates = filter_fee_candidates(&spendable, fee);
 
     let transfer_spendable: Vec<OwnCoin> = spendable
         .iter()
-        .filter(|c| c.note.token_id == token_id)
+        .filter(|c| c.note.spend_hook == FuncId::none() && c.note.token_id == token_id)
         .cloned()
         .collect();
 
@@ -307,19 +349,15 @@ pub async fn build_transaction_extended(
         } else {
             // DEP-0008: spend transfer change inside this tx (tx-local tree).
             // Must match host `merkle_add_local`: dummy ZERO leaf, then local coins.
+            // Payment outputs occupy 0..(1 or 2 with half_split); never cannibalize them.
+            let min_change_index = if half_split { 2 } else { 1 };
             let mut local_tree = MerkleTree::new(1);
             local_tree.append(MerkleNode::from(pallas::Base::ZERO));
             let mut src = None;
-            for output in params.outputs.iter_mut() {
-                let Ok(note) = output.note.decrypt::<MoneyNote>(&keypair.secret) else {
-                    continue;
-                };
-                // Fee must be paid in native DRK (upstream 0f985c7cf), not the
-                // transfer token — custom-token change cannot cover fees.
-                if note.value < fee || note.token_id != *darkfi_money_contract::model::DARK_TOKEN_ID
-                {
-                    continue;
-                }
+            if let Some((idx, note)) =
+                select_tx_local_fee_output(&params.outputs, &keypair.secret, fee, min_change_index)
+            {
+                let output = &mut params.outputs[idx];
                 let derived = CoinAttributes {
                     public_key: PublicKey::from_secret(keypair.secret),
                     value: note.value,
@@ -364,7 +402,6 @@ pub async fn build_transaction_extended(
                     input_tx_local: true,
                     expected_root,
                 });
-                break;
             }
             src
         }
@@ -498,23 +535,148 @@ pub async fn build_transaction_extended(
         )?;
 
         let tx = tx_builder.build_signed()?;
-        let self_output_indices = self_output_indices(&params.outputs, &keypair.secret, true);
+        let (self_output_indices, total_outputs) =
+            self_output_indices(&params.outputs, &keypair.secret, true);
         Ok(BuiltTransfer {
             tx,
             spent_commitments,
             spent_nullifiers,
             self_output_indices,
+            total_outputs,
         })
     } else {
         // No fee call — build transaction with just the transfer call.
         let mut tx_builder = TransactionBuilder::new(transfer_leaf, vec![])?;
         let tx = tx_builder.build_signed()?;
-        let self_output_indices = self_output_indices(&params.outputs, &keypair.secret, false);
+        let (self_output_indices, total_outputs) =
+            self_output_indices(&params.outputs, &keypair.secret, false);
         Ok(BuiltTransfer {
             tx,
             spent_commitments,
             spent_nullifiers,
             self_output_indices,
+            total_outputs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkfi_money_contract::model::{Output, DARK_TOKEN_ID};
+    use darkfi_sdk::pasta::group::Group;
+
+    fn make_own_coin(value: u64, token_id: TokenId, spend_hook: FuncId) -> OwnCoin {
+        let kp = Keypair::random(&mut rand_core::OsRng);
+        let blind = Blind::random(&mut rand_core::OsRng);
+        let note = MoneyNote {
+            value,
+            token_id,
+            spend_hook,
+            user_data: pallas::Base::ZERO,
+            coin_blind: blind,
+            value_blind: Blind(pallas::Scalar::from(1u64)),
+            token_blind: Blind::from(2u64),
+            memo: Vec::new(),
+        };
+        let coin = CoinAttributes {
+            public_key: kp.public,
+            value,
+            token_id,
+            spend_hook,
+            user_data: pallas::Base::ZERO,
+            blind,
+        }
+        .to_coin();
+        OwnCoin {
+            coin,
+            note,
+            secret: kp.secret,
+            leaf_position: 1u64.into(),
+        }
+    }
+
+    fn make_encrypted_output(
+        kp: &Keypair,
+        value: u64,
+        spend_hook: FuncId,
+        memo: Vec<u8>,
+    ) -> Output {
+        let blind = Blind::random(&mut rand_core::OsRng);
+        let note = MoneyNote {
+            value,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook,
+            user_data: pallas::Base::ZERO,
+            coin_blind: blind,
+            value_blind: Blind(pallas::Scalar::from(1u64)),
+            token_blind: Blind::from(2u64),
+            memo,
+        };
+        let coin = CoinAttributes {
+            public_key: kp.public,
+            value,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook,
+            user_data: pallas::Base::ZERO,
+            blind,
+        }
+        .to_coin();
+        let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
+        Output {
+            value_commit: pallas::Point::identity(),
+            token_commit: pallas::Base::ZERO,
+            coin,
+            note: enc,
+            tx_local: false,
+        }
+    }
+
+    #[test]
+    fn filter_fee_candidates_excludes_hooked_and_zero_token() {
+        let dao_hook = crate::dao_ops::dao_spend_hook();
+        let hooked = make_own_coin(10_000_000, *DARK_TOKEN_ID, dao_hook);
+        let zero_tok = make_own_coin(
+            10_000_000,
+            TokenId::from(pallas::Base::ZERO),
+            FuncId::none(),
+        );
+        let valid = make_own_coin(10_000_000, *DARK_TOKEN_ID, FuncId::none());
+        let too_small = make_own_coin(100, *DARK_TOKEN_ID, FuncId::none());
+
+        let kept = filter_fee_candidates(&[hooked, zero_tok, valid.clone(), too_small], 5_000_000);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].coin, valid.coin);
+    }
+
+    #[test]
+    fn tx_local_fee_skips_payment_output_and_memo_and_hook() {
+        let kp = Keypair::random(&mut rand_core::OsRng);
+        let dao_hook = crate::dao_ops::dao_spend_hook();
+        // Self-transfer: output 0 is payment (with memo), output 1 is hooked, output 2 is plain change.
+        let payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), b"pay-self".to_vec());
+        let hooked = make_encrypted_output(&kp, 50_000_000, dao_hook, vec![]);
+        let change = make_encrypted_output(&kp, 20_000_000, FuncId::none(), vec![]);
+
+        let chosen = select_tx_local_fee_output(
+            &[payment.clone(), hooked, change],
+            &kp.secret,
+            5_000_000,
+            1,
+        )
+        .expect("should pick change output");
+        assert_eq!(chosen.0, 2);
+        assert_eq!(chosen.1.value, 20_000_000);
+
+        // Even without a memo, output 0 (payment) must not be cannibalized when min_change_index == 1.
+        let unmemoized_payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), vec![]);
+        assert!(
+            select_tx_local_fee_output(&[unmemoized_payment], &kp.secret, 5_000_000, 1).is_none()
+        );
+        // If output 1 has a memo, skip it too.
+        assert!(
+            select_tx_local_fee_output(&[payment.clone(), payment], &kp.secret, 5_000_000, 1)
+                .is_none()
+        );
     }
 }

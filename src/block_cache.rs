@@ -32,15 +32,16 @@ use chacha20poly1305::{
 use rand::RngCore;
 use rusqlite::{params, Connection, Result as SqlResult};
 use std::path::Path;
+use zeroize::Zeroize;
 
 /// Same magic and key context as `darkfi-mobile-ffi` `MobileBlockCache`.
 const CACHE_MAGIC: &[u8] = b"NHC1";
 const NONCE_LEN: usize = 24;
 const CACHE_KEY_CONTEXT: &str = "nighthawk compact-block-cache v1";
 
-fn cache_key_for_wallet_db(wallet_db: &str) -> Option<[u8; 32]> {
-    let pass = crate::secret_wrap::load_or_create_passphrase(wallet_db).ok()?;
-    Some(blake3::derive_key(CACHE_KEY_CONTEXT, pass.as_bytes()))
+fn cache_key_for_wallet_db(wallet_db: &str) -> Result<[u8; 32], String> {
+    let pass = crate::secret_wrap::load_or_create_passphrase(wallet_db)?;
+    Ok(blake3::derive_key(CACHE_KEY_CONTEXT, pass.as_bytes()))
 }
 
 fn wrap_blob(key: Option<&[u8; 32]>, plaintext: &[u8]) -> SqlResult<Vec<u8>> {
@@ -91,15 +92,29 @@ pub struct BlockCache {
     key: Option<[u8; 32]>,
 }
 
+impl Drop for BlockCache {
+    fn drop(&mut self) {
+        if let Some(ref mut k) = self.key {
+            k.zeroize();
+        }
+    }
+}
+
 impl BlockCache {
-    /// Open or create the block cache database.
+    /// Open or create the block cache database (fails closed without wallet passphrase).
     pub fn open(path: &str) -> SqlResult<Self> {
+        let wallet_db = path.strip_suffix(".blocks.db").unwrap_or(path);
+        let key = cache_key_for_wallet_db(wallet_db).map_err(sql_err)?;
         if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent).ok();
+            if !parent.as_os_str().is_empty() {
+                crate::secret_wrap::ensure_dir_0700(parent).map_err(sql_err)?;
+            }
         }
         let conn = Connection::open(path)?;
+        crate::secret_wrap::set_file_mode_0600(Path::new(path)).map_err(sql_err)?;
         conn.execute_batch(
             "
+            PRAGMA secure_delete = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
 
@@ -121,10 +136,9 @@ impl BlockCache {
             );
             ",
         )?;
-        let wallet_db = path.strip_suffix(".blocks.db").unwrap_or(path);
         Ok(Self {
             conn,
-            key: cache_key_for_wallet_db(wallet_db),
+            key: Some(key),
         })
     }
 
@@ -406,5 +420,27 @@ mod tests {
         cache.insert_block(1, &[0u8; 100]).unwrap();
         cache.insert_block(2, &[0u8; 200]).unwrap();
         assert_eq!(cache.size_bytes().unwrap(), 300);
+    }
+
+    #[test]
+    fn open_fails_closed_without_passphrase() {
+        if std::env::var("MOONSHINE_WALLET_PASS")
+            .ok()
+            .is_some_and(|v| !v.is_empty())
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "moonshine-cache-fail-closed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing.blocks.db");
+        assert!(
+            BlockCache::open(path.to_str().unwrap()).is_err(),
+            "BlockCache::open must fail closed without passphrase"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

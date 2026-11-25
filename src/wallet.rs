@@ -113,20 +113,9 @@ pub fn reset_directory_attest_pin(db: &WalletDb, server_url: &str) -> Result<(),
 /// Clue-key version on every registration.
 ///
 /// The clue key is derived from the wallet secret and does not rotate, so
-/// this stays 1. A timestamp would distinguish real directory rows from decoys.
-/// Decoy / legacy floor (must stay `1` to match lightwalletd `decoy_key_version`).
-#[allow(dead_code)]
+/// this stays 1. A timestamp would distinguish real directory rows from decoys
+/// (lightwalletd `decoy_key_version = 1`).
 pub const CLUE_KEY_VERSION: u64 = 1;
-
-/// Monotonic clue-key version for `RegisterCluePublicKey` (unix seconds).
-/// Matches mobile FFI `clue_key_version_now` so re-registration is not rejected
-/// as stale after an earlier timestamped registration on the same LWD.
-pub fn clue_key_version_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(1)
-}
 
 /// Session-scoped clue-registration ids. Oldest insert is dropped at `cap`.
 /// Updating an already-present id does not refresh FIFO position.
@@ -179,50 +168,68 @@ fn clue_reg_cache() -> &'static std::sync::Mutex<BoundedIdSet> {
     CLUE_PK_REGISTERED.get_or_init(|| std::sync::Mutex::new(BoundedIdSet::new()))
 }
 
-fn clue_registration_id(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> [u8; 32] {
-    let mut h = blake3::Hasher::new_derive_key("moonshine clue-reg v1");
+fn normalize_server_url(server_url: &str) -> &str {
+    server_url.trim().trim_end_matches('/')
+}
+
+fn clue_registration_id(
+    server_url: &str,
+    network: u8,
+    pay_pk: &[u8; 32],
+    clue_pk: &[u8],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("moonshine clue-reg v2");
+    let url = normalize_server_url(server_url);
+    h.update(&(url.len() as u64).to_le_bytes());
+    h.update(url.as_bytes());
     h.update(&[network]);
     h.update(pay_pk);
     h.update(clue_pk);
     *h.finalize().as_bytes()
 }
 
-pub fn clue_already_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> bool {
-    let id = clue_registration_id(network, pay_pk, clue_pk);
+pub fn clue_already_registered(
+    server_url: &str,
+    network: u8,
+    pay_pk: &[u8; 32],
+    clue_pk: &[u8],
+) -> bool {
+    let id = clue_registration_id(server_url, network, pay_pk, clue_pk);
     clue_reg_cache()
         .lock()
         .map(|s| s.contains(&id))
         .unwrap_or(false)
 }
 
-pub fn mark_clue_registered(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) {
-    let id = clue_registration_id(network, pay_pk, clue_pk);
+pub fn mark_clue_registered(server_url: &str, network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) {
+    let id = clue_registration_id(server_url, network, pay_pk, clue_pk);
     if let Ok(mut s) = clue_reg_cache().lock() {
         s.insert(id);
     }
 }
 
 /// Wallet-DB meta key for a durable UnifOMR registration mark (survives CLI restarts).
-fn clue_reg_meta_key(network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> String {
-    let id = clue_registration_id(network, pay_pk, clue_pk);
-    format!("clue_reg_v1:{}", hex::encode(id))
+fn clue_reg_meta_key(server_url: &str, network: u8, pay_pk: &[u8; 32], clue_pk: &[u8]) -> String {
+    let id = clue_registration_id(server_url, network, pay_pk, clue_pk);
+    format!("clue_reg_v2:{}", hex::encode(id))
 }
 
 /// Session cache **or** durable wallet meta — each `moonshine` CLI process is fresh,
 /// so UnifOMR stress loops must not re-hit `RegisterCluePublicKey` every invocation.
 pub fn clue_already_registered_db(
     db: &crate::db::WalletDb,
+    server_url: &str,
     network: u8,
     pay_pk: &[u8; 32],
     clue_pk: &[u8],
 ) -> bool {
-    if clue_already_registered(network, pay_pk, clue_pk) {
+    if clue_already_registered(server_url, network, pay_pk, clue_pk) {
         return true;
     }
-    let key = clue_reg_meta_key(network, pay_pk, clue_pk);
+    let key = clue_reg_meta_key(server_url, network, pay_pk, clue_pk);
     match db.get_meta(&key) {
         Ok(Some(_)) => {
-            mark_clue_registered(network, pay_pk, clue_pk);
+            mark_clue_registered(server_url, network, pay_pk, clue_pk);
             true
         }
         _ => false,
@@ -231,12 +238,13 @@ pub fn clue_already_registered_db(
 
 pub fn mark_clue_registered_db(
     db: &crate::db::WalletDb,
+    server_url: &str,
     network: u8,
     pay_pk: &[u8; 32],
     clue_pk: &[u8],
 ) {
-    mark_clue_registered(network, pay_pk, clue_pk);
-    let key = clue_reg_meta_key(network, pay_pk, clue_pk);
+    mark_clue_registered(server_url, network, pay_pk, clue_pk);
+    let key = clue_reg_meta_key(server_url, network, pay_pk, clue_pk);
     let _ = db.set_meta(&key, &[1u8]);
 }
 
@@ -258,6 +266,7 @@ impl Wallet {
     /// The resulting mnemonic can be imported into any DarkFi wallet
     /// (Android, iOS, Moonshine) and will produce the same secret key.
     pub fn create(name: &str, network: &str) -> Result<Self, Box<dyn Error>> {
+        Self::validate_wallet_name(name)?;
         // Refuse before opening the DB so a failed TTY check cannot leave an
         // unrecoverable wallet whose seed was never displayed.
         if !std::io::stderr().is_terminal()
@@ -270,9 +279,9 @@ impl Wallet {
 
         let db_path = Self::db_path(name);
 
-        // Ensure wallet directory exists
+        // Ensure wallet directory exists with owner-only permissions (0700).
         if let Some(parent) = Path::new(&db_path).parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::secret_wrap::ensure_dir_0700(parent)?;
         }
 
         if Path::new(&db_path).exists() {
@@ -348,10 +357,11 @@ impl Wallet {
         mnemonic_words: &[String],
         network: &str,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::validate_wallet_name(name)?;
         let db_path = Self::db_path(name);
 
         if let Some(parent) = Path::new(&db_path).parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::secret_wrap::ensure_dir_0700(parent)?;
         }
 
         if Path::new(&db_path).exists() {
@@ -401,6 +411,7 @@ impl Wallet {
 
     /// Open an existing wallet.
     pub fn open(name: &str) -> Result<Self, Box<dyn Error>> {
+        Self::validate_wallet_name(name)?;
         let db_path = Self::db_path(name);
         if !Path::new(&db_path).exists() {
             return Err(format!("Wallet '{}' not found at {}", name, db_path).into());
@@ -596,6 +607,23 @@ impl Wallet {
         Ok(public_hex)
     }
 
+    /// Reject wallet names that could traverse directories or escape `wallets/`.
+    /// Allowed: `^[A-Za-z0-9._-]+$`, excluding `.` and `..`.
+    pub fn validate_wallet_name(name: &str) -> Result<(), String> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(format!(
+                "Invalid wallet name '{name}': use only ASCII letters, digits, '.', '_', '-' (not '.' or '..')"
+            ));
+        }
+        Ok(())
+    }
+
     /// Get wallet database path.
     pub fn db_path(name: &str) -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -623,6 +651,7 @@ impl Wallet {
 
     /// Delete a wallet database.
     pub fn delete(name: &str) -> Result<(), Box<dyn Error>> {
+        Self::validate_wallet_name(name)?;
         let db_path = Self::db_path(name);
         let mut removed = false;
         let extras = [
@@ -634,6 +663,7 @@ impl Wallet {
             format!("{db_path}.blocks.db"),
             format!("{db_path}.blocks.db-wal"),
             format!("{db_path}.blocks.db-shm"),
+            Self::last_tx_path(name).to_string_lossy().into_owned(),
         ];
         for path in extras {
             if Path::new(&path).exists() {
@@ -767,11 +797,18 @@ mod tests {
     fn test_clue_registration_session_cache() {
         let pk = [0x11u8; 32];
         let clue = vec![0x22u8; 8];
-        assert!(!clue_already_registered(1, &pk, &clue));
-        mark_clue_registered(1, &pk, &clue);
-        assert!(clue_already_registered(1, &pk, &clue));
+        let url_a = "https://lwd-a.example/";
+        let url_a_norm = "https://lwd-a.example";
+        let url_b = "https://lwd-b.example";
+        assert!(!clue_already_registered(url_a, 1, &pk, &clue));
+        mark_clue_registered(url_a, 1, &pk, &clue);
+        assert!(clue_already_registered(url_a_norm, 1, &pk, &clue));
         assert!(
-            !clue_already_registered(0, &pk, &clue),
+            !clue_already_registered(url_b, 1, &pk, &clue),
+            "different server_url must not collide"
+        );
+        assert!(
+            !clue_already_registered(url_a, 0, &pk, &clue),
             "different network must not collide"
         );
     }
@@ -781,11 +818,34 @@ mod tests {
         let db = WalletDb::in_memory().unwrap();
         let pk = [0x33u8; 32];
         let clue = vec![0x44u8; 8];
-        assert!(!clue_already_registered_db(&db, 1, &pk, &clue));
-        mark_clue_registered_db(&db, 1, &pk, &clue);
-        assert!(clue_already_registered_db(&db, 1, &pk, &clue));
-        let key = clue_reg_meta_key(1, &pk, &clue);
+        let url = "https://lwd-meta.example";
+        assert!(!clue_already_registered_db(&db, url, 1, &pk, &clue));
+        mark_clue_registered_db(&db, url, 1, &pk, &clue);
+        assert!(clue_already_registered_db(&db, url, 1, &pk, &clue));
+        assert!(!clue_already_registered_db(
+            &db,
+            "https://lwd-other.example",
+            1,
+            &pk,
+            &clue
+        ));
+        let key = clue_reg_meta_key(url, 1, &pk, &clue);
         assert!(db.get_meta(&key).unwrap().is_some());
+    }
+
+    #[test]
+    fn wallet_name_rejects_path_traversal() {
+        assert!(Wallet::validate_wallet_name("main").is_ok());
+        assert!(Wallet::validate_wallet_name("alice_wallet-1.0").is_ok());
+        assert!(Wallet::validate_wallet_name("../evil").is_err());
+        assert!(Wallet::validate_wallet_name("a/b").is_err());
+        assert!(Wallet::validate_wallet_name("a\\b").is_err());
+        assert!(Wallet::validate_wallet_name(".").is_err());
+        assert!(Wallet::validate_wallet_name("..").is_err());
+        assert!(Wallet::validate_wallet_name("").is_err());
+        assert!(Wallet::validate_wallet_name("bad name").is_err());
+        assert!(Wallet::open("../evil").is_err());
+        assert!(Wallet::delete("../evil").is_err());
     }
 
     #[test]

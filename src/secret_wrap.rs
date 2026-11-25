@@ -30,8 +30,9 @@ use rand::RngCore;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"MSK1";
 const NONCE_LEN: usize = 16;
@@ -60,12 +61,13 @@ fn keystream(key: &[u8; 32], nonce: &[u8], len: usize) -> Vec<u8> {
 pub fn wrap_secret(plaintext: &[u8], key: &[u8; 32]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce);
-    let stream = keystream(key, &nonce, plaintext.len());
+    let mut stream = keystream(key, &nonce, plaintext.len());
     let mut ct: Vec<u8> = plaintext
         .iter()
         .zip(stream.iter())
         .map(|(p, s)| p ^ s)
         .collect();
+    stream.zeroize();
 
     let mut out = Vec::with_capacity(4 + NONCE_LEN + ct.len() + 16);
     out.extend_from_slice(MAGIC);
@@ -101,8 +103,10 @@ pub fn unwrap_secret(stored: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
     }
     let nonce = &body[4..4 + NONCE_LEN];
     let ct = &body[4 + NONCE_LEN..];
-    let stream = keystream(key, nonce, ct.len());
-    Ok(ct.iter().zip(stream.iter()).map(|(c, s)| c ^ s).collect())
+    let mut stream = keystream(key, nonce, ct.len());
+    let out = ct.iter().zip(stream.iter()).map(|(c, s)| c ^ s).collect();
+    stream.zeroize();
+    Ok(out)
 }
 
 /// Derive a 32-byte meta-encryption key from a user passphrase.
@@ -148,24 +152,24 @@ fn meta_key_from_passphrase_argon2(pass: &str) -> [u8; 32] {
     key
 }
 
-/// Load passphrase from `MOONSHINE_WALLET_PASS`, else `{db}.pass` (create 0600).
-pub fn load_or_create_passphrase(db_path: &str) -> Result<String, String> {
+/// Load passphrase from `MOONSHINE_WALLET_PASS`, else legacy `{db}.pass`.
+pub fn load_or_create_passphrase(db_path: &str) -> Result<Zeroizing<String>, String> {
     if let Ok(pass) = env::var("MOONSHINE_WALLET_PASS") {
         if !pass.is_empty() {
-            return Ok(pass);
+            return Ok(Zeroizing::new(pass));
         }
     }
     let pass_path = format!("{db_path}.pass");
     if Path::new(&pass_path).exists() {
-        let mut s = String::new();
+        let mut s = Zeroizing::new(String::new());
         fs::File::open(&pass_path)
             .and_then(|mut f| f.read_to_string(&mut s))
             .map_err(|e| e.to_string())?;
-        let s = s.trim().to_string();
-        if s.is_empty() {
+        let trimmed = Zeroizing::new(s.trim().to_string());
+        if trimmed.is_empty() {
             return Err("Empty wallet passphrase file".into());
         }
-        return Ok(s);
+        return Ok(trimmed);
     }
     Err(format!(
         "No wallet passphrase. Set MOONSHINE_WALLET_PASS (it is not written next to the database). \
@@ -213,24 +217,49 @@ pub fn random_wrap_key() -> [u8; 32] {
 
 /// Recover the wrap key stored in `wallet_meta` under the passphrase.
 pub fn unwrap_meta_wrap_key(stored: &[u8], passphrase: &str) -> Result<[u8; 32], String> {
-    let meta_key = meta_key_from_passphrase(passphrase);
-    let raw = unwrap_secret(stored, &meta_key)?;
+    let mut meta_key = meta_key_from_passphrase(passphrase);
+    let res = unwrap_secret(stored, &meta_key);
+    meta_key.zeroize();
+    let mut raw = res?;
     if raw.len() != 32 {
+        raw.zeroize();
         return Err("wallet_meta wrap key has the wrong length".into());
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&raw);
+    raw.zeroize();
     Ok(key)
 }
 
-/// Write bytes to a file with mode 0600, replacing any previous contents.
+/// Create `dir` (and parents) and restrict `dir` to mode 0700 (owner only).
+pub fn ensure_dir_0700(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let perms = fs::Permissions::from_mode(0o700);
+    fs::set_permissions(dir, perms).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Restrict an existing file to mode 0600 (owner read/write only).
+pub fn set_file_mode_0600(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Write bytes to a file with mode 0600, replacing any previous contents and
+/// tightening permissions on pre-existing files.
 pub fn write_mode_0600_overwrite(path: &Path, data: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        if !parent.as_os_str().is_empty() {
+            ensure_dir_0700(parent)?;
+        }
     }
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o600);
     let mut f = opts.open(path).map_err(|e| e.to_string())?;
+    set_file_mode_0600(path)?;
     f.write_all(data).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -241,8 +270,9 @@ pub fn store_wrap_key_in_meta(
     wrap_key: &[u8; 32],
     passphrase: &str,
 ) -> Result<(), String> {
-    let meta_key = meta_key_from_passphrase(passphrase);
+    let mut meta_key = meta_key_from_passphrase(passphrase);
     let wrapped = wrap_secret(wrap_key, &meta_key);
+    meta_key.zeroize();
     set_meta(META_WRAP_KEY, &wrapped)
 }
 
@@ -288,10 +318,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("last-tx.hex");
         write_mode_0600_overwrite(&path, b"aaa").unwrap();
+        // Pre-existing permissive mode must be tightened back to 0600.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         write_mode_0600_overwrite(&path, b"bbb").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"bbb");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1,6 +1,6 @@
 # Moonshine Wallet CLI
 
-**Moonshine 3.1.19** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. DarkFi pin `9d7ceaf77`. Same release as Android/iOS 3.01.19 and desktop 3.1.19. Aligns with lightwalletd 0.3.12.
+**Moonshine 3.1.20** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. DarkFi pin `191941936`. Same release as Android/iOS 3.01.20 and desktop 3.1.20. Aligns with lightwalletd 0.3.13.
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 
@@ -26,15 +26,15 @@ Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a
 |-------------|--------|
 | **Rust** stable | [rustup](https://rustup.rs/) |
 | **`protoc`** | On `PATH` |
-| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `9d7ceaf77` (full `9d7ceaf77da7ccfd29ead3ba168fab284decd8c8`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough, and `git.dark.fi` returns HTTP 504 and does not have this pin. |
-| **Sibling `darkfi-lightwalletd`** | Proto from `../darkfi-lightwalletd/proto/lightwallet.proto` |
+| **Sibling `darkfi-nighthawk-testnet`** | Directory name is literal. Pin `191941936` (full `1919419364a406b85a68411fa8ad80919b286113`, nighthawk24 `nighthawk-testnet`). A `darkfi` checkout on master is **not** enough, and `git.dark.fi` returns HTTP 504 and does not have this pin. |
+| **Sibling `darkfi-lightwalletd`** | Shared `darkfi-lightwalletd` crate for UnifOMR (`build.rs` compiles local `proto/lightwallet.proto`, kept lockstep with `../darkfi-lightwalletd/proto/lightwallet.proto`) |
 | **Running lightwalletd** | Local or remote before `moonshine sync` |
 
 Clone the path dependencies as **sibling directories** (names matter — see `Cargo.toml` / `build.rs`):
 
 ```text
 parent/
-  darkfi-nighthawk-testnet/ # MUST be this name — pin 9d7ceaf77, not git.dark.fi master
+  darkfi-nighthawk-testnet/ # MUST be this name — pin 191941936, not git.dark.fi master
   darkfi-lightwalletd/      # gRPC server + proto + UnifOMR crate
   moonshine/                # this repo
   # optional; same pin if you already built Android:
@@ -47,7 +47,7 @@ Reuse the Android vendored tree (same pin) instead of a second clone:
 # Clean setup on a new Mac:
 brew install protobuf
 
-# Sibling darkfi checkout at required pin (9d7ceaf77):
+# Sibling darkfi checkout at required pin (191941936):
 git -C ../darkfi worktree add --detach ../darkfi-nighthawk-testnet origin/nighthawk-testnet
 # Or reuse the Android pin:
 # ln -sfn nighthawk-android-wallet/third_party/darkfi darkfi-nighthawk-testnet
@@ -58,7 +58,7 @@ Pin DarkFi to the same revision lightwalletd uses (reproducible builds):
 ```bash
 # from darkfi-lightwalletd/
 FORCE_DARKFI_PIN=1 ./scripts/fetch-darkfi.sh
-# See docs/darkfi-pin.md — current SHA 9d7ceaf77da7ccfd29ead3ba168fab284decd8c8
+# See docs/darkfi-pin.md — current SHA 1919419364a406b85a68411fa8ad80919b286113
 ```
 
 Moonshine’s own pruned wallet remains **SQLCipher** (`PRAGMA key`) by design — it does
@@ -92,7 +92,7 @@ cargo test
 ```toml
 server_url = "https://epidermis-sandbox-marshland.ngrok-free.dev"
 network = "testnet"
-tls_pin_sha256 = "c02faee24a8cf271aa91c28b942949ba10ec4413c6d427a598b15a5467978824"
+tls_pin_sha256 = "d8163009e3bb0bac39adbbfeb227827a91a590b96ec33f72576278c492be628e"
 use_tor = true
 ```
 
@@ -103,7 +103,7 @@ use_tor = true
 moonshine --server http://127.0.0.1:9067 sync
 ```
 
-Optional wallet passphrase for SQLCipher (otherwise a random `{wallet}.pass` file is created):
+Required wallet passphrase for SQLCipher on new wallets (not written beside the DB; legacy wallets that already have a `{wallet}.pass` file still open):
 
 ```bash
 export MOONSHINE_WALLET_PASS='your-strong-passphrase'
@@ -130,7 +130,7 @@ Moonshine’s `PinnedVerifier` checks that hash against the presented leaf cert 
 # Terminal A — darkfid (testnet example)
 # Terminal B — lightwalletd (see darkfi-lightwalletd README; bind 127.0.0.1 or TLS)
 
-moonshine wallet create --name main
+moonshine wallet create main
 moonshine address default
 moonshine sync
 moonshine balance
@@ -191,8 +191,8 @@ moonshine
 | **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive. Change outputs get `extra_omr_clues`, but strict sync still does not make that change spendable. Run `sync --force-trial` after the change is in a block |
 | **One input per send** | ✅ | Largest coin that covers amount + fee. A two-input proof is not built; darkfid rejects it |
 | **Localnet UnifOMR (2026-10-21)** | ✅ | 100/100 each way with Android and with desktop. `--no-omr` payments were received by those wallets under trial decrypt |
-| **Payment memo on wire** | ✅ | `--memo` → OMR-aware bytes in recipient `MoneyNote::memo` (not local-only) |
-| **Multi detection_keys** | ✅ | Up to 16 wallet secrets in `GetUnifOmrDigest` |
+| **Payment memo on wire** | ✅ | `--memo` (≤255 UTF-8 bytes) → plain user text in recipient `MoneyNote::memo`; encrypted OMR metadata sent separately in `omr_metadata_enc` when experimental UnifOMR is active |
+| **UnifOMR detection key** | ✅ | Derived from the primary wallet secret (matching registered clue key) and streamed in 1 MiB chunks |
 | **Local BlockCache** | ✅ | Sparse/PIR compact blocks cached beside wallet DB |
 | **Instant Sync Checkpoints** | ✅ | Fast Merkle tree restore from authenticated `CheckpointSnapshot` (see [docs/instant-sync-strategy.md](docs/instant-sync-strategy.md)) |
 | **Proto Version Lockstep** | ✅ | Client proto **2.1.0**. A 1.x or 3.x server is a hard mismatch; an empty server version is a mismatch |
@@ -208,7 +208,7 @@ moonshine
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **SQLCipher DB (S14)** | ✅ | `PRAGMA key` from `MOONSHINE_WALLET_PASS` or `{db}.pass` (0600) |
+| **SQLCipher DB (S14)** | ✅ | `PRAGMA key` from `MOONSHINE_WALLET_PASS` (required for new wallets; legacy `{db}.pass` 0600 still opens) |
 | **Secret wrap** | ✅ | Address `secret_key` BLOBs wrapped (`MSK1` + MAC). The wrap key is stored inside the encrypted database. A legacy `.wrapkey` file is imported once and deleted |
 | **WAL + secure_delete** | ✅ | SQLite pragmas on open |
 | **22-word DarkFi mnemonic** | ✅ | Same derivation as Nighthawk Android/iOS |
@@ -224,11 +224,11 @@ moonshine
 ### UnifOMR (scheme 0x05)
 
 - Requires **darkfi-lightwalletd** with `fhe-omr`
-- Cross-client crypto parity: RLWE `n=1024`, signed AHE, `CLUE_ERROR_BOUND=2`, length-prefixed SealPIR limbs
+- Cross-client crypto parity: Param2 RLWE `n=1024`, discrete Gaussian `σ=0.5` (`CLUE_ERROR_BOUND=84`, `r′=149`, `ℓ=2`), signed AHE, length-prefixed SealPIR limbs
 - Flow: RegisterCluePublicKey → GetClue → SendTransaction(omr_clue) → GetUnifOmrDigest → FetchPirBatch
 - Default sync is trial decryption. `--unifomr` is experimental and unmaintained until DarkFi mainnet contracts are live.
 - Send fails closed unless GetClue **ownership proof** verifies (rejects directory decoys)
-- First-run default LWD: loopback `http://127.0.0.1:9067` (Tor off). Remote HTTPS still needs `tls_pin_sha256` + Tor if you want it.
+- First-run default LWD: remote HTTPS endpoint with leaf-cert `tls_pin_sha256` and Tor enabled (`use_tor = true`). Override with `--server http://127.0.0.1:9067` for local loopback (Tor is auto-skipped for loopback).
 - Limits: [`docs/unifomr_mvp_limits.md`](docs/unifomr_mvp_limits.md) (Param2 active)
 - MVP fork archive: [`docs/unifomr_mvp_archive.md`](docs/unifomr_mvp_archive.md)
 - Checklist: [`docs/verification-checklist.md`](docs/verification-checklist.md)
@@ -238,7 +238,7 @@ moonshine
 1. **One input per transaction.** darkfid rejected a two-input transfer proof on the 2026-10-21 localnet. Selection spends a single coin that covers the amount plus the 0.05 DRK fee. It does not combine smaller coins. If no such coin is visible yet, the send stops before broadcast.
 2. **One coin must cover the amount plus fee.** Change from the previous send is visible after the next default trial-decrypt sync includes that block. A second coin is not combined into the proof.
 3. **Experimental UnifOMR can hide funds.** `--unifomr` only sees payments whose clue was registered on this lightwalletd. Leave it off to receive `drk` and other clue-less transfers.
-4. **`git.dark.fi` returns HTTP 504** and does not publish pin `9d7ceaf77`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
+4. **`git.dark.fi` returns HTTP 504** and does not publish pin `191941936`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
 
 ---
 
@@ -246,7 +246,7 @@ moonshine
 
 | Sibling directory | Role |
 |-------------------|------|
-| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `9d7ceaf77` (symlink to `nighthawk-android-wallet/third_party/darkfi`) |
+| `../darkfi-nighthawk-testnet` | DarkFi SDK pin `191941936` (symlink to `nighthawk-android-wallet/third_party/darkfi`) |
 | `../darkfi-lightwalletd` | gRPC lightwalletd + shared UnifOMR |
 | `../darkfi-mobile-ffi` | Shared UniFFI crate (Android / iOS / desktop) |
 | `../nighthawk-android-wallet` | Android wallet (`third_party/darkfi` = same pin) |

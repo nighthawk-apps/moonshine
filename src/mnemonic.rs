@@ -58,7 +58,7 @@ pub fn derivation_seed_from_mnemonic(mnemonic: &[String]) -> [u8; 32] {
     hasher.update(DERIVE_CONTEXT.as_bytes());
     hasher.update(&[0]);
     for word in mnemonic {
-        hasher.update(word.trim().to_lowercase().as_bytes());
+        hasher.update(normalize_text(word).as_bytes());
         hasher.update(&[0]);
     }
     *hasher.finalize().as_bytes()
@@ -241,8 +241,9 @@ impl DarkfiMnemonic {
 
     /// Decode a mnemonic word sequence to a BigUint.
     pub fn mnemonic_decode(&self, seed: &str) -> Result<BigUint, MnemonicError> {
+        let normalized = normalize_text(seed);
         let n = BigUint::from(self.wordlist.len());
-        let mut words: Vec<&str> = seed.split_whitespace().collect();
+        let mut words: Vec<&str> = normalized.split_whitespace().collect();
         let mut i = BigUint::zero();
         while let Some(w) = words.pop() {
             let k = self
@@ -257,7 +258,9 @@ impl DarkfiMnemonic {
     /// Generate a new 22-word mnemonic phrase.
     ///
     /// Uses 232 bits of entropy with HMAC-SHA512 prefix validation to ensure
-    /// the seed is deterministically verifiable.
+    /// the seed is deterministically verifiable. For the default 232-bit
+    /// 2048-word configuration, enforces an exact 22-word phrase for
+    /// mobile/desktop interoperability.
     pub fn make_seed(
         &self,
         seed_type: Option<&str>,
@@ -268,8 +271,14 @@ impl DarkfiMnemonic {
 
         let bpw = (self.wordlist.len() as f64).log2();
         let adj_num_bits = ((num_bits as f64 / bpw).ceil() * bpw) as u32;
+        let require_22_words = num_bits == 232 && self.wordlist.len() == 2048;
 
-        let threshold_exp = (num_bits as f64 - bpw) as u32;
+        let threshold_exp = if require_22_words {
+            // 2048^21 = 2^231 guarantees exactly 22 words in [2^231, 2^242).
+            231u32
+        } else {
+            (num_bits as f64 - bpw) as u32
+        };
         let threshold = BigUint::from(2u32).pow(threshold_exp);
         let max_entropy = BigUint::from(2u32).pow(adj_num_bits);
 
@@ -289,12 +298,29 @@ impl DarkfiMnemonic {
         loop {
             nonce += 1u32;
             let i = &entropy + &nonce;
+            if require_22_words && i >= max_entropy {
+                // Re-sample if nonce addition wrapped past 22 words.
+                let adj_bytes = (adj_num_bits as usize).div_ceil(8);
+                let mut buf = vec![0u8; adj_bytes];
+                use rand::RngCore;
+                loop {
+                    rng_instance.fill_bytes(&mut buf);
+                    entropy = BigUint::from_bytes_be(&buf) % &max_entropy;
+                    if entropy >= threshold {
+                        break;
+                    }
+                }
+                nonce = BigUint::zero();
+                continue;
+            }
 
             seed = self.mnemonic_encode(&i);
             if i != self.mnemonic_decode(&seed)? {
                 return Err(MnemonicError::EntropyMismatch);
             }
-            if is_new_seed(&seed, prefix) {
+            if is_new_seed(&seed, prefix)
+                && (!require_22_words || seed.split_whitespace().count() == 22)
+            {
                 break;
             }
         }
@@ -403,13 +429,14 @@ mod tests {
     #[test]
     fn test_generate_22_word_mnemonic() {
         let engine = DarkfiMnemonic::default();
-        let phrase = engine.make_seed(None, None).unwrap();
-        let word_count = phrase.split_whitespace().count();
-        // DarkFi mnemonics are 21 or 22 words (depends on entropy)
-        assert!(
-            (21..=22).contains(&word_count),
-            "Expected 21-22 words, got {word_count}"
-        );
+        for _ in 0..10 {
+            let phrase = engine.make_seed(None, None).unwrap();
+            let word_count = phrase.split_whitespace().count();
+            assert_eq!(word_count, 22, "Generated mnemonic must always be 22 words");
+            // Validation must accept mixed-case and extra spaces via normalize_text.
+            let upper = format!("  {}  ", phrase.to_uppercase().replace(' ', "   "));
+            assert!(engine.validate(&upper));
+        }
     }
 
     #[test]

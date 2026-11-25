@@ -68,6 +68,12 @@ pub async fn finish_with_native_fee(
         let coin = fee_coin
             .ok_or("Not enough native tokens to pay for fee (need leftover DRK or change ≥ fee)")?;
         let tree = tree.ok_or("Money Merkle tree missing for fee coin")?;
+        if coin.note.token_id != *DARK_TOKEN_ID {
+            return Err("fee coin must be native DRK".into());
+        }
+        if coin.note.spend_hook != FuncId::none() {
+            return Err("refusing to spend contract-hooked coin for fee".into());
+        }
         if coin.note.value < fee {
             return Err("fee coin too small".into());
         }
@@ -210,6 +216,43 @@ async fn collect_spent_nullifiers(
     Ok(spent)
 }
 
+/// Pick an unhooked, unmemoized native-DRK change output from `outputs` for `FeeV1`.
+/// Prefers tail change outputs (`idx > 0`) so a self-transfer payment output at index 0
+/// is never cannibalized when change outputs exist.
+pub(crate) fn select_tx_local_fee_candidate(
+    outputs: &[darkfi_money_contract::model::Output],
+    wallet_secrets: &[SecretKey],
+    spent_nullifiers: &[Nullifier],
+    required_fee: u64,
+) -> Option<(
+    usize,
+    SecretKey,
+    MoneyNote,
+    darkfi_money_contract::model::Coin,
+)> {
+    let min_idx = if outputs.len() > 1 { 1 } else { 0 };
+    for (idx, output) in outputs.iter().enumerate().rev() {
+        if idx < min_idx {
+            continue;
+        }
+        for secret in wallet_secrets {
+            let Ok(note) = output.note.decrypt::<MoneyNote>(secret) else {
+                continue;
+            };
+            let nullifier = Nullifier::from(poseidon_hash([secret.inner(), output.coin.inner()]));
+            let suitable = note.token_id == *DARK_TOKEN_ID
+                && note.value >= required_fee
+                && note.spend_hook == FuncId::none()
+                && note.memo.is_empty()
+                && !spent_nullifiers.contains(&nullifier);
+            if suitable {
+                return Some((idx, *secret, note, output.coin));
+            }
+        }
+    }
+    None
+}
+
 /// Find and mark a native-token TransferV1 change output as tx-local for the fee.
 fn mark_tx_local_output_for_fee(
     tx_builder: &mut TransactionBuilder,
@@ -229,22 +272,12 @@ fn mark_tx_local_output_for_fee(
             continue;
         };
 
-        let found = params.outputs.iter().enumerate().find_map(|(idx, output)| {
-            for secret in wallet_secrets {
-                let Ok(note) = output.note.decrypt::<MoneyNote>(secret) else {
-                    continue;
-                };
-                let nullifier =
-                    Nullifier::from(poseidon_hash([secret.inner(), output.coin.inner()]));
-                let suitable = note.token_id == *DARK_TOKEN_ID
-                    && note.value >= required_fee
-                    && !spent_nullifiers.contains(&nullifier);
-                if suitable {
-                    return Some((idx, *secret, note, output.coin));
-                }
-            }
-            None
-        });
+        let found = select_tx_local_fee_candidate(
+            &params.outputs,
+            wallet_secrets,
+            spent_nullifiers,
+            required_fee,
+        );
 
         if let Some((idx, ..)) = &found {
             params.outputs[*idx].tx_local = true;
@@ -285,4 +318,65 @@ fn mark_tx_local_output_for_fee(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use darkfi_money_contract::model::{CoinAttributes, Output};
+    use darkfi_sdk::crypto::Keypair;
+    use darkfi_sdk::pasta::group::Group;
+
+    fn mk_out(kp: &Keypair, value: u64, spend_hook: FuncId, memo: Vec<u8>) -> Output {
+        let blind = Blind::random(&mut rand_core::OsRng);
+        let note = MoneyNote {
+            value,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook,
+            user_data: pallas::Base::ZERO,
+            coin_blind: blind,
+            value_blind: Blind(pallas::Scalar::from(1u64)),
+            token_blind: Blind::from(2u64),
+            memo,
+        };
+        let coin = CoinAttributes {
+            public_key: kp.public,
+            value,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook,
+            user_data: pallas::Base::ZERO,
+            blind,
+        }
+        .to_coin();
+        let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
+        Output {
+            value_commit: pallas::Point::identity(),
+            token_commit: pallas::Base::ZERO,
+            coin,
+            note: enc,
+            tx_local: false,
+        }
+    }
+
+    #[test]
+    fn fee_attach_skips_memoized_and_hooked_outputs_and_prefers_change() {
+        let kp = Keypair::random(&mut rand_core::OsRng);
+        let dao_hook = crate::dao_ops::dao_spend_hook();
+        let pay0 = mk_out(&kp, 40_000_000, FuncId::none(), b"invoice".to_vec());
+        let hooked1 = mk_out(&kp, 40_000_000, dao_hook, vec![]);
+        let change2 = mk_out(&kp, 15_000_000, FuncId::none(), vec![]);
+
+        let chosen = select_tx_local_fee_candidate(
+            &[pay0.clone(), hooked1, change2],
+            &[kp.secret],
+            &[],
+            5_000_000,
+        )
+        .expect("should pick unhooked unmemoized change");
+        assert_eq!(chosen.0, 2);
+        assert_eq!(chosen.2.value, 15_000_000);
+
+        // Single memoized payment output must not be selected.
+        assert!(select_tx_local_fee_candidate(&[pay0], &[kp.secret], &[], 5_000_000).is_none());
+    }
 }

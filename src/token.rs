@@ -133,7 +133,13 @@ pub async fn build_mint_builder(
     let (token_id, mint_sk, token_blind) = load_authority(db, token_or_alias)?;
     let token_attrs = derive_token_attributes(mint_sk, token_blind);
     let mint_authority = Keypair::new(mint_sk);
-    assert_eq!(token_id, token_attrs.to_token_id());
+    let derived_id = token_attrs.to_token_id();
+    if token_id != derived_id {
+        return Err(format!(
+            "stored token_id {token_id} does not match derived authority token_id {derived_id}"
+        )
+        .into());
+    }
 
     let mint_zkbin_bytes = &zkas_bins
         .iter()

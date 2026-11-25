@@ -109,7 +109,7 @@ for ((i=0; i<COUNT; i++)); do
     for _w in $(seq 1 40); do
       sleep 10
       tip=$("$MOON" -w "$SENDER_WALLET" --server "$SERVER" sync --force-trial 2>&1 | awk '/Chain tip:/{print $NF; exit}')
-      bal=$("$MOON" -w "$SENDER_WALLET" balance 2>&1 | awk '/Raw:/{print $2; exit}')
+      bal=$("$MOON" -w "$SENDER_WALLET" balance 2>&1 | awk '/DRK:/{gsub(/[()]/,""); for(i=1;i<=NF;i++) if($i=="atomic"){print $(i-1); exit}} /Balance: 0 DRK/{print 0; exit}')
       echo "  wait tip=$tip bal=$bal (prev=$prev_tip)" | tee -a "$LOG"
       if [[ -n "$tip" && -n "$prev_tip" && "$tip" -gt "$prev_tip" && "$bal" != "0" ]]; then
         break

@@ -119,7 +119,7 @@ pub async fn connect(host: &str, port: u16) -> Result<arti_client::DataStream, S
     isolated
         .connect_with_prefs((host, port), &prefs)
         .await
-        .map_err(|e| format!("Tor connect to {host}:{port} failed: {e}"))
+        .map_err(|e| format!("Tor connect failed: {e}"))
 }
 
 #[cfg(test)]

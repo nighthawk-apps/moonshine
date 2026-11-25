@@ -1,6 +1,6 @@
 [package]
 name = "moonshine"
-version = "3.1.19"
+version = "3.1.20"
 description = "Moonshine: DarkFi light wallet CLI. Compact blocks from darkfi-lightwalletd; trial decrypt, money send, token/DAO mint, contract deploy."
 authors = ["Nighthawk Apps <contact@nighthawkapps.com>"]
 edition = "2021"
@@ -44,9 +44,8 @@ blake3 = "1.8.7"
 hex = "0.4.3"
 thiserror = "2.0.21"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
-tracing-appender = "0.2.5"
 regex-lite = "0.1"
+zeroize = "1.9"
 
 # DarkFi-compatible mnemonic (22-word Electrum-style)
 hmac = "0.12"
@@ -77,4 +76,9 @@ url = { git = "https://github.com/darkrenaissance/rust-url", branch = "v258" }
 
 [build-dependencies]
 tonic-build = "0.12"
+
+# Deny warnings in this crate only. A global RUSTFLAGS=-D warnings also
+# denies warnings in the DarkFi path dependency.
+[lints.rust]
+warnings = "deny"
 
