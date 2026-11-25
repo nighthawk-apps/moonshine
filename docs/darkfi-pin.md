@@ -18,7 +18,7 @@ Cargo git deps inside the pin (also HTTP 504 on git.dark.fi):
 | RandomX `0e31d5a` | `https://codeberg.org/darkrenaissance/RandomX` |
 | `rust-url` branch `v258` | `https://github.com/darkrenaissance/rust-url` |
 
-Current pin: `1919419364a406b85a68411fa8ad80919b286113` (`nighthawk-testnet`, same commit as Android `third_party/darkfi`). It is `9d7ceaf77` plus `6e61deb26` (recipient memo on `make_transfer_call`) and the spent-nullifier skip. Moonshine passes that memo into the transfer builder, so a checkout of `9d7ceaf77` or git.dark.fi master fails with `E0061` (13 arguments, 14 supplied). The crates path-depend on `../darkfi-nighthawk-testnet`, so this is the checkout those builds use, not a git `rev`.
+Current pin: `b87318e80968ea071fbd3a56eb1ea17110252753` (`nighthawk-testnet`, same commit as Android `third_party/darkfi`). It builds on `191941936` (`9d7ceaf77` + `6e61deb26` recipient memos + spent-nullifier skip) with upstream P2P/TLS timeout, `SocketAddr` fallback, event-graph reconnect/DAG catchup, checkpoint header, and RFC 1929 SOCKS5 auth fixes. Moonshine passes the recipient memo into the transfer builder, so a checkout of `9d7ceaf77` or git.dark.fi master fails with `E0061` (13 arguments, 14 supplied). The crates path-depend on `../darkfi-nighthawk-testnet`, so this is the checkout those builds use, not a git `rev`.
 
 ## Wallet crypto note
 

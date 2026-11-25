@@ -92,6 +92,38 @@ pub enum DaoSubcommand {
         #[arg(long, default_value_t = 5_000_000)]
         fee: u64,
     },
+    /// Create and broadcast a DAO treasury transfer proposal
+    Propose {
+        name: String,
+        recipient: String,
+        amount: String,
+        #[arg(long, default_value = "DRK")]
+        token: String,
+        #[arg(long, default_value_t = 1)]
+        duration_blockwindows: u64,
+        #[arg(long, default_value_t = 5_000_000)]
+        fee: u64,
+    },
+    /// Vote yes or no on a DAO proposal
+    Vote {
+        name: String,
+        proposal_bulla: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        no: bool,
+        #[arg(long, default_value_t = 5_000_000)]
+        fee: u64,
+    },
+    /// Execute an approved DAO transfer proposal
+    Exec {
+        name: String,
+        proposal_bulla: String,
+        #[arg(long)]
+        early: Option<bool>,
+        #[arg(long, default_value_t = 5_000_000)]
+        fee: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -220,6 +252,8 @@ pub async fn run_token(
                 &tid.to_string(),
                 atomic,
                 "",
+                Some(recipient_pk),
+                &[],
             )
             .await?;
             println!("Minted token id: {tid}");
@@ -247,6 +281,8 @@ pub async fn run_token(
                 &tid.to_string(),
                 0,
                 "freeze-mint-authority",
+                None,
+                &[],
             )
             .await?;
             w.db.set_token_frozen(&tid.to_string(), None)?;
@@ -525,12 +561,176 @@ pub async fn run_dao(
                 "",
                 0,
                 &format!("dao={name}"),
+                None,
+                &[],
             )
             .await?;
             if let Some(toml) = w.db.get_dao_toml(&name)? {
                 w.db.upsert_dao_record(&name, &toml, Some(&bulla), Some(&tx_hash))?;
             }
             println!("DAO bulla: {bulla}");
+        }
+        DaoSubcommand::Propose {
+            name,
+            recipient,
+            amount: amount_str,
+            token,
+            duration_blockwindows,
+            fee,
+        } => {
+            tx_status::begin("dao-propose", "build");
+            let recipient_pk = parse_address_pubkey_for_network(&recipient, &config.network)?;
+            let atomic = amount::parse_drk_atomic(&amount_str).map_err(|e| e.to_string())?;
+            let token_id = dao_ops::normalize_token_id(&w.db, &token)?;
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
+            crate::sync::preflight_server(&mut client, &w.db, &config.server_url, &config.network)
+                .await?;
+            let dao_zkas = zkas_pairs(
+                client
+                    .lookup_zkas(&darkfi_sdk::crypto::contract_id::DAO_CONTRACT_ID.to_string())
+                    .await?,
+            );
+            let (builder, prop_bulla, dao_bulla, prop_bytes, coin_attrs_bytes) =
+                dao_ops::build_propose_builder(
+                    &w.db,
+                    &mut client,
+                    &name,
+                    recipient_pk,
+                    atomic,
+                    token_id,
+                    duration_blockwindows,
+                    &dao_zkas,
+                )
+                .await?;
+            let money_zkas = zkas_pairs(
+                client
+                    .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
+                    .await?,
+            );
+            let tx_hash = broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &money_zkas,
+                "dao-propose",
+                &token_id.to_string(),
+                atomic,
+                &format!("dao={name}"),
+                None,
+                &[],
+            )
+            .await?;
+            w.db.upsert_dao_proposal(
+                &prop_bulla,
+                &dao_bulla,
+                &prop_bytes,
+                Some(&coin_attrs_bytes),
+                None,
+                Some(&tx_hash),
+            )?;
+            println!("Proposal bulla: {prop_bulla}");
+        }
+        DaoSubcommand::Vote {
+            name,
+            proposal_bulla,
+            yes,
+            no,
+            fee,
+        } => {
+            if yes == no {
+                return Err("Specify exactly one of --yes or --no".into());
+            }
+            tx_status::begin("dao-vote", "build");
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
+            crate::sync::preflight_server(&mut client, &w.db, &config.server_url, &config.network)
+                .await?;
+            let dao_zkas = zkas_pairs(
+                client
+                    .lookup_zkas(&darkfi_sdk::crypto::contract_id::DAO_CONTRACT_ID.to_string())
+                    .await?,
+            );
+            let builder = dao_ops::build_vote_builder(
+                &w.db,
+                &mut client,
+                &name,
+                &proposal_bulla,
+                yes,
+                &dao_zkas,
+            )
+            .await?;
+            let money_zkas = zkas_pairs(
+                client
+                    .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
+                    .await?,
+            );
+            broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &money_zkas,
+                "dao-vote",
+                "",
+                0,
+                &format!("dao={name},vote={}", if yes { "yes" } else { "no" }),
+                None,
+                &[],
+            )
+            .await?;
+        }
+        DaoSubcommand::Exec {
+            name,
+            proposal_bulla,
+            early,
+            fee,
+        } => {
+            tx_status::begin("dao-exec", "build");
+            let mut client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
+            crate::sync::preflight_server(&mut client, &w.db, &config.server_url, &config.network)
+                .await?;
+            let dao_zkas = zkas_pairs(
+                client
+                    .lookup_zkas(&darkfi_sdk::crypto::contract_id::DAO_CONTRACT_ID.to_string())
+                    .await?,
+            );
+            let money_zkas = zkas_pairs(
+                client
+                    .lookup_zkas(&darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID.to_string())
+                    .await?,
+            );
+            let (builder, spent_treasury_nfs) = dao_ops::build_exec_builder(
+                &w.db,
+                &mut client,
+                &name,
+                &proposal_bulla,
+                early,
+                &dao_zkas,
+                &money_zkas,
+            )
+            .await?;
+            let tx_hash = broadcast_builder(
+                w,
+                config,
+                builder,
+                fee,
+                &money_zkas,
+                "dao-exec",
+                "",
+                0,
+                &format!("dao={name}"),
+                None,
+                &spent_treasury_nfs,
+            )
+            .await?;
+            w.db.set_dao_proposal_executed(proposal_bulla.trim(), None, Some(&tx_hash))?;
+            println!("Executed DAO proposal: {proposal_bulla}");
         }
     }
     Ok(())
@@ -619,6 +819,8 @@ pub async fn run_contract(
                 &deploy_auth,
                 0,
                 "",
+                None,
+                &[],
             )
             .await?;
         }
@@ -645,6 +847,8 @@ pub async fn run_contract(
                 &deploy_auth,
                 0,
                 "",
+                None,
+                &[],
             )
             .await?;
             w.db.set_deploy_locked(&deploy_auth, None)?;
@@ -652,6 +856,77 @@ pub async fn run_contract(
         }
     }
     Ok(())
+}
+
+fn collect_wallet_secrets(w: &Wallet) -> Result<Vec<SecretKey>, Box<dyn Error>> {
+    let mut secrets = Vec::new();
+    for raw in w.db.get_all_secrets()? {
+        if raw.len() >= 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&raw[..32]);
+            if let Ok(sk) = SecretKey::from_bytes(arr) {
+                secrets.push(sk);
+            }
+        }
+    }
+    if secrets.is_empty() {
+        let primary = SecretKey::from_bytes(w.wallet_secret_bytes()?)
+            .map_err(|e| format!("Invalid wallet secret: {e:?}"))?;
+        secrets.push(primary);
+    }
+    Ok(secrets)
+}
+
+async fn visible_money_output_notes(
+    tx: &darkfi::tx::Transaction,
+) -> Result<Vec<(u32, darkfi_sdk::crypto::note::AeadEncryptedNote)>, Box<dyn Error>> {
+    use darkfi_money_contract::{
+        model::{MoneyFeeParamsV1, MoneyTokenMintParamsV1, MoneyTransferParamsV1},
+        MoneyFunction,
+    };
+    use darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID;
+    use darkfi_serial::deserialize_async;
+
+    let mut out = Vec::new();
+    let mut idx = 0u32;
+    for call in &tx.calls {
+        if call.data.contract_id != *MONEY_CONTRACT_ID || call.data.data.is_empty() {
+            continue;
+        }
+        let data = &call.data.data;
+        let notes = match MoneyFunction::try_from(data[0]) {
+            Ok(MoneyFunction::TransferV1) => {
+                let p = deserialize_async::<MoneyTransferParamsV1>(&data[1..]).await?;
+                p.outputs
+                    .into_iter()
+                    .filter(|o| !o.tx_local)
+                    .map(|o| o.note)
+                    .collect()
+            }
+            Ok(MoneyFunction::FeeV1) => {
+                if data.len() < 10 {
+                    Vec::new()
+                } else {
+                    let p = deserialize_async::<MoneyFeeParamsV1>(&data[9..]).await?;
+                    if p.output.tx_local {
+                        Vec::new()
+                    } else {
+                        vec![p.output.note]
+                    }
+                }
+            }
+            Ok(MoneyFunction::TokenMintV1) => {
+                let p = deserialize_async::<MoneyTokenMintParamsV1>(&data[1..]).await?;
+                vec![p.enc_note]
+            }
+            _ => Vec::new(),
+        };
+        for note in notes {
+            out.push((idx, note));
+            idx = idx.saturating_add(1);
+        }
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -665,14 +940,15 @@ async fn broadcast_builder(
     token: &str,
     amount: u64,
     detail: &str,
+    recipient_pk: Option<PublicKey>,
+    extra_spent_nullifiers: &[Vec<u8>],
 ) -> Result<String, Box<dyn Error>> {
     tx_status::phase("sign");
+    let wallet_secrets = collect_wallet_secrets(w)?;
     let (tx, nf) = if fee == 0 {
         let mut builder = builder;
         (builder.build_signed()?, Vec::new())
     } else {
-        let wallet_secret = SecretKey::from_bytes(w.wallet_secret_bytes()?)
-            .map_err(|e| format!("Invalid wallet secret: {e:?}"))?;
         // Prefer tx-local TransferV1 change (drk/0f985c7cf); only pick a wallet
         // DRK coin when that path cannot cover the fee.
         let fallback = pick_fee_coin(w, fee).ok();
@@ -686,7 +962,7 @@ async fn broadcast_builder(
             fee_coin,
             tree,
             money_zkas,
-            &[wallet_secret],
+            &wallet_secrets,
         )
         .await?;
         (tx, nf)
@@ -710,8 +986,87 @@ async fn broadcast_builder(
     tx_status::phase("broadcast");
     let mut client = LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
         .with_tor(config.use_tor);
+
+    // Attach UnifOMR clues for FeeV1 change / TokenMintV1 / DAO treasury change when enabled.
+    let (primary_clue, extra_clues, payment_index) = if config.experimental_unifomr {
+        let outputs = visible_money_output_notes(&tx).await?;
+        let total_outputs = outputs.len() as u32;
+        let own_indexes: Vec<u32> = outputs
+            .iter()
+            .filter(|(_idx, note)| {
+                wallet_secrets.iter().any(|s| {
+                    note.decrypt::<darkfi_money_contract::client::MoneyNote>(s)
+                        .is_ok()
+                })
+            })
+            .map(|(idx, _)| *idx)
+            .collect();
+        let p_idx = (0..total_outputs)
+            .find(|idx| !own_indexes.contains(idx))
+            .unwrap_or(0);
+        let own_clue_pk = w.wallet_secret_bytes().ok().and_then(|sb| {
+            darkfi_lightwalletd::unifomr::clue_keypair_from_wallet(
+                &sb,
+                Wallet::network_byte(&config.network),
+            )
+            .ok()
+            .map(|(_sk, pk)| pk)
+        });
+        let primary = if let (Some(rpk), false) = (recipient_pk, own_indexes.contains(&p_idx)) {
+            let net_byte = Wallet::network_byte(&config.network);
+            let rpk_bytes = rpk.to_bytes();
+            match (
+                client.get_light_info().await,
+                client.get_clue_public_key(rpk_bytes.to_vec()).await,
+            ) {
+                (Ok(info), Ok(resp)) if info.directory_attest_pubkey.len() == 32 => {
+                    match darkfi_lightwalletd::unifomr::verify_directory_attestation(
+                        &info.directory_attest_pubkey,
+                        net_byte,
+                        resp.key_version,
+                        &rpk_bytes,
+                        &resp.clue_public_key,
+                        &resp.ownership_proof,
+                    )
+                    .and_then(|_| {
+                        darkfi_lightwalletd::unifomr::deserialize_public_key(&resp.clue_public_key)
+                    }) {
+                        Ok(pk) => darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk),
+                        Err(e) => {
+                            eprintln!("Warning: skipping recipient UnifOMR clue ({e})");
+                            Vec::new()
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            }
+        } else if own_indexes.contains(&p_idx) {
+            own_clue_pk
+                .as_ref()
+                .map(darkfi_lightwalletd::unifomr::build_omr_clue_from_pk)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let extra = match &own_clue_pk {
+            Some(pk) => own_indexes
+                .iter()
+                .copied()
+                .filter(|idx| *idx != p_idx)
+                .map(|output_index| crate::client::proto::OutputOmrClue {
+                    output_index,
+                    omr_clue: darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(pk),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        (primary, extra, p_idx)
+    } else {
+        (Vec::new(), Vec::new(), 0)
+    };
+
     let resp = client
-        .send_transaction(raw, Vec::new(), Vec::new(), Vec::new(), 0)
+        .send_transaction(raw, primary_clue, Vec::new(), extra_clues, payment_index)
         .await?;
     if !resp.error.is_empty() && resp.error != "0" {
         return Err(format!("SendTransaction error: {}", resp.error).into());
@@ -733,9 +1088,14 @@ async fn broadcast_builder(
                 "Transaction not confirmed in lightwalletd mempool ({e}). Refusing to mark as Broadcasted."
             )
         })?;
+    let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
     if !nf.is_empty() {
-        let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
         let _ = w.db.reserve_note(&nf, reserved_at);
+    }
+    for extra_nf in extra_spent_nullifiers {
+        if !extra_nf.is_empty() {
+            let _ = w.db.reserve_note(extra_nf, reserved_at);
+        }
     }
     let _ = w.db.insert_typed(
         &tx_hash,
@@ -927,4 +1287,86 @@ pub fn parse_user_data(s: &str) -> Result<pallas::Base, Box<dyn Error>> {
         }
     }
     Err("user_data must be u64 integer, 32-byte base58 bulla, or 32-byte hex".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::WalletDb;
+    use crate::wallet::Wallet;
+    use darkfi_sdk::crypto::pasta_prelude::PrimeField;
+    use darkfi_sdk::crypto::Keypair;
+
+    #[test]
+    fn collect_wallet_secrets_returns_all_derived_addresses() {
+        let db = WalletDb::in_memory().unwrap();
+        let kp1 = Keypair::random(&mut rand_core::OsRng);
+        let kp2 = Keypair::random(&mut rand_core::OsRng);
+        db.set_meta("seed_hash", &[1u8; 32]).unwrap();
+        db.insert_address("addr1", &kp1.secret.inner().to_repr())
+            .unwrap();
+        db.insert_address("addr2", &kp2.secret.inner().to_repr())
+            .unwrap();
+        let w = Wallet {
+            name: "test".into(),
+            db,
+        };
+        let secrets = collect_wallet_secrets(&w).unwrap();
+        assert_eq!(secrets.len(), 2);
+        assert_eq!(secrets[0].inner().to_repr(), kp1.secret.inner().to_repr());
+        assert_eq!(secrets[1].inner().to_repr(), kp2.secret.inner().to_repr());
+    }
+
+    #[tokio::test]
+    async fn visible_money_output_notes_counts_token_mint_outputs() {
+        use darkfi::tx::{ContractCallLeaf, Transaction, TransactionBuilder};
+        use darkfi_money_contract::client::MoneyNote;
+        use darkfi_money_contract::model::{Coin, MoneyTokenMintParamsV1, DARK_TOKEN_ID};
+        use darkfi_money_contract::MoneyFunction;
+        use darkfi_sdk::crypto::contract_id::MONEY_CONTRACT_ID;
+        use darkfi_sdk::crypto::note::AeadEncryptedNote;
+        use darkfi_sdk::crypto::Blind;
+        use darkfi_sdk::pasta::pallas;
+        use darkfi_serial::AsyncEncodable;
+
+        let empty = Transaction {
+            calls: vec![],
+            proofs: vec![],
+            signatures: vec![],
+        };
+        assert!(visible_money_output_notes(&empty).await.unwrap().is_empty());
+
+        let kp = Keypair::random(&mut rand_core::OsRng);
+        let note = MoneyNote {
+            value: 42,
+            token_id: *DARK_TOKEN_ID,
+            coin_blind: Blind::random(&mut rand_core::OsRng),
+            value_blind: Blind::random(&mut rand_core::OsRng),
+            token_blind: Blind::random(&mut rand_core::OsRng),
+            spend_hook: darkfi_sdk::crypto::FuncId::none(),
+            user_data: pallas::Base::ZERO,
+            memo: Vec::new(),
+        };
+        let enc_note =
+            AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
+        let params = MoneyTokenMintParamsV1 {
+            coin: Coin::from(pallas::Base::from(7u64)),
+            enc_note,
+        };
+        let mut data = vec![MoneyFunction::TokenMintV1 as u8];
+        params.encode_async(&mut data).await.unwrap();
+        let call = darkfi_sdk::tx::ContractCall {
+            contract_id: *MONEY_CONTRACT_ID,
+            data,
+        };
+        let tx = TransactionBuilder::new(ContractCallLeaf::new(call, vec![], vec![]), vec![])
+            .unwrap()
+            .build()
+            .unwrap();
+        let visible = visible_money_output_notes(&tx).await.unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0, 0);
+        let decrypted = visible[0].1.decrypt::<MoneyNote>(&kp.secret).unwrap();
+        assert_eq!(decrypted.value, 42);
+    }
 }

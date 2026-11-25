@@ -12,7 +12,7 @@ env:
   # path-dependency DarkFi tree, and that tree has an upstream unreachable
   # Infallible conversion. Moonshine denies its own warnings via [lints.rust].
   # Sibling path in Cargo.toml; pin must match docs/darkfi-pin.md
-  DARKFI_PIN: 1919419364a406b85a68411fa8ad80919b286113
+  DARKFI_PIN: b87318e80968ea071fbd3a56eb1ea17110252753
 
 # Path deps expect siblings:
 #   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not git.dark.fi master; do not use the GitHub mirror)

@@ -78,10 +78,45 @@ impl WalletDb {
         let _ = crate::secret_wrap::set_file_mode_0600(Path::new(&format!("{path}-shm")));
         // The wrap key lives inside the encrypted DB. A legacy `{path}.wrapkey`
         // file is imported once, then removed so the key is not sitting beside
-        // the ciphertext.
+        // the ciphertext. Legacy unsalted / MSK1 meta keys are upgraded in place.
         if let Some(stored) = db.get_meta(crate::secret_wrap::META_WRAP_KEY)? {
-            db.wrap_key = crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase)
+            let salt = db.get_meta(crate::secret_wrap::META_PASS_SALT)?;
+            let (wrap_key, needs_rekey) =
+                crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase, salt.as_deref())
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            if needs_rekey {
+                let new_salt = crate::secret_wrap::random_pass_salt();
+                crate::secret_wrap::store_wrap_key_in_meta(
+                    |k, v| db.set_meta(k, v).map_err(|e| e.to_string()),
+                    &wrap_key,
+                    &passphrase,
+                    &new_salt,
+                )
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                let stored2 = db
+                    .get_meta(crate::secret_wrap::META_WRAP_KEY)?
+                    .ok_or_else(|| {
+                        rusqlite::Error::ToSqlConversionFailure(
+                            "wrap key missing after MSK2 re-key".into(),
+                        )
+                    })?;
+                let salt2 = db.get_meta(crate::secret_wrap::META_PASS_SALT)?;
+                let (mut check, still_legacy) = crate::secret_wrap::unwrap_meta_wrap_key(
+                    &stored2,
+                    &passphrase,
+                    salt2.as_deref(),
+                )
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if check != wrap_key || still_legacy {
+                    check.zeroize();
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        "wrap key MSK2 re-key round-trip mismatch".into(),
+                    ));
+                }
+                check.zeroize();
+            }
+            db.wrap_key = wrap_key;
+            db.migrate_secrets_to_v2()?;
             crate::secret_wrap::delete_legacy_wrap_key(path);
             return Ok(db);
         }
@@ -91,10 +126,12 @@ impl WalletDb {
             Some(key) => key,
             None => crate::secret_wrap::random_wrap_key(),
         };
+        let pass_salt = crate::secret_wrap::random_pass_salt();
         crate::secret_wrap::store_wrap_key_in_meta(
             |k, v| db.set_meta(k, v).map_err(|e| e.to_string()),
             &wrap_key,
             &passphrase,
+            &pass_salt,
         )
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
         // Confirm the meta copy unwraps before deleting the sidecar.
@@ -105,9 +142,11 @@ impl WalletDb {
                     "wrap key missing from wallet_meta after store".into(),
                 )
             })?;
-        let mut check = crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
-        if check != wrap_key {
+        let stored_salt = db.get_meta(crate::secret_wrap::META_PASS_SALT)?;
+        let (mut check, still_legacy) =
+            crate::secret_wrap::unwrap_meta_wrap_key(&stored, &passphrase, stored_salt.as_deref())
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        if check != wrap_key || still_legacy {
             wrap_key.zeroize();
             check.zeroize();
             return Err(rusqlite::Error::ToSqlConversionFailure(
@@ -117,6 +156,7 @@ impl WalletDb {
         db.wrap_key = wrap_key;
         wrap_key.zeroize();
         check.zeroize();
+        db.migrate_secrets_to_v2()?;
         crate::secret_wrap::delete_legacy_wrap_key(path);
         Ok(db)
     }
@@ -241,10 +281,174 @@ impl WalletDb {
                 is_locked INTEGER NOT NULL DEFAULT 0,
                 lock_height INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS dao_proposals (
+                proposal_bulla TEXT PRIMARY KEY,
+                dao_bulla TEXT NOT NULL,
+                proposal_bytes BLOB NOT NULL,
+                coin_attrs_bytes BLOB,
+                mint_height INTEGER,
+                tx_hash TEXT,
+                exec_height INTEGER,
+                exec_tx_hash TEXT
+            );
         ",
         )?;
         self.migrate_notes_columns()?;
         Ok(())
+    }
+
+    /// One-time atomic upgrade of legacy `MSK1` or plaintext secret columns to `MSK2`
+    /// (`XChaCha20Poly1305`). Safe to call repeatedly (idempotent when already `MSK2`).
+    pub fn migrate_secrets_to_v2(&self) -> SqlResult<usize> {
+        let mut upgraded = 0usize;
+        let tx = self.conn.unchecked_transaction()?;
+
+        // 1. addresses.secret_key
+        {
+            let mut stmt = tx.prepare("SELECT id, secret_key FROM addresses")?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<SqlResult<_>>()?;
+            drop(stmt);
+            for (id, stored) in rows {
+                let (mut plain, needs_rewrite) =
+                    crate::secret_wrap::unwrap_secret_for_migration(&stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if needs_rewrite {
+                    let wrapped = crate::secret_wrap::wrap_secret(&plain, &self.wrap_key);
+                    tx.execute(
+                        "UPDATE addresses SET secret_key = ?1 WHERE id = ?2",
+                        params![wrapped, id],
+                    )?;
+                    upgraded += 1;
+                }
+                plain.zeroize();
+            }
+        }
+
+        // 2. notes.owner_secret
+        {
+            let mut stmt =
+                tx.prepare("SELECT id, owner_secret FROM notes WHERE owner_secret IS NOT NULL")?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<SqlResult<_>>()?;
+            drop(stmt);
+            for (id, stored) in rows {
+                let (mut plain, needs_rewrite) =
+                    crate::secret_wrap::unwrap_secret_for_migration(&stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if needs_rewrite {
+                    let wrapped = crate::secret_wrap::wrap_secret(&plain, &self.wrap_key);
+                    tx.execute(
+                        "UPDATE notes SET owner_secret = ?1 WHERE id = ?2",
+                        params![wrapped, id],
+                    )?;
+                    upgraded += 1;
+                }
+                plain.zeroize();
+            }
+        }
+
+        // 3. wallet_meta['derivation_seed']
+        {
+            let mut stmt =
+                tx.prepare("SELECT value FROM wallet_meta WHERE key = 'derivation_seed'")?;
+            let existing: Option<Vec<u8>> = stmt.query_map([], |r| r.get(0))?.next().transpose()?;
+            drop(stmt);
+            if let Some(stored) = existing {
+                let (mut plain, needs_rewrite) =
+                    crate::secret_wrap::unwrap_secret_for_migration(&stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if needs_rewrite {
+                    let wrapped = crate::secret_wrap::wrap_secret(&plain, &self.wrap_key);
+                    tx.execute(
+                        "UPDATE wallet_meta SET value = ?1 WHERE key = 'derivation_seed'",
+                        params![wrapped],
+                    )?;
+                    upgraded += 1;
+                }
+                plain.zeroize();
+            }
+        }
+
+        // 4. token_mints (mint_authority + token_blind)
+        {
+            let mut stmt =
+                tx.prepare("SELECT token_id, mint_authority, token_blind FROM token_mints")?;
+            let rows: Vec<(String, Vec<u8>, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<SqlResult<_>>()?;
+            drop(stmt);
+            for (tid, auth_stored, blind_stored) in rows {
+                let (mut auth_plain, auth_rw) =
+                    crate::secret_wrap::unwrap_secret_for_migration(&auth_stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                let (mut blind_plain, blind_rw) =
+                    crate::secret_wrap::unwrap_secret_for_migration(&blind_stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if auth_rw || blind_rw {
+                    let auth_w = crate::secret_wrap::wrap_secret(&auth_plain, &self.wrap_key);
+                    let blind_w = crate::secret_wrap::wrap_secret(&blind_plain, &self.wrap_key);
+                    tx.execute(
+                        "UPDATE token_mints SET mint_authority = ?1, token_blind = ?2 WHERE token_id = ?3",
+                        params![auth_w, blind_w, tid],
+                    )?;
+                    upgraded += 1;
+                }
+                auth_plain.zeroize();
+                blind_plain.zeroize();
+            }
+        }
+
+        // 5. deploy_auths.secret_key
+        {
+            let mut stmt = tx.prepare("SELECT contract_id, secret_key FROM deploy_auths")?;
+            let rows: Vec<(String, Vec<u8>)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<SqlResult<_>>()?;
+            drop(stmt);
+            for (cid, stored) in rows {
+                let (mut plain, needs_rewrite) =
+                    crate::secret_wrap::unwrap_secret_for_migration(&stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if needs_rewrite {
+                    let wrapped = crate::secret_wrap::wrap_secret(&plain, &self.wrap_key);
+                    tx.execute(
+                        "UPDATE deploy_auths SET secret_key = ?1 WHERE contract_id = ?2",
+                        params![wrapped, cid],
+                    )?;
+                    upgraded += 1;
+                }
+                plain.zeroize();
+            }
+        }
+
+        // 6. dao_records.params_toml
+        {
+            let mut stmt = tx.prepare("SELECT name, params_toml FROM dao_records")?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<SqlResult<_>>()?;
+            drop(stmt);
+            for (name, stored) in rows {
+                let (plain, needs_rewrite) =
+                    crate::secret_wrap::unwrap_secret_text_for_migration(&stored, &self.wrap_key)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                if needs_rewrite {
+                    let wrapped = crate::secret_wrap::wrap_secret_text(&plain, &self.wrap_key);
+                    tx.execute(
+                        "UPDATE dao_records SET params_toml = ?1 WHERE name = ?2",
+                        params![wrapped, name],
+                    )?;
+                    upgraded += 1;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(upgraded)
     }
 
     /// Recompute each unspent note's commitment from note attributes + owner
@@ -530,6 +734,8 @@ impl WalletDb {
         token_blind: &[u8],
         alias: Option<&str>,
     ) -> SqlResult<()> {
+        let wrapped_auth = crate::secret_wrap::wrap_secret(mint_authority, &self.wrap_key);
+        let wrapped_blind = crate::secret_wrap::wrap_secret(token_blind, &self.wrap_key);
         self.conn.execute(
             "INSERT INTO token_mints (token_id, mint_authority, token_blind, alias, is_frozen) \
              VALUES (?1, ?2, ?3, ?4, 0) \
@@ -537,7 +743,7 @@ impl WalletDb {
                mint_authority = excluded.mint_authority, \
                token_blind = excluded.token_blind, \
                alias = COALESCE(excluded.alias, token_mints.alias)",
-            rusqlite::params![token_id, mint_authority, token_blind, alias],
+            rusqlite::params![token_id, wrapped_auth, wrapped_blind, alias],
         )?;
         Ok(())
     }
@@ -557,7 +763,16 @@ impl WalletDb {
                 row.get::<_, Option<u32>>(5)?,
             ))
         })?;
-        rows.collect()
+        let mut out = Vec::new();
+        for r in rows {
+            let (tid, auth_stored, blind_stored, alias, frozen, fh) = r?;
+            let auth = crate::secret_wrap::unwrap_secret(&auth_stored, &self.wrap_key)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            let blind = crate::secret_wrap::unwrap_secret(&blind_stored, &self.wrap_key)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            out.push((tid, auth, blind, alias, frozen, fh));
+        }
+        Ok(out)
     }
 
     pub fn get_token_mint(&self, token_or_alias: &str) -> SqlResult<Option<TokenMintLookup>> {
@@ -576,7 +791,13 @@ impl WalletDb {
             ))
         })?;
         match rows.next() {
-            Some(Ok(v)) => Ok(Some(v)),
+            Some(Ok((tid, auth_stored, blind_stored, frozen))) => {
+                let auth = crate::secret_wrap::unwrap_secret(&auth_stored, &self.wrap_key)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                let blind = crate::secret_wrap::unwrap_secret(&blind_stored, &self.wrap_key)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                Ok(Some((tid, auth, blind, frozen)))
+            }
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
@@ -597,13 +818,14 @@ impl WalletDb {
         bulla: Option<&str>,
         tx_hash: Option<&str>,
     ) -> SqlResult<()> {
+        let wrapped_toml = crate::secret_wrap::wrap_secret_text(params_toml, &self.wrap_key);
         self.conn.execute(
             "INSERT INTO dao_records (name, params_toml, bulla, tx_hash) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(name) DO UPDATE SET
                params_toml = excluded.params_toml,
                bulla = COALESCE(excluded.bulla, dao_records.bulla),
                tx_hash = COALESCE(excluded.tx_hash, dao_records.tx_hash)",
-            rusqlite::params![name, params_toml, bulla, tx_hash],
+            rusqlite::params![name, wrapped_toml, bulla, tx_hash],
         )?;
         Ok(())
     }
@@ -628,19 +850,24 @@ impl WalletDb {
             .prepare("SELECT params_toml FROM dao_records WHERE name = ?1")?;
         let mut rows = stmt.query_map([name], |row| row.get::<_, String>(0))?;
         match rows.next() {
-            Some(Ok(v)) => Ok(Some(v)),
+            Some(Ok(stored)) => {
+                let plain = crate::secret_wrap::unwrap_secret_text(&stored, &self.wrap_key)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                Ok(Some(plain))
+            }
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
     }
 
     pub fn insert_deploy_auth(&self, contract_id: &str, secret_key: &[u8]) -> SqlResult<()> {
+        let wrapped = crate::secret_wrap::wrap_secret(secret_key, &self.wrap_key);
         self.conn.execute(
             "INSERT INTO deploy_auths (contract_id, secret_key, is_locked) \
              VALUES (?1, ?2, 0) \
              ON CONFLICT(contract_id) DO UPDATE SET \
                secret_key = excluded.secret_key",
-            rusqlite::params![contract_id, secret_key],
+            rusqlite::params![contract_id, wrapped],
         )?;
         Ok(())
     }
@@ -667,7 +894,11 @@ impl WalletDb {
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? != 0))
         })?;
         match rows.next() {
-            Some(Ok(v)) => Ok(Some(v)),
+            Some(Ok((stored, locked))) => {
+                let plain = crate::secret_wrap::unwrap_secret(&stored, &self.wrap_key)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+                Ok(Some((plain, locked)))
+            }
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
@@ -816,6 +1047,22 @@ impl WalletDb {
             )?;
             Ok(())
         }
+    }
+
+    /// Store a sensitive metadata value wrapped at rest (`MSK2`).
+    pub fn set_wrapped_meta(&self, key: &str, value: &[u8]) -> SqlResult<()> {
+        let wrapped = crate::secret_wrap::wrap_secret(value, &self.wrap_key);
+        self.set_meta(key, &wrapped)
+    }
+
+    /// Retrieve and unwrap a sensitive metadata value (`MSK2`, fail-closed).
+    pub fn get_wrapped_meta(&self, key: &str) -> SqlResult<Option<Vec<u8>>> {
+        let Some(stored) = self.get_meta(key)? else {
+            return Ok(None);
+        };
+        let plain = crate::secret_wrap::unwrap_secret(&stored, &self.wrap_key)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        Ok(Some(plain))
     }
 
     /// Store a key-value pair in wallet metadata.
@@ -1301,7 +1548,9 @@ impl WalletDb {
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut secrets = Vec::new();
         for r in rows {
-            let toml_str = r?;
+            let stored = r?;
+            let toml_str = crate::secret_wrap::unwrap_secret_text(&stored, &self.wrap_key)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
             if let Ok(value) = toml::from_str::<toml::Value>(&toml_str) {
                 if let Some(table) = value.as_table() {
                     let sec = table
@@ -1325,6 +1574,171 @@ impl WalletDb {
             }
         }
         Ok(secrets)
+    }
+
+    /// Unspent DAO treasury coins with full spend fields (matching BOTH spend_hook and user_data).
+    #[allow(clippy::type_complexity)]
+    pub fn list_unspent_dao_full(
+        &self,
+        dao_spend_hook: &[u8],
+        dao_bulla: &[u8],
+    ) -> SqlResult<
+        Vec<(
+            String,
+            u32,
+            i64,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            u32,
+            Vec<u8>,
+            Vec<u8>,
+        )>,
+    > {
+        let mut stmt = self.conn.prepare(
+            "SELECT tx_hash, output_index, value_raw, token_id, coin_blind, value_blind, token_blind, \
+             spend_hook_bytes, user_data, leaf_position, commitment, owner_secret \
+             FROM notes WHERE spent = 0 AND spend_hook_bytes = ?1 AND user_data = ?2 \
+             AND leaf_position IS NOT NULL AND commitment IS NOT NULL AND length(commitment) = 32 \
+             AND owner_secret IS NOT NULL \
+             ORDER BY block_height",
+        )?;
+        let rows = stmt.query_map(params![dao_spend_hook, dao_bulla], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, u32>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
+                row.get::<_, Vec<u8>>(11)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (tx, idx, val, tok, cb, vb, tb, hook, ud, lpos, commitment, owner_stored) = row?;
+            let owner = crate::secret_wrap::unwrap_secret(&owner_stored, &self.wrap_key)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            out.push((
+                tx, idx, val, tok, cb, vb, tb, hook, ud, lpos, commitment, owner,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Persist a DAO proposal (locally created or decrypted from `dao_calls`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_dao_proposal(
+        &self,
+        proposal_bulla: &str,
+        dao_bulla: &str,
+        proposal_bytes: &[u8],
+        coin_attrs_bytes: Option<&[u8]>,
+        mint_height: Option<u32>,
+        tx_hash: Option<&str>,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "INSERT INTO dao_proposals \
+             (proposal_bulla, dao_bulla, proposal_bytes, coin_attrs_bytes, mint_height, tx_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(proposal_bulla) DO UPDATE SET \
+               coin_attrs_bytes = COALESCE(excluded.coin_attrs_bytes, dao_proposals.coin_attrs_bytes), \
+               mint_height = COALESCE(excluded.mint_height, dao_proposals.mint_height), \
+               tx_hash = COALESCE(excluded.tx_hash, dao_proposals.tx_hash)",
+            params![
+                proposal_bulla,
+                dao_bulla,
+                proposal_bytes,
+                coin_attrs_bytes,
+                mint_height,
+                tx_hash
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Look up a stored DAO proposal by Base58 `proposal_bulla`.
+    #[allow(clippy::type_complexity)]
+    pub fn get_dao_proposal(
+        &self,
+        proposal_bulla: &str,
+    ) -> SqlResult<
+        Option<(
+            String,
+            String,
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<u32>,
+            Option<String>,
+            Option<u32>,
+            Option<String>,
+        )>,
+    > {
+        let mut stmt = self.conn.prepare(
+            "SELECT proposal_bulla, dao_bulla, proposal_bytes, coin_attrs_bytes, \
+             mint_height, tx_hash, exec_height, exec_tx_hash \
+             FROM dao_proposals WHERE proposal_bulla = ?1",
+        )?;
+        let mut rows = stmt.query_map([proposal_bulla], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark a stored DAO proposal as executed.
+    pub fn set_dao_proposal_executed(
+        &self,
+        proposal_bulla: &str,
+        exec_height: Option<u32>,
+        exec_tx_hash: Option<&str>,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE dao_proposals SET \
+             exec_height = COALESCE(?2, exec_height), \
+             exec_tx_hash = COALESCE(?3, exec_tx_hash) \
+             WHERE proposal_bulla = ?1",
+            params![proposal_bulla, exec_height, exec_tx_hash],
+        )?;
+        Ok(())
+    }
+
+    /// All synced compact DAO calls in ascending height order (no arbitrary limit).
+    pub fn list_all_dao_calls_asc(&self) -> SqlResult<Vec<DaoCallFullRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT height, tx_hash, kind, bulla, payload FROM dao_calls \
+             ORDER BY height ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        rows.collect()
     }
 
     /// Synced compact DAO calls including payload (ordered by height ascending for tree/replay).
@@ -1437,6 +1851,14 @@ impl WalletDb {
         )?;
         tx.execute("DELETE FROM dao_calls", [])?;
         tx.execute("DELETE FROM func_events", [])?;
+        tx.execute(
+            "DELETE FROM dao_proposals WHERE coin_attrs_bytes IS NULL",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE dao_proposals SET mint_height = NULL, tx_hash = NULL, exec_height = NULL, exec_tx_hash = NULL",
+            [],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1521,6 +1943,18 @@ impl WalletDb {
         )?;
         tx.execute("DELETE FROM dao_calls WHERE height > ?1", params![height])?;
         tx.execute("DELETE FROM func_events WHERE height > ?1", params![height])?;
+        tx.execute(
+            "UPDATE dao_proposals SET exec_height = NULL, exec_tx_hash = NULL WHERE exec_height > ?1",
+            params![height],
+        )?;
+        tx.execute(
+            "DELETE FROM dao_proposals WHERE mint_height > ?1 AND coin_attrs_bytes IS NULL",
+            params![height],
+        )?;
+        tx.execute(
+            "UPDATE dao_proposals SET mint_height = NULL, tx_hash = NULL WHERE mint_height > ?1 AND coin_attrs_bytes IS NOT NULL",
+            params![height],
+        )?;
         tx.commit()?;
         Ok((notes_deleted as u32, txs_deleted as u32))
     }
@@ -1593,6 +2027,97 @@ impl WalletDb {
             "UPDATE transactions SET block_height = ?1 WHERE hash = ?2 AND block_height = 0",
             params![height, hash],
         )
+    }
+
+    /// True if a note with `(tx_hash, commitment)` is already stored in `notes`.
+    pub fn note_exists_by_commitment(&self, tx_hash: &str, commitment: &[u8]) -> SqlResult<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM notes WHERE tx_hash = ?1 AND commitment = ?2 LIMIT 1")?;
+        let mut rows = stmt.query(params![tx_hash, commitment])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Resolve a non-colliding `output_index` for `(tx_hash, preferred_idx, commitment)`.
+    ///
+    /// If `(tx_hash, preferred_idx)` is unoccupied (or occupied by the same commitment),
+    /// returns `preferred_idx`. If occupied by a *different* commitment (e.g. a synthetic
+    /// `idx = 0` from `GetCompactOutputsByFunc` colliding with a `FeeV1` output in the
+    /// same transaction), returns `MAX(output_index) + 1` for `tx_hash`.
+    pub fn resolve_note_output_index(
+        &self,
+        tx_hash: &str,
+        preferred_idx: u32,
+        commitment: Option<&[u8]>,
+    ) -> SqlResult<u32> {
+        let existing: Option<Option<Vec<u8>>> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT commitment FROM notes WHERE tx_hash = ?1 AND output_index = ?2 LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![tx_hash, preferred_idx])?;
+            if let Some(row) = rows.next()? {
+                Some(row.get::<_, Option<Vec<u8>>>(0)?)
+            } else {
+                None
+            }
+        };
+        let Some(existing_commitment) = existing else {
+            return Ok(preferred_idx);
+        };
+        if let (Some(want), Some(have)) = (commitment, existing_commitment.as_deref()) {
+            if want == have {
+                return Ok(preferred_idx);
+            }
+            let max_idx: u32 = self.conn.query_row(
+                "SELECT COALESCE(MAX(output_index), 0) FROM notes WHERE tx_hash = ?1",
+                params![tx_hash],
+                |row| row.get(0),
+            )?;
+            return Ok(max_idx.saturating_add(1));
+        }
+        Ok(preferred_idx)
+    }
+
+    /// Record or update an incoming transaction by summing ALL notes belonging to
+    /// `(hash, token_id)` in `notes`.
+    ///
+    /// - Multi-output incoming txs (e.g. `--half-split`, batch payouts) reflect the
+    ///   exact summed total rather than collapsing to output 0.
+    /// - Idempotent across rescans (derives total directly from deduplicated `notes`).
+    /// - Never overwrites an `"outgoing"` row (only confirms its `block_height`).
+    pub fn upsert_incoming_transaction(
+        &self,
+        hash: &str,
+        block_height: u32,
+        fallback_value: i64,
+        token_id: &str,
+        memo: Option<&str>,
+    ) -> SqlResult<()> {
+        let summed: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(value_raw), 0) FROM notes WHERE tx_hash = ?1 AND token_id = ?2",
+            params![hash, token_id],
+            |row| row.get(0),
+        )?;
+        let total = if summed > 0 { summed } else { fallback_value };
+        self.conn.execute(
+            "INSERT INTO transactions (hash, block_height, direction, value_raw, token_id, counterparty, memo, kind)
+             VALUES (?1, ?2, 'incoming', ?3, ?4, NULL, ?5, 'receive')
+             ON CONFLICT(hash) DO UPDATE SET
+               block_height = CASE
+                 WHEN transactions.block_height = 0 AND excluded.block_height > 0 THEN excluded.block_height
+                 ELSE transactions.block_height
+               END,
+               value_raw = CASE
+                 WHEN transactions.direction = 'incoming' AND transactions.token_id = excluded.token_id THEN excluded.value_raw
+                 ELSE transactions.value_raw
+               END,
+               memo = CASE
+                 WHEN transactions.direction = 'incoming' AND (transactions.memo IS NULL OR transactions.memo = '') THEN excluded.memo
+                 ELSE transactions.memo
+               END",
+            params![hash, block_height, total, token_id, memo],
+        )?;
+        Ok(())
     }
 
     /// Insert a transaction record.
@@ -1767,14 +2292,227 @@ mod tests {
             )
             .unwrap();
         assert!(
-            stored.starts_with(b"MSK1"),
-            "secret_key must be wrapped (MSK1), got {:?}",
+            stored.starts_with(b"MSK2"),
+            "secret_key must be wrapped (MSK2), got {:?}",
             &stored[..stored.len().min(8)]
         );
         assert_ne!(stored, secret.to_vec());
         // Round-trip via public API still yields plaintext.
         let secrets = db.get_all_secrets().unwrap();
         assert_eq!(secrets, vec![secret.to_vec()]);
+    }
+
+    #[test]
+    fn test_all_sensitive_secrets_wrapped_at_rest_and_legacy_migrates() {
+        let db = WalletDb::in_memory().unwrap();
+        let wrap_key = db.wrap_key;
+
+        // 1. Fresh inserts wrap derivation_seed, token_mints, deploy_auths, dao_records with MSK2.
+        db.set_wrapped_meta("derivation_seed", &[0x55u8; 32])
+            .unwrap();
+        let raw_seed: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT value FROM wallet_meta WHERE key = 'derivation_seed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_seed.starts_with(b"MSK2"));
+        assert_eq!(
+            db.get_wrapped_meta("derivation_seed").unwrap().unwrap(),
+            vec![0x55u8; 32]
+        );
+
+        db.insert_token_mint("tok1", &[0x11u8; 32], &[0x22u8; 32], Some("T1"))
+            .unwrap();
+        let (raw_auth, raw_blind): (Vec<u8>, Vec<u8>) = db
+            .conn
+            .query_row(
+                "SELECT mint_authority, token_blind FROM token_mints WHERE token_id = 'tok1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(raw_auth.starts_with(b"MSK2"));
+        assert!(raw_blind.starts_with(b"MSK2"));
+
+        db.insert_deploy_auth("cid1", &[0x33u8; 32]).unwrap();
+        let raw_deploy: Vec<u8> = db
+            .conn
+            .query_row(
+                "SELECT secret_key FROM deploy_auths WHERE contract_id = 'cid1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_deploy.starts_with(b"MSK2"));
+
+        db.upsert_dao_record("d1", "notes_secret_key = \"supersecret\"", None, None)
+            .unwrap();
+        let raw_dao: String = db
+            .conn
+            .query_row(
+                "SELECT params_toml FROM dao_records WHERE name = 'd1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_dao.starts_with("MSK2:"));
+        assert!(!raw_dao.contains("supersecret"));
+        assert_eq!(
+            db.get_dao_toml("d1").unwrap().unwrap(),
+            "notes_secret_key = \"supersecret\""
+        );
+
+        // 2. Simulate legacy MSK1 & plaintext rows directly in SQLite -> fail closed before migration.
+        let legacy_addr_v1 = crate::secret_wrap::wrap_secret_legacy_v1(&[0x77u8; 32], &wrap_key);
+        db.conn
+            .execute(
+                "INSERT INTO addresses (public_key, secret_key) VALUES ('legacy_pk', ?1)",
+                params![legacy_addr_v1],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE wallet_meta SET value = ?1 WHERE key = 'derivation_seed'",
+                params![vec![0x66u8; 32]],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE token_mints SET mint_authority = ?1, token_blind = ?2 WHERE token_id = 'tok1'",
+                params![vec![0x88u8; 32], vec![0x99u8; 32]],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE deploy_auths SET secret_key = ?1 WHERE contract_id = 'cid1'",
+                params![vec![0xAAu8; 32]],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE dao_records SET params_toml = 'legacy_plain = true' WHERE name = 'd1'",
+                [],
+            )
+            .unwrap();
+
+        // Fail-closed runtime reads refuse unmigrated MSK1/plaintext!
+        assert!(db.get_all_secrets().is_err());
+        assert!(db.get_wrapped_meta("derivation_seed").is_err());
+        assert!(db.get_token_mint("tok1").is_err());
+        assert!(db.get_deploy_auth("cid1").is_err());
+        assert!(db.get_dao_toml("d1").is_err());
+
+        // One-time migration upgrades all 5 rows to MSK2!
+        let count = db.migrate_secrets_to_v2().unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(
+            db.migrate_secrets_to_v2().unwrap(),
+            0,
+            "migration must be idempotent"
+        );
+
+        assert_eq!(db.get_all_secrets().unwrap(), vec![vec![0x77u8; 32]]);
+        assert_eq!(
+            db.get_wrapped_meta("derivation_seed").unwrap().unwrap(),
+            vec![0x66u8; 32]
+        );
+        let (_, auth, blind, _) = db.get_token_mint("tok1").unwrap().unwrap();
+        assert_eq!(auth, vec![0x88u8; 32]);
+        assert_eq!(blind, vec![0x99u8; 32]);
+        assert_eq!(
+            db.get_deploy_auth("cid1").unwrap().unwrap().0,
+            vec![0xAAu8; 32]
+        );
+        assert_eq!(
+            db.get_dao_toml("d1").unwrap().unwrap(),
+            "legacy_plain = true"
+        );
+    }
+
+    #[test]
+    fn test_multi_output_incoming_tx_sums_and_avoids_synthetic_idx_collision() {
+        let db = WalletDb::in_memory().unwrap();
+        let tok = WalletDb::dark_token_id_hex();
+        let c0 = [0x10u8; 32];
+        let c1 = [0x20u8; 32];
+
+        // First output at idx=0
+        let idx0 = db
+            .resolve_note_output_index("tx_multi", 0, Some(&c0))
+            .unwrap();
+        assert_eq!(idx0, 0);
+        db.insert_note(
+            "tx_multi",
+            idx0,
+            500,
+            &tok,
+            &[1],
+            100,
+            Some("split"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&c0),
+            Some(&[1]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.upsert_incoming_transaction("tx_multi", 100, 500, &tok, Some("split"))
+            .unwrap();
+        assert_eq!(
+            db.get_transaction("tx_multi").unwrap().unwrap().value_raw,
+            500
+        );
+
+        // Second output with synthetic idx=0 but DIFFERENT commitment c1 -> gets idx=1, no collision!
+        assert!(!db.note_exists_by_commitment("tx_multi", &c1).unwrap());
+        let idx1 = db
+            .resolve_note_output_index("tx_multi", 0, Some(&c1))
+            .unwrap();
+        assert_eq!(idx1, 1);
+        db.insert_note(
+            "tx_multi",
+            idx1,
+            700,
+            &tok,
+            &[2],
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&c1),
+            Some(&[2]),
+            Some(&[9u8; 32]),
+        )
+        .unwrap();
+        db.upsert_incoming_transaction("tx_multi", 100, 700, &tok, None)
+            .unwrap();
+
+        let tx_row = db.get_transaction("tx_multi").unwrap().unwrap();
+        assert_eq!(
+            tx_row.value_raw, 1200,
+            "multi-output incoming tx must sum all outputs"
+        );
+        assert_eq!(tx_row.memo.as_deref(), Some("split"));
+
+        // Re-scanning is idempotent (no double-counting).
+        assert!(db.note_exists_by_commitment("tx_multi", &c0).unwrap());
+        db.upsert_incoming_transaction("tx_multi", 100, 500, &tok, Some("split"))
+            .unwrap();
+        assert_eq!(
+            db.get_transaction("tx_multi").unwrap().unwrap().value_raw,
+            1200
+        );
     }
 
     #[test]

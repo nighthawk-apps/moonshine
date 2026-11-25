@@ -596,55 +596,86 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 }
 
-                // Coin selection (unhooked coins only)
+                // Coin selection preview (unhooked coins only, multi-input supported).
                 let mut unspent = w.db.list_unspent()?;
-                unspent.sort_by_key(|coin| std::cmp::Reverse(coin.2));
+                unspent.sort_by(|a, b| {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| a.1.cmp(&b.1))
+                });
                 let mut selected_inputs = Vec::new();
                 let mut input_total = 0u64;
 
                 if is_drk {
-                    for (tx_hash, idx, value, ref tok_id) in &unspent {
-                        let Ok(val_u64) = u64::try_from(*value) else {
-                            continue;
-                        };
-                        if crate::db::WalletDb::is_drk_token(tok_id) && val_u64 >= drk_total_needed
-                        {
+                    let drk_coins: Vec<_> = unspent
+                        .iter()
+                        .filter_map(|(tx_hash, idx, value, tok_id)| {
+                            let val_u64 = u64::try_from(*value).ok()?;
+                            crate::db::WalletDb::is_drk_token(tok_id).then_some((
+                                tx_hash.clone(),
+                                *idx,
+                                *value,
+                                val_u64,
+                            ))
+                        })
+                        .collect();
+                    if let Some((tx_hash, idx, value, val_u64)) = drk_coins
+                        .iter()
+                        .filter(|(_, _, _, v)| *v >= drk_total_needed)
+                        .min_by_key(|(_, _, _, v)| *v)
+                    {
+                        selected_inputs.push((tx_hash.clone(), *idx, *value));
+                        input_total = *val_u64;
+                    } else {
+                        for (tx_hash, idx, value, val_u64) in &drk_coins {
                             selected_inputs.push((tx_hash.clone(), *idx, *value));
-                            input_total = val_u64;
-                            break;
+                            input_total = input_total
+                                .checked_add(*val_u64)
+                                .ok_or("input total overflow")?;
+                            if input_total >= drk_total_needed {
+                                break;
+                            }
                         }
                     }
-                    if selected_inputs.is_empty() {
+                    if input_total < drk_total_needed {
                         return Err(format!(
-                            "No single coin covers {drk_total_needed} atomic DRK \
-                             (amount {amount_atomic} + fee {fee_atomic}). \
-                             Moonshine spends one input per transaction; darkfid rejects \
-                             two-input proofs. If change from the last send is missing, \
-                             run `moonshine sync` after that change is in a block."
+                            "Insufficient spendable DRK coins: have {input_total} atomic, \
+                             need {drk_total_needed} ({amount_atomic} + {fee_atomic} fee)."
                         )
                         .into());
                     }
                 } else {
-                    for (tx_hash, idx, value, ref tok_id) in &unspent {
-                        let Ok(val_u64) = u64::try_from(*value) else {
-                            continue;
-                        };
-                        let matches = tok_id == &resolved_token_hex
-                            || tok_id == &token
-                            || tok_id == &token_hex;
-                        if matches && val_u64 >= amount_atomic {
+                    let tok_coins: Vec<_> = unspent
+                        .iter()
+                        .filter_map(|(tx_hash, idx, value, tok_id)| {
+                            let val_u64 = u64::try_from(*value).ok()?;
+                            let matches = tok_id == &resolved_token_hex
+                                || tok_id == &token
+                                || tok_id == &token_hex;
+                            matches.then_some((tx_hash.clone(), *idx, *value, val_u64))
+                        })
+                        .collect();
+                    if let Some((tx_hash, idx, value, val_u64)) = tok_coins
+                        .iter()
+                        .filter(|(_, _, _, v)| *v >= amount_atomic)
+                        .min_by_key(|(_, _, _, v)| *v)
+                    {
+                        selected_inputs.push((tx_hash.clone(), *idx, *value));
+                        input_total = *val_u64;
+                    } else {
+                        for (tx_hash, idx, value, val_u64) in &tok_coins {
                             selected_inputs.push((tx_hash.clone(), *idx, *value));
                             input_total = input_total
-                                .checked_add(val_u64)
+                                .checked_add(*val_u64)
                                 .ok_or("input total overflow")?;
-                            break;
+                            if input_total >= amount_atomic {
+                                break;
+                            }
                         }
                     }
-                    if selected_inputs.is_empty() {
+                    if input_total < amount_atomic {
                         return Err(format!(
-                            "No single coin covers {amount_atomic} atomic for token {token}. \
-                             If change from the last send is missing, \
-                             run `moonshine sync` after that change is in a block."
+                            "Insufficient spendable coins for token {token}: have {input_total} atomic, need {amount_atomic}."
                         )
                         .into());
                     }
@@ -656,7 +687,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         });
                         if !drk_ok {
                             return Err(format!(
-                                "No single DRK coin covers fee of {fee_atomic} atomic units."
+                                "No single DRK coin covers fee of {fee_atomic} atomic units \
+                                 (FeeV1 takes 1 input; consolidate DRK coins or lower --fee)."
                             )
                             .into());
                         }
@@ -944,10 +976,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         leaf_position: (lpos as u64).into(),
                     });
                 }
-                // Largest first so a payment that fits in one coin does not
-                // pull in an extra input. Two-input proofs are currently
-                // rejected by darkfid as invalid.
-                all_coins.sort_by_key(|coin| std::cmp::Reverse(coin.note.value));
+                // Deterministic ordering before passing to multi-input coin selection.
+                all_coins.sort_by(|a, b| {
+                    b.note
+                        .value
+                        .cmp(&a.note.value)
+                        .then_with(|| u64::from(a.leaf_position).cmp(&u64::from(b.leaf_position)))
+                        .then_with(|| a.coin.to_bytes().cmp(&b.coin.to_bytes()))
+                });
 
                 // Filter to requested token (and native DRK for fee when custom token)
                 let want_drk = is_drk;

@@ -24,15 +24,15 @@ use darkfi::{
 use darkfi_money_contract::{
     client::{
         fee_v1::{create_fee_proof, FeeCallInput, FeeCallOutput},
-        transfer_v1::make_transfer_call,
+        transfer_v1::{TransferCallBuilder, TransferCallInput, TransferCallOutput},
         MoneyNote, OwnCoin,
     },
-    model::{CoinAttributes, MoneyFeeParamsV1, TokenId},
+    model::{CoinAttributes, MoneyFeeParamsV1, MoneyTransferParamsV1, TokenId, DARK_TOKEN_ID},
     MoneyFunction, MONEY_CONTRACT_ZKAS_BURN_NS_V1, MONEY_CONTRACT_ZKAS_FEE_NS_V1,
     MONEY_CONTRACT_ZKAS_MINT_NS_V1,
 };
 use darkfi_sdk::bridgetree::Hashable;
-use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
+use darkfi_sdk::crypto::pasta_prelude::{Field, Group, PrimeField};
 use darkfi_sdk::{
     crypto::{
         contract_id::MONEY_CONTRACT_ID, note::AeadEncryptedNote, FuncId, Keypair, MerkleNode,
@@ -43,6 +43,7 @@ use darkfi_sdk::{
     tx::ContractCall,
 };
 use darkfi_serial::AsyncEncodable;
+use rand_core::RngCore;
 use std::error::Error;
 
 /// Recompute the Money Merkle root the burn/fee circuits publish.
@@ -91,11 +92,15 @@ pub(crate) fn assert_witness_at_tip(
     Ok(tip_root)
 }
 
+/// Compute the final output's Pedersen value blinding factor so that:
+/// `sum(input_blinds) - sum(output_blinds) == 0 (mod q)`,
+/// matching DarkFi's `Money::TransferV1` entrypoint balance equation:
+/// `sum(inputs.value_commit) - sum(outputs.value_commit) == identity`.
 pub fn compute_remainder_blind(
     inputs: &[Blind<pallas::Scalar>],
     outputs: &[Blind<pallas::Scalar>],
 ) -> Blind<pallas::Scalar> {
-    let mut remainder = pallas::Scalar::zero();
+    let mut remainder = pallas::Scalar::ZERO;
     for i in inputs {
         remainder += i.inner();
     }
@@ -103,6 +108,165 @@ pub fn compute_remainder_blind(
         remainder -= o.inner();
     }
     Blind(remainder)
+}
+
+/// Verify that a `MoneyTransferParamsV1` satisfies DarkFi's per-token-group
+/// Pedersen commitment balance check (`sum(inputs) - sum(outputs) == identity`).
+pub(crate) fn verify_transfer_value_balance(
+    params: &MoneyTransferParamsV1,
+) -> Result<(), Box<dyn Error>> {
+    let mut groups: Vec<(pallas::Base, pallas::Point)> = Vec::new();
+    for inp in &params.inputs {
+        if let Some((_, acc)) = groups.iter_mut().find(|(tc, _)| *tc == inp.token_commit) {
+            *acc += inp.value_commit;
+        } else {
+            groups.push((inp.token_commit, inp.value_commit));
+        }
+    }
+    for out in &params.outputs {
+        if let Some((_, acc)) = groups.iter_mut().find(|(tc, _)| *tc == out.token_commit) {
+            *acc -= out.value_commit;
+        } else {
+            groups.push((out.token_commit, -out.value_commit));
+        }
+    }
+    for (i, (_, acc)) in groups.iter().enumerate() {
+        if *acc != pallas::Point::identity() {
+            return Err(
+                format!("TransferV1 value commitments in token group {i} do not balance").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Deterministic sort key for reproducible coin selection:
+/// `(leaf_position, coin_commitment_bytes)`.
+fn coin_tie_key(c: &OwnCoin) -> (u64, [u8; 32]) {
+    (u64::from(c.leaf_position), c.coin.to_bytes())
+}
+
+/// Deterministically select minimal unspent coins covering `target`.
+///
+/// Strategy:
+/// 1. If any single coin covers `target`, pick the smallest single coin `>= target`
+///    (tie-broken deterministically by `(leaf_position, coin_bytes)`).
+/// 2. Otherwise, greedily accumulate largest-first (tie-broken by `(leaf_position, coin_bytes)`)
+///    until `sum >= target`, which achieves minimum input cardinality.
+pub(crate) fn select_coins_deterministic(
+    coins: &[OwnCoin],
+    target: u64,
+) -> Result<(Vec<OwnCoin>, u64), Box<dyn Error>> {
+    if target == 0 {
+        return Err("Transfer target amount must be greater than 0".into());
+    }
+    if coins.is_empty() {
+        return Err("No eligible spendable coins available".into());
+    }
+
+    // 1. Prefer a single coin when possible (smallest >= target, deterministic tie-break).
+    if let Some(best_single) = coins
+        .iter()
+        .filter(|c| c.note.value >= target)
+        .min_by_key(|c| (c.note.value, coin_tie_key(c)))
+    {
+        return Ok((vec![best_single.clone()], best_single.note.value - target));
+    }
+
+    // 2. Multi-input: sort descending by value, tie-broken deterministically.
+    let mut sorted: Vec<OwnCoin> = coins.to_vec();
+    sorted.sort_by(|a, b| {
+        b.note
+            .value
+            .cmp(&a.note.value)
+            .then_with(|| coin_tie_key(a).cmp(&coin_tie_key(b)))
+    });
+
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    for coin in sorted {
+        total = total
+            .checked_add(coin.note.value)
+            .ok_or("Selected coin value sum overflow")?;
+        selected.push(coin);
+        if total >= target {
+            return Ok((selected, total - target));
+        }
+    }
+
+    Err(format!("Insufficient spendable coins: have {total} atomic, need {target} atomic").into())
+}
+
+/// Select minimal unspent, unhooked coins for `TransferV1` plus an optional separate
+/// leftover native DRK coin for `FeeV1`.
+///
+/// For native DRK transfers with `fee > 0`:
+/// - First selects minimal coins covering `amount`.
+/// - If an unused native DRK coin `>= fee` remains, returns it as the separate fee input.
+/// - Otherwise, if transfer change already covers `fee`, uses tx-local fee change (`None`).
+/// - Otherwise, expands selection to cover `amount + fee` across multiple inputs so the
+///   transfer change output (`>= fee`) funds `FeeV1` tx-locally.
+#[allow(clippy::type_complexity)]
+pub(crate) fn select_transfer_and_fee_coins(
+    spendable: &[OwnCoin],
+    token_id: TokenId,
+    amount: u64,
+    fee: u64,
+) -> Result<(Vec<OwnCoin>, u64, Option<OwnCoin>), Box<dyn Error>> {
+    let transfer_pool: Vec<OwnCoin> = spendable
+        .iter()
+        .filter(|c| c.note.spend_hook == FuncId::none() && c.note.token_id == token_id)
+        .cloned()
+        .collect();
+
+    if transfer_pool.is_empty() {
+        return Err("No unhooked spendable coins matching requested token".into());
+    }
+
+    if fee == 0 {
+        let (sel, change) = select_coins_deterministic(&transfer_pool, amount)?;
+        return Ok((sel, change, None));
+    }
+
+    let fee_pool = filter_fee_candidates(spendable, fee);
+
+    if token_id == *DARK_TOKEN_ID {
+        let (sel, change) = select_coins_deterministic(&transfer_pool, amount)?;
+        // Check if an unused DRK coin can pay the fee directly (smallest >= fee).
+        let leftover = fee_pool
+            .iter()
+            .filter(|c| !sel.iter().any(|s| s.coin == c.coin))
+            .min_by_key(|c| (c.note.value, coin_tie_key(c)))
+            .cloned();
+        if let Some(fee_coin) = leftover {
+            return Ok((sel, change, Some(fee_coin)));
+        }
+        if change >= fee {
+            return Ok((sel, change, None));
+        }
+        // Neither a leftover fee coin nor transfer change covers `fee` yet:
+        // select minimal coins covering `amount + fee` so tx-local change >= fee.
+        let total_needed = amount.checked_add(fee).ok_or("amount + fee overflow")?;
+        let (sel_with_fee, remainder_after_fee) =
+            select_coins_deterministic(&transfer_pool, total_needed)?;
+        let transfer_change = remainder_after_fee
+            .checked_add(fee)
+            .ok_or("transfer change overflow")?;
+        Ok((sel_with_fee, transfer_change, None))
+    } else {
+        let (sel, change) = select_coins_deterministic(&transfer_pool, amount)?;
+        let fee_coin = fee_pool
+            .iter()
+            .min_by_key(|c| (c.note.value, coin_tie_key(c)))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "No single unhooked native DRK coin covers fee of {fee} atomic units \
+                     (FeeV1 takes 1 input; consolidate DRK coins or lower --fee)"
+                )
+            })?;
+        Ok((sel, change, Some(fee_coin)))
+    }
 }
 
 /// Built Money transfer (+ optional fee) plus the coins it spends.
@@ -114,7 +278,6 @@ pub struct BuiltTransfer {
     pub spent_commitments: Vec<Vec<u8>>,
     pub spent_nullifiers: Vec<Vec<u8>>,
     /// Compact-block output indexes of change that decrypts to this wallet.
-    /// Index 0 is the payment output and is covered by the recipient clue.
     pub self_output_indices: Vec<u32>,
     /// Total number of non-tx-local outputs in the transaction (transfer + optional fee).
     pub total_outputs: u32,
@@ -153,7 +316,7 @@ pub(crate) fn filter_fee_candidates(spendable: &[OwnCoin], fee: u64) -> Vec<OwnC
         .filter(|c| {
             c.note.value >= fee
                 && c.note.spend_hook == FuncId::none()
-                && c.note.token_id == *darkfi_money_contract::model::DARK_TOKEN_ID
+                && c.note.token_id == *DARK_TOKEN_ID
         })
         .cloned()
         .collect()
@@ -161,11 +324,12 @@ pub(crate) fn filter_fee_candidates(spendable: &[OwnCoin], fee: u64) -> Vec<OwnC
 
 /// Select a tx-local change output for `FeeV1` without cannibalizing payment outputs.
 ///
-/// Iterates from the tail (where `make_transfer_call` appends change) and skips:
+/// Iterates from the tail and skips:
 /// - payment outputs (`idx < min_change_index`)
 /// - non-DRK coins or coins smaller than `fee`
 /// - contract-hooked notes (`spend_hook != FuncId::none()`)
 /// - outputs carrying a non-empty payment memo
+#[allow(dead_code)]
 pub(crate) fn select_tx_local_fee_output(
     outputs: &[darkfi_money_contract::model::Output],
     secret: &SecretKey,
@@ -180,7 +344,7 @@ pub(crate) fn select_tx_local_fee_output(
             continue;
         };
         if note.value < fee
-            || note.token_id != *darkfi_money_contract::model::DARK_TOKEN_ID
+            || note.token_id != *DARK_TOKEN_ID
             || note.spend_hook != FuncId::none()
             || !note.memo.is_empty()
         {
@@ -197,6 +361,14 @@ fn own_coin_commitment(coin: &OwnCoin) -> Vec<u8> {
 
 fn own_coin_nullifier(coin: &OwnCoin) -> Vec<u8> {
     coin.nullifier().inner().to_repr().to_vec()
+}
+
+/// Fisher-Yates shuffle using `OsRng` (cryptographic RNG, avoids output-order correlation).
+fn shuffle_osrng<T>(slice: &mut [T]) {
+    for i in (1..slice.len()).rev() {
+        let j = (rand_core::OsRng.next_u64() as usize) % (i + 1);
+        slice.swap(i, j);
+    }
 }
 
 #[allow(dead_code)]
@@ -245,6 +417,16 @@ pub async fn build_transaction_extended(
     spend_hook: Option<FuncId>,
     user_data: Option<pallas::Base>,
 ) -> Result<BuiltTransfer, Box<dyn Error>> {
+    if amount == 0 {
+        return Err("Transfer amount must be greater than 0".into());
+    }
+    if half_split && amount == 1 {
+        return Err("Cannot half-split an amount of 1 atomic unit".into());
+    }
+    if token_id.inner() == pallas::Base::ZERO {
+        return Err(format!("Invalid token ID: {token_id}").into());
+    }
+
     let keypair = Keypair::new(wallet_secret);
 
     // Decode ZK binaries
@@ -276,8 +458,7 @@ pub async fn build_transaction_extended(
     let burn_pk = ProvingKey::build(burn_zkbin.k, &burn_circuit);
     let fee_pk = ProvingKey::build(fee_zkbin.k, &fee_circuit);
 
-    // Transfer call. The pinned DarkFi builder takes the recipient memo.
-
+    // Filter to coins with valid Merkle witnesses at the current tree tip.
     let mut spendable = Vec::with_capacity(all_coins.len());
     for coin in all_coins {
         match assert_witness_at_tip(
@@ -297,30 +478,107 @@ pub async fn build_transaction_extended(
         );
     }
 
-    let fee_candidates = filter_fee_candidates(&spendable, fee);
+    // Deterministic multi-input coin selection for TransferV1 + optional separate FeeV1 coin.
+    let (spent_coins, change_value, leftover_fee_coin) =
+        select_transfer_and_fee_coins(&spendable, token_id, amount, fee)?;
 
-    let transfer_spendable: Vec<OwnCoin> = spendable
-        .iter()
-        .filter(|c| c.note.spend_hook == FuncId::none() && c.note.token_id == token_id)
-        .cloned()
-        .collect();
+    let mut inputs = Vec::with_capacity(spent_coins.len());
+    for coin in &spent_coins {
+        let merkle_path = tree.witness(coin.leaf_position, 0).map_err(|_| {
+            format!(
+                "Merkle witness missing for coin at {:?}",
+                coin.leaf_position
+            )
+        })?;
+        inputs.push(TransferCallInput {
+            coin: coin.clone(),
+            merkle_path,
+            user_data_blind: Blind::random(&mut rand_core::OsRng),
+        });
+    }
 
-    let (mut params, secrets, spent_coins) = make_transfer_call(
-        keypair,
-        recipient_pubkey,
-        amount,
-        token_id,
-        transfer_spendable,
-        tree.clone(),
-        spend_hook,
-        user_data,
+    // Build outputs (payment output(s) + optional change), tagging the exact change output
+    // so output-order shuffling can never confuse change with a self-payment output.
+    let recipient_memo = payment_memo.unwrap_or_default();
+    let mut tagged_outputs: Vec<(TransferCallOutput, Vec<u8>, bool)> = Vec::new();
+    if half_split {
+        let first_half = amount / 2;
+        let second_half = first_half + (amount % 2);
+        for val in [first_half, second_half] {
+            if val > 0 {
+                tagged_outputs.push((
+                    TransferCallOutput {
+                        public_key: recipient_pubkey,
+                        value: val,
+                        token_id,
+                        spend_hook: spend_hook.unwrap_or(FuncId::none()),
+                        user_data: user_data.unwrap_or(pallas::Base::ZERO),
+                        blind: Blind::random(&mut rand_core::OsRng),
+                    },
+                    recipient_memo.clone(),
+                    false,
+                ));
+            }
+        }
+    } else {
+        tagged_outputs.push((
+            TransferCallOutput {
+                public_key: recipient_pubkey,
+                value: amount,
+                token_id,
+                spend_hook: spend_hook.unwrap_or(FuncId::none()),
+                user_data: user_data.unwrap_or(pallas::Base::ZERO),
+                blind: Blind::random(&mut rand_core::OsRng),
+            },
+            recipient_memo,
+            false,
+        ));
+    }
+
+    if change_value > 0 {
+        tagged_outputs.push((
+            TransferCallOutput {
+                public_key: keypair.public,
+                value: change_value,
+                token_id,
+                spend_hook: FuncId::none(),
+                user_data: pallas::Base::ZERO,
+                blind: Blind::random(&mut rand_core::OsRng),
+            },
+            Vec::new(),
+            true,
+        ));
+    }
+
+    shuffle_osrng(&mut tagged_outputs);
+    let change_output_idx = tagged_outputs.iter().position(|(_, _, is_chg)| *is_chg);
+    let mut outputs = Vec::with_capacity(tagged_outputs.len());
+    let mut output_memos = Vec::with_capacity(tagged_outputs.len());
+    for (out, memo, _) in tagged_outputs {
+        outputs.push(out);
+        output_memos.push(memo);
+    }
+
+    let (mut params, secrets) = TransferCallBuilder {
+        clear_inputs: vec![],
+        inputs,
+        outputs,
         mint_zkbin,
         mint_pk,
         burn_zkbin,
         burn_pk,
-        half_split,
-        payment_memo.unwrap_or_default(),
-    )?;
+        output_memos,
+    }
+    .build()?;
+
+    // Verify multi-input Pedersen value commitment balance & remainder blind identity
+    // matching DarkFi's TransferV1 entrypoint before signing or broadcasting.
+    verify_transfer_value_balance(&params)?;
+    let residual =
+        compute_remainder_blind(&secrets.input_value_blinds, &secrets.output_value_blinds);
+    if residual.inner() != pallas::Scalar::ZERO {
+        return Err("TransferV1 multi-input value blind balance mismatch".into());
+    }
 
     let mut spent_commitments: Vec<Vec<u8>> = spent_coins.iter().map(own_coin_commitment).collect();
     let mut spent_nullifiers: Vec<Vec<u8>> = spent_coins.iter().map(own_coin_nullifier).collect();
@@ -333,77 +591,79 @@ pub async fn build_transaction_extended(
     }
 
     let fee_src = if fee > 0 {
-        let leftover = fee_candidates
-            .iter()
-            .find(|c| !spent_coins.iter().any(|sc| sc.coin == c.coin) && c.note.value >= fee);
-        if let Some(c) = leftover {
+        if let Some(c) = leftover_fee_coin {
             let merkle_path = tree
                 .witness(c.leaf_position, 0)
                 .map_err(|_| "Merkle path missing for fee coin")?;
             Some(FeeSrc {
-                coin: c.clone(),
+                coin: c,
                 merkle_path,
                 input_tx_local: false,
                 expected_root: tree.root(0),
             })
-        } else {
+        } else if let Some(idx) = change_output_idx {
             // DEP-0008: spend transfer change inside this tx (tx-local tree).
             // Must match host `merkle_add_local`: dummy ZERO leaf, then local coins.
-            // Payment outputs occupy 0..(1 or 2 with half_split); never cannibalize them.
-            let min_change_index = if half_split { 2 } else { 1 };
             let mut local_tree = MerkleTree::new(1);
             local_tree.append(MerkleNode::from(pallas::Base::ZERO));
-            let mut src = None;
-            if let Some((idx, note)) =
-                select_tx_local_fee_output(&params.outputs, &keypair.secret, fee, min_change_index)
+            let output = &mut params.outputs[idx];
+            let note = output
+                .note
+                .decrypt::<MoneyNote>(&keypair.secret)
+                .map_err(|_| "Failed to decrypt transfer change output for tx-local fee")?;
+            if note.value < fee
+                || note.token_id != *DARK_TOKEN_ID
+                || note.spend_hook != FuncId::none()
+                || !note.memo.is_empty()
             {
-                let output = &mut params.outputs[idx];
-                let derived = CoinAttributes {
-                    public_key: PublicKey::from_secret(keypair.secret),
-                    value: note.value,
-                    token_id: note.token_id,
-                    spend_hook: note.spend_hook,
-                    user_data: note.user_data,
-                    blind: note.coin_blind,
-                }
-                .to_coin();
-                if derived != output.coin {
-                    return Err(format!(
-                        "tx-local change coin mismatch: output={} derived={}",
-                        hex::encode(output.coin.inner().to_repr()),
-                        hex::encode(derived.inner().to_repr())
-                    )
-                    .into());
-                }
-                output.tx_local = true;
-                local_tree.append(MerkleNode::from(output.coin.inner()));
-                let leaf_position = local_tree.mark().ok_or("tx-local merkle mark failed")?;
-                let coin = OwnCoin {
-                    coin: output.coin,
-                    note,
-                    secret: keypair.secret,
-                    leaf_position,
-                };
-                let merkle_path = local_tree
-                    .witness(leaf_position, 0)
-                    .map_err(|_| "tx-local merkle path missing")?;
-                let expected_root = local_tree.root(0);
-                eprintln!(
-                    "tx-local tree root={} pos={:?} change={}",
-                    expected_root
-                        .map(|r| hex::encode(r.to_bytes()))
-                        .unwrap_or_default(),
-                    leaf_position,
-                    hex::encode(output.coin.inner().to_repr())
-                );
-                src = Some(FeeSrc {
-                    coin,
-                    merkle_path,
-                    input_tx_local: true,
-                    expected_root,
-                });
+                return Err("Transfer change output is not eligible to pay FeeV1".into());
             }
-            src
+            let derived = CoinAttributes {
+                public_key: PublicKey::from_secret(keypair.secret),
+                value: note.value,
+                token_id: note.token_id,
+                spend_hook: note.spend_hook,
+                user_data: note.user_data,
+                blind: note.coin_blind,
+            }
+            .to_coin();
+            if derived != output.coin {
+                return Err(format!(
+                    "tx-local change coin mismatch: output={} derived={}",
+                    hex::encode(output.coin.inner().to_repr()),
+                    hex::encode(derived.inner().to_repr())
+                )
+                .into());
+            }
+            output.tx_local = true;
+            local_tree.append(MerkleNode::from(output.coin.inner()));
+            let leaf_position = local_tree.mark().ok_or("tx-local merkle mark failed")?;
+            let coin = OwnCoin {
+                coin: output.coin,
+                note,
+                secret: keypair.secret,
+                leaf_position,
+            };
+            let merkle_path = local_tree
+                .witness(leaf_position, 0)
+                .map_err(|_| "tx-local merkle path missing")?;
+            let expected_root = local_tree.root(0);
+            eprintln!(
+                "tx-local tree root={} pos={:?} change={}",
+                expected_root
+                    .map(|r| hex::encode(r.to_bytes()))
+                    .unwrap_or_default(),
+                leaf_position,
+                hex::encode(output.coin.inner().to_repr())
+            );
+            Some(FeeSrc {
+                coin,
+                merkle_path,
+                input_tx_local: true,
+                expected_root,
+            })
+        } else {
+            None
         }
     } else {
         None
@@ -564,9 +824,9 @@ pub async fn build_transaction_extended(
 mod tests {
     use super::*;
     use darkfi_money_contract::model::{Output, DARK_TOKEN_ID};
-    use darkfi_sdk::pasta::group::Group;
+    use darkfi_sdk::crypto::pedersen::pedersen_commitment_u64;
 
-    fn make_own_coin(value: u64, token_id: TokenId, spend_hook: FuncId) -> OwnCoin {
+    fn make_own_coin_at(value: u64, token_id: TokenId, spend_hook: FuncId, pos: u64) -> OwnCoin {
         let kp = Keypair::random(&mut rand_core::OsRng);
         let blind = Blind::random(&mut rand_core::OsRng);
         let note = MoneyNote {
@@ -592,8 +852,12 @@ mod tests {
             coin,
             note,
             secret: kp.secret,
-            leaf_position: 1u64.into(),
+            leaf_position: pos.into(),
         }
+    }
+
+    fn make_own_coin(value: u64, token_id: TokenId, spend_hook: FuncId) -> OwnCoin {
+        make_own_coin_at(value, token_id, spend_hook, 1)
     }
 
     fn make_encrypted_output(
@@ -653,7 +917,6 @@ mod tests {
     fn tx_local_fee_skips_payment_output_and_memo_and_hook() {
         let kp = Keypair::random(&mut rand_core::OsRng);
         let dao_hook = crate::dao_ops::dao_spend_hook();
-        // Self-transfer: output 0 is payment (with memo), output 1 is hooked, output 2 is plain change.
         let payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), b"pay-self".to_vec());
         let hooked = make_encrypted_output(&kp, 50_000_000, dao_hook, vec![]);
         let change = make_encrypted_output(&kp, 20_000_000, FuncId::none(), vec![]);
@@ -668,15 +931,174 @@ mod tests {
         assert_eq!(chosen.0, 2);
         assert_eq!(chosen.1.value, 20_000_000);
 
-        // Even without a memo, output 0 (payment) must not be cannibalized when min_change_index == 1.
         let unmemoized_payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), vec![]);
         assert!(
             select_tx_local_fee_output(&[unmemoized_payment], &kp.secret, 5_000_000, 1).is_none()
         );
-        // If output 1 has a memo, skip it too.
         assert!(
             select_tx_local_fee_output(&[payment.clone(), payment], &kp.secret, 5_000_000, 1)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn multi_input_pedersen_blind_balance_2_and_3_inputs() {
+        // 2-input -> 2-output (payment + change)
+        let in2_vals = [40_000_000u64, 35_000_000u64];
+        let out2_vals = [60_000_000u64, 15_000_000u64];
+        let in2_blinds = [
+            Blind::random(&mut rand_core::OsRng),
+            Blind::random(&mut rand_core::OsRng),
+        ];
+        let out2_b0 = Blind::random(&mut rand_core::OsRng);
+        let out2_b1 = compute_remainder_blind(&in2_blinds, &[out2_b0]);
+
+        let mut acc2 = pallas::Point::identity();
+        for (&v, &b) in in2_vals.iter().zip(in2_blinds.iter()) {
+            acc2 += pedersen_commitment_u64(v, b);
+        }
+        acc2 -= pedersen_commitment_u64(out2_vals[0], out2_b0);
+        acc2 -= pedersen_commitment_u64(out2_vals[1], out2_b1);
+        assert_eq!(
+            acc2,
+            pallas::Point::identity(),
+            "2-input TransferV1 Pedersen commitments must sum to identity"
+        );
+        assert_eq!(
+            compute_remainder_blind(&in2_blinds, &[out2_b0, out2_b1]).inner(),
+            pallas::Scalar::ZERO
+        );
+
+        // 3-input -> 3-output (--half-split payment + change)
+        let in3_vals = [25_000_000u64, 30_000_000u64, 20_000_000u64];
+        let out3_vals = [32_500_000u64, 32_500_000u64, 10_000_000u64];
+        let in3_blinds = [
+            Blind::random(&mut rand_core::OsRng),
+            Blind::random(&mut rand_core::OsRng),
+            Blind::random(&mut rand_core::OsRng),
+        ];
+        let out3_b0 = Blind::random(&mut rand_core::OsRng);
+        let out3_b1 = Blind::random(&mut rand_core::OsRng);
+        let out3_b2 = compute_remainder_blind(&in3_blinds, &[out3_b0, out3_b1]);
+
+        let mut acc3 = pallas::Point::identity();
+        for (&v, &b) in in3_vals.iter().zip(in3_blinds.iter()) {
+            acc3 += pedersen_commitment_u64(v, b);
+        }
+        for (&v, &b) in out3_vals.iter().zip([out3_b0, out3_b1, out3_b2].iter()) {
+            acc3 -= pedersen_commitment_u64(v, b);
+        }
+        assert_eq!(
+            acc3,
+            pallas::Point::identity(),
+            "3-input TransferV1 Pedersen commitments must sum to identity"
+        );
+
+        // 3-input -> 1-output (exact sweep, 0 change)
+        let out1_b0 = compute_remainder_blind(&in3_blinds, &[]);
+        let mut acc_exact = pallas::Point::identity();
+        for (&v, &b) in in3_vals.iter().zip(in3_blinds.iter()) {
+            acc_exact += pedersen_commitment_u64(v, b);
+        }
+        acc_exact -= pedersen_commitment_u64(75_000_000, out1_b0);
+        assert_eq!(
+            acc_exact,
+            pallas::Point::identity(),
+            "3-input exact-sweep TransferV1 Pedersen commitments must sum to identity"
+        );
+    }
+
+    #[test]
+    fn coin_selection_2_input_and_3_input_and_fee_edge_cases() {
+        let c1 = make_own_coin_at(50_000_000, *DARK_TOKEN_ID, FuncId::none(), 1);
+        let c2 = make_own_coin_at(40_000_000, *DARK_TOKEN_ID, FuncId::none(), 2);
+        let c3 = make_own_coin_at(20_000_000, *DARK_TOKEN_ID, FuncId::none(), 3);
+        let hooked = make_own_coin_at(
+            999_000_000,
+            *DARK_TOKEN_ID,
+            crate::dao_ops::dao_spend_hook(),
+            4,
+        );
+
+        // 2-input transfer (60M + 5M fee = 65M): selects c1 (50M) + c2 (40M) = 90M,
+        // and leftover c3 (20M) pays fee separately (or change 30M pays tx-locally).
+        let (sel2, chg2, fee2) = select_transfer_and_fee_coins(
+            &[c3.clone(), hooked.clone(), c1.clone(), c2.clone()],
+            *DARK_TOKEN_ID,
+            60_000_000,
+            5_000_000,
+        )
+        .unwrap();
+        assert_eq!(sel2.len(), 2);
+        assert_eq!(sel2[0].coin, c1.coin);
+        assert_eq!(sel2[1].coin, c2.coin);
+        assert_eq!(chg2, 30_000_000);
+        assert_eq!(fee2.as_ref().map(|c| c.coin), Some(c3.coin));
+
+        // 3-input transfer (100M + 5M fee = 105M): selects all 3 unhooked coins (110M),
+        // change = 10M >= 5M fee (paid tx-locally), excludes hooked 999M coin!
+        let (sel3, chg3, fee3) = select_transfer_and_fee_coins(
+            &[c3.clone(), hooked.clone(), c2.clone(), c1.clone()],
+            *DARK_TOKEN_ID,
+            100_000_000,
+            5_000_000,
+        )
+        .unwrap();
+        assert_eq!(sel3.len(), 3);
+        assert_eq!(chg3, 10_000_000);
+        assert!(fee3.is_none(), "fee must come from tx-local change >= fee");
+
+        // Edge case: [60M, 3M, 3M] sending 60M + 5M fee. Neither 3M coin covers 5M fee alone,
+        // so selector MUST pull all 3 coins into TransferV1 (total 66M -> change 6M >= 5M fee).
+        let big = make_own_coin_at(60_000_000, *DARK_TOKEN_ID, FuncId::none(), 10);
+        let dust_a = make_own_coin_at(3_000_000, *DARK_TOKEN_ID, FuncId::none(), 11);
+        let dust_b = make_own_coin_at(3_000_000, *DARK_TOKEN_ID, FuncId::none(), 12);
+        let (sel_edge, chg_edge, fee_edge) = select_transfer_and_fee_coins(
+            &[dust_b.clone(), big.clone(), dust_a.clone()],
+            *DARK_TOKEN_ID,
+            60_000_000,
+            5_000_000,
+        )
+        .unwrap();
+        assert_eq!(sel_edge.len(), 3);
+        assert_eq!(chg_edge, 6_000_000);
+        assert!(fee_edge.is_none());
+
+        // Determinism check: reversed input order produces identical selection.
+        let (sel_rev, chg_rev, fee_rev) = select_transfer_and_fee_coins(
+            &[dust_a, big, dust_b],
+            *DARK_TOKEN_ID,
+            60_000_000,
+            5_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            sel_edge.iter().map(|c| c.coin).collect::<Vec<_>>(),
+            sel_rev.iter().map(|c| c.coin).collect::<Vec<_>>()
+        );
+        assert_eq!(chg_edge, chg_rev);
+        assert_eq!(fee_edge.map(|c| c.coin), fee_rev.map(|c| c.coin));
+    }
+
+    #[test]
+    fn custom_token_multi_input_with_separate_drk_fee() {
+        let custom_tok = TokenId::from(pallas::Base::from(777u64));
+        let t1 = make_own_coin_at(300, custom_tok, FuncId::none(), 1);
+        let t2 = make_own_coin_at(400, custom_tok, FuncId::none(), 2);
+        let t3 = make_own_coin_at(200, custom_tok, FuncId::none(), 3);
+        let drk_fee = make_own_coin_at(10_000_000, *DARK_TOKEN_ID, FuncId::none(), 4);
+
+        let (sel, chg, fee_coin) = select_transfer_and_fee_coins(
+            &[t3, drk_fee.clone(), t1.clone(), t2.clone()],
+            custom_tok,
+            650,
+            5_000_000,
+        )
+        .unwrap();
+        assert_eq!(sel.len(), 2);
+        assert_eq!(sel[0].coin, t2.coin);
+        assert_eq!(sel[1].coin, t1.coin);
+        assert_eq!(chg, 50);
+        assert_eq!(fee_coin.as_ref().map(|c| c.coin), Some(drk_fee.coin));
     }
 }

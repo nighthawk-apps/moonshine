@@ -454,6 +454,7 @@ impl SyncEngine {
             let extra = self
                 .fetch_outputs_by_func(&mut client, padded_start, padded_end, MONEY_FUNC_TOKEN_MINT)
                 .await?;
+            let extra = dedup_extra_blocks_against_window(&in_window, extra);
             in_window.extend(extra);
             self.store_contract_records(&mut client, padded_start, padded_end)
                 .await?;
@@ -960,7 +961,16 @@ impl SyncEngine {
             return Ok(None);
         }
         let mut tree_data = Vec::new();
+        let mut total_bytes = first.nullifier_index.len();
         for chunk in &chunks {
+            total_bytes = total_bytes.saturating_add(chunk.tree_data.len());
+            if total_bytes > crate::client::MAX_CHECKPOINT_SNAPSHOT_BYTES {
+                tracing::warn!(
+                    "checkpoint snapshot at {height} exceeds max byte cap ({}); replaying commitments",
+                    crate::client::MAX_CHECKPOINT_SNAPSHOT_BYTES
+                );
+                return Ok(None);
+            }
             tree_data.extend_from_slice(&chunk.tree_data);
         }
         let digest = snapshot_integrity_hash(height, &tree_data, &first.nullifier_index);
@@ -969,9 +979,72 @@ impl SyncEngine {
             return Ok(None);
         }
         let tree: MerkleTree =
-            darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(&tree_data)).map_err(
-                |e| -> Box<dyn std::error::Error> { format!("checkpoint tree decode: {e}").into() },
-            )?;
+            match darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(&tree_data)) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        "checkpoint tree decode failed at {height} ({e}); replaying commitments"
+                    );
+                    return Ok(None);
+                }
+            };
+        let Some(snap_root) = tree.root(0) else {
+            tracing::warn!("checkpoint tree at {height} has no root; replaying commitments");
+            return Ok(None);
+        };
+        // Authenticate the snapshot root against GetTreeState(height) when the server
+        // can serve that height (e.g. tip or checkpoint-capable server). Historical
+        // heights return FAILED_PRECONDITION/NOT_FOUND on tip-only servers; in that
+        // case also cross-check block_hash against GetBlock(height) if available.
+        match client.get_tree_state(height).await {
+            Ok(ts) => {
+                if first.block_hash.len() == 32
+                    && ts.block_hash.len() == 32
+                    && first.block_hash != ts.block_hash
+                {
+                    tracing::warn!(
+                        "checkpoint block_hash mismatch vs GetTreeState at {height}; replaying commitments"
+                    );
+                    return Ok(None);
+                }
+                match darkfi_serial::Decodable::decode(&mut std::io::Cursor::new(&ts.tree_data)) {
+                    Ok(expected_tree) => {
+                        let expected_tree: MerkleTree = expected_tree;
+                        if expected_tree.root(0) != Some(snap_root) {
+                            tracing::warn!(
+                                "checkpoint root mismatch vs GetTreeState at {height}; replaying commitments"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "GetTreeState decode failed while authenticating checkpoint at {height} ({e}); replaying commitments"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            Err(e) if checkpoint_status_falls_back(e.as_ref()) => {
+                if first.block_hash.len() == 32 {
+                    if let Ok(blk) = client.get_block(height).await {
+                        if blk.hash.len() == 32 && blk.hash != first.block_hash {
+                            tracing::warn!(
+                                "checkpoint block_hash mismatch vs GetBlock({height}); replaying commitments"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "GetTreeState check failed for checkpoint at {height} ({}); replaying commitments",
+                    redact_sync_error(&e.to_string())
+                );
+                return Ok(None);
+            }
+        }
         let mut out = Vec::new();
         darkfi_serial::Encodable::encode(&tree, &mut out).map_err(
             |e| -> Box<dyn std::error::Error> { format!("checkpoint tree encode: {e}").into() },
@@ -1749,8 +1822,8 @@ impl SyncEngine {
     ) -> Result<u32, Box<dyn std::error::Error>> {
         let hits = batch_open_blocks(&self.secret_keys, blocks);
         let mut notes_found = 0u32;
-        for block in blocks {
-            notes_found += self.trial_decrypt_block(block, &hits)?;
+        for (block_pos, block) in blocks.iter().enumerate() {
+            notes_found += self.trial_decrypt_block(block_pos, block, &hits)?;
             if let Some(cache) = &self.block_cache {
                 if let Err(e) = cache.delete_height(block.height) {
                     tracing::warn!(
@@ -1765,11 +1838,12 @@ impl SyncEngine {
 
     fn trial_decrypt_block(
         &self,
+        block_pos: usize,
         block: &crate::client::proto::CompactBlock,
         hits: &TrialHits,
     ) -> Result<u32, Box<dyn std::error::Error>> {
         let mut notes_found = 0u32;
-        for tx in &block.txs {
+        for (tx_pos, tx) in block.txs.iter().enumerate() {
             let tx_hash_hex = hex::encode(&tx.tx_hash);
             if self
                 .db
@@ -1802,12 +1876,10 @@ impl SyncEngine {
                 }
             }
             for (idx, output) in tx.outputs.iter().enumerate() {
-                let mut tx_key = [0u8; 32];
                 if tx.tx_hash.len() != 32 {
                     continue;
                 }
-                tx_key.copy_from_slice(&tx.tx_hash);
-                let Some((note, secret_key)) = hits.get(&(block.height, tx_key, idx as u32)) else {
+                let Some((note, secret_key)) = hits.get(&(block_pos, tx_pos, idx)) else {
                     continue;
                 };
                 {
@@ -1818,6 +1890,13 @@ impl SyncEngine {
                     } else {
                         None
                     };
+                    // Skip if this exact on-chain coin commitment is already recorded for this tx
+                    // (e.g. a TOKEN_MINT output appearing in both a full block and an extra block).
+                    if let Some(c) = commitment {
+                        if self.db.note_exists_by_commitment(&tx_hash_hex, c)? {
+                            continue;
+                        }
+                    }
                     // Nullifier = poseidon(secret, coin) — must match LWD nullifier stream.
                     let nullifier_bytes = {
                         use darkfi_money_contract::model::Coin;
@@ -1851,11 +1930,17 @@ impl SyncEngine {
                         );
                         continue;
                     };
+                    // Avoid synthetic `idx = 0` collisions when extra TOKEN_MINT blocks
+                    // share a tx_hash with another output already stored at output_index 0.
+                    let db_output_index =
+                        self.db
+                            .resolve_note_output_index(&tx_hash_hex, idx as u32, commitment)?;
+                    let token_hex = hex::encode(&note.token_id);
                     let _rowid = self.db.insert_note(
                         &tx_hash_hex,
-                        idx as u32,
+                        db_output_index,
                         value_i64,
-                        &hex::encode(&note.token_id),
+                        &token_hex,
                         &note.serial,
                         block.height,
                         note.memo.as_deref(),
@@ -1873,21 +1958,20 @@ impl SyncEngine {
                     if note.spend_hook_bytes.len() == 32 {
                         let _ = self.db.set_spend_hook_bytes(
                             &tx_hash_hex,
-                            idx as u32,
+                            db_output_index,
                             &note.spend_hook_bytes,
                         );
                     }
-                    self.db.insert_transaction(
+                    // Multi-output incoming tx accounting: sum all notes in this tx
+                    // for `token_hex` instead of collapsing to output 0.
+                    self.db.upsert_incoming_transaction(
                         &tx_hash_hex,
                         block.height,
-                        "incoming",
                         value_i64,
-                        &hex::encode(&note.token_id),
-                        None,
+                        &token_hex,
                         note.memo.as_deref(),
                     )?;
                     if fresh_note {
-                        let token_hex = hex::encode(&note.token_id);
                         let (kind, detail) = match self.db.get_transaction(&tx_hash_hex) {
                             Ok(Some(row)) if row.direction == "outgoing" => {
                                 let kind = if row.kind.is_empty() || row.kind == "transfer" {
@@ -1895,9 +1979,9 @@ impl SyncEngine {
                                 } else {
                                     row.kind
                                 };
-                                (kind, format!("own-output-{idx}"))
+                                (kind, format!("own-output-{db_output_index}"))
                             }
-                            _ => ("receive".to_string(), format!("output-{idx}")),
+                            _ => ("receive".to_string(), format!("output-{db_output_index}")),
                         };
                         crate::tx_status::emit(
                             &kind,
@@ -2733,7 +2817,47 @@ pub fn derived_coin_from_note(note: &DecryptedNote, wallet_key: &[u8]) -> Option
     )
 }
 
-type TrialHits = std::collections::HashMap<(u32, [u8; 32], u32), (DecryptedNote, Vec<u8>)>;
+/// Keyed by `(block_pos, tx_pos, out_pos)` in the caller's `blocks` slice so
+/// supplemental blocks at the same height (e.g. `TOKEN_MINT` extra blocks)
+/// never collide with regular compact blocks.
+type TrialHits = std::collections::HashMap<(usize, usize, usize), (DecryptedNote, Vec<u8>)>;
+
+/// Strip outputs from supplemental `TOKEN_MINT` blocks that are already present
+/// in `in_window` (matching `(height, tx_hash, coin)`), avoiding duplicate work
+/// and synthetic `idx = 0` collisions.
+fn dedup_extra_blocks_against_window(
+    in_window: &[crate::client::proto::CompactBlock],
+    extra: Vec<crate::client::proto::CompactBlock>,
+) -> Vec<crate::client::proto::CompactBlock> {
+    let mut seen: std::collections::HashSet<(u32, Vec<u8>, Vec<u8>)> =
+        std::collections::HashSet::new();
+    for block in in_window {
+        for tx in &block.txs {
+            for out in &tx.outputs {
+                if out.coin.len() == 32 {
+                    seen.insert((block.height, tx.tx_hash.clone(), out.coin.clone()));
+                }
+            }
+        }
+    }
+    let mut out_blocks = Vec::new();
+    for mut block in extra {
+        for tx in &mut block.txs {
+            tx.outputs.retain(|o| {
+                if o.coin.len() == 32 {
+                    !seen.contains(&(block.height, tx.tx_hash.clone(), o.coin.clone()))
+                } else {
+                    true
+                }
+            });
+        }
+        block.txs.retain(|tx| !tx.outputs.is_empty());
+        if !block.txs.is_empty() {
+            out_blocks.push(block);
+        }
+    }
+    out_blocks
+}
 
 const MONEY_FUNC_AUTH_TOKEN_MINT: u32 = 0x04;
 const MONEY_FUNC_AUTH_TOKEN_FREEZE: u32 = 0x05;
@@ -2750,40 +2874,41 @@ fn batch_open_blocks(
     use std::io::Cursor;
 
     struct Job {
-        height: u32,
-        tx: [u8; 32],
-        idx: u32,
+        block_pos: usize,
+        tx_pos: usize,
+        out_pos: usize,
         coin: Vec<u8>,
         note: AeadEncryptedNote,
     }
 
     let mut jobs = Vec::new();
     let mut fallback = Vec::new();
-    for block in blocks {
-        for tx in &block.txs {
+    for (block_pos, block) in blocks.iter().enumerate() {
+        for (tx_pos, tx) in block.txs.iter().enumerate() {
             if tx.tx_hash.len() != 32 {
                 continue;
             }
-            let mut tx_key = [0u8; 32];
-            tx_key.copy_from_slice(&tx.tx_hash);
-            for (idx, output) in tx.outputs.iter().enumerate() {
+            for (out_pos, output) in tx.outputs.iter().enumerate() {
                 if output.encrypted_note.len() < 48 {
                     continue;
                 }
                 let mut cursor = Cursor::new(output.encrypted_note.as_slice());
-                if let Ok(note) = AeadEncryptedNote::decode(&mut cursor) {
+                let decoded_exact = AeadEncryptedNote::decode(&mut cursor)
+                    .ok()
+                    .filter(|_| cursor.position() as usize == output.encrypted_note.len());
+                if let Some(note) = decoded_exact {
                     jobs.push(Job {
-                        height: block.height,
-                        tx: tx_key,
-                        idx: idx as u32,
+                        block_pos,
+                        tx_pos,
+                        out_pos,
                         coin: output.coin.clone(),
                         note,
                     });
                 } else {
                     fallback.push((
-                        block.height,
-                        tx_key,
-                        idx as u32,
+                        block_pos,
+                        tx_pos,
+                        out_pos,
                         output.coin.clone(),
                         output.encrypted_note.clone(),
                     ));
@@ -2805,7 +2930,7 @@ fn batch_open_blocks(
         let pending: Vec<usize> = jobs
             .iter()
             .enumerate()
-            .filter(|(_, job)| !out.contains_key(&(job.height, job.tx, job.idx)))
+            .filter(|(_, job)| !out.contains_key(&(job.block_pos, job.tx_pos, job.out_pos)))
             .map(|(index, _)| index)
             .collect();
         if pending.is_empty() {
@@ -2855,13 +2980,17 @@ fn batch_open_blocks(
         };
         for (index, note) in hits {
             out.insert(
-                (jobs[index].height, jobs[index].tx, jobs[index].idx),
+                (
+                    jobs[index].block_pos,
+                    jobs[index].tx_pos,
+                    jobs[index].out_pos,
+                ),
                 (note, secret_bytes.clone()),
             );
         }
     }
-    for (height, tx, idx, coin, encrypted) in fallback {
-        if out.contains_key(&(height, tx, idx)) {
+    for (block_pos, tx_pos, out_pos, coin, encrypted) in fallback {
+        if out.contains_key(&(block_pos, tx_pos, out_pos)) {
             continue;
         }
         for secret_bytes in secrets {
@@ -2875,7 +3004,7 @@ fn batch_open_blocks(
             if coin.len() == 32 && derived.as_slice() != coin.as_slice() {
                 continue;
             }
-            out.insert((height, tx, idx), (note, secret_bytes.clone()));
+            out.insert((block_pos, tx_pos, out_pos), (note, secret_bytes.clone()));
             break;
         }
     }
@@ -3297,5 +3426,181 @@ mod tests {
         let r_hp = redact_sync_error(hp);
         assert!(!r_hp.contains("lwd.darkfi.example"));
         assert!(r_hp.contains("[redacted-addr]"));
+    }
+
+    #[test]
+    fn batch_open_and_trial_decrypt_multi_output_and_extra_token_mint_no_collision() {
+        use darkfi_money_contract::client::MoneyNote;
+        use darkfi_money_contract::model::{CoinAttributes, DARK_TOKEN_ID};
+        use darkfi_sdk::crypto::note::AeadEncryptedNote;
+        use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
+        use darkfi_sdk::crypto::{Blind, FuncId, Keypair};
+        use darkfi_sdk::pasta::pallas;
+        use darkfi_serial::serialize;
+
+        let kp = Keypair::random(&mut rand_core::OsRng);
+        let sk_bytes = kp.secret.inner().to_repr().to_vec();
+        let mk_out = |val: u64, memo: Vec<u8>| {
+            let cb = Blind::random(&mut rand_core::OsRng);
+            let note = MoneyNote {
+                value: val,
+                token_id: *DARK_TOKEN_ID,
+                spend_hook: FuncId::none(),
+                user_data: pallas::Base::ZERO,
+                coin_blind: cb,
+                value_blind: Blind::random(&mut rand_core::OsRng),
+                token_blind: Blind::random(&mut rand_core::OsRng),
+                memo,
+            };
+            let coin = CoinAttributes {
+                public_key: kp.public,
+                value: val,
+                token_id: *DARK_TOKEN_ID,
+                spend_hook: FuncId::none(),
+                user_data: pallas::Base::ZERO,
+                blind: cb,
+            }
+            .to_coin();
+            let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
+            crate::client::proto::CompactOutput {
+                coin: coin.to_bytes().to_vec(),
+                encrypted_note: serialize(&enc),
+                value_commit: Vec::new(),
+                token_commit: Vec::new(),
+                omr_clue: Vec::new(),
+                omr_metadata_enc: Vec::new(),
+                func_code: 0,
+            }
+        };
+
+        let tx_hash = vec![0x42u8; 32];
+        let out0 = mk_out(300, b"part1".to_vec());
+        let out1 = mk_out(450, Vec::new());
+        let out_mint_extra = mk_out(250, Vec::new());
+
+        // Block 0: normal compact block with 2 outputs for our wallet.
+        let main_block = crate::client::proto::CompactBlock {
+            height: 77,
+            hash: vec![0x01; 32],
+            prev_hash: vec![0x00; 32],
+            timestamp: 1,
+            txs: vec![crate::client::proto::CompactTx {
+                tx_hash: tx_hash.clone(),
+                outputs: vec![out0.clone(), out1],
+                nullifiers: Vec::new(),
+                fee: 0,
+            }],
+        };
+        // Extra TOKEN_MINT block at the SAME height and SAME tx_hash with synthetic idx=0:
+        // contains both a duplicate of out0 and a distinct extra output out_mint_extra!
+        let extra_raw = vec![crate::client::proto::CompactBlock {
+            height: 77,
+            hash: vec![0x01; 32],
+            prev_hash: vec![0x00; 32],
+            timestamp: 1,
+            txs: vec![crate::client::proto::CompactTx {
+                tx_hash: tx_hash.clone(),
+                outputs: vec![out0, out_mint_extra],
+                nullifiers: Vec::new(),
+                fee: 0,
+            }],
+        }];
+        let mut combined = vec![main_block];
+        let extra_deduped = dedup_extra_blocks_against_window(&combined, extra_raw);
+        assert_eq!(extra_deduped.len(), 1);
+        assert_eq!(extra_deduped[0].txs[0].outputs.len(), 1);
+        combined.extend(extra_deduped);
+
+        let db = WalletDb::in_memory().unwrap();
+        let engine = SyncEngine::new(
+            db,
+            "http://127.0.0.1:9067",
+            vec![sk_bytes],
+            None,
+            0x01,
+            false,
+            false,
+            None,
+            false,
+        );
+        let found = engine.trial_decrypt_blocks(&combined).unwrap();
+        assert_eq!(
+            found, 3,
+            "all 3 distinct outputs must be stored without synthetic idx=0 collision"
+        );
+        assert_eq!(engine.db.confirmed_balance("DRK").unwrap(), 1000);
+        let tx_row = engine
+            .db
+            .get_transaction(&hex::encode(&tx_hash))
+            .unwrap()
+            .expect("incoming tx row must exist");
+        assert_eq!(
+            tx_row.value_raw, 1000,
+            "multi-output incoming tx must sum all 3 outputs"
+        );
+    }
+
+    #[test]
+    fn batch_open_blocks_enforces_trailing_byte_check_and_falls_back() {
+        use darkfi_money_contract::client::MoneyNote;
+        use darkfi_money_contract::model::{CoinAttributes, DARK_TOKEN_ID};
+        use darkfi_sdk::crypto::note::AeadEncryptedNote;
+        use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
+        use darkfi_sdk::crypto::{Blind, FuncId, Keypair};
+        use darkfi_sdk::pasta::pallas;
+        use darkfi_serial::serialize;
+
+        let kp = Keypair::random(&mut rand_core::OsRng);
+        let sk_bytes = kp.secret.inner().to_repr().to_vec();
+        let cb = Blind::random(&mut rand_core::OsRng);
+        let note = MoneyNote {
+            value: 123_456,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook: FuncId::none(),
+            user_data: pallas::Base::ZERO,
+            coin_blind: cb,
+            value_blind: Blind::random(&mut rand_core::OsRng),
+            token_blind: Blind::random(&mut rand_core::OsRng),
+            memo: Vec::new(),
+        };
+        let coin = CoinAttributes {
+            public_key: kp.public,
+            value: 123_456,
+            token_id: *DARK_TOKEN_ID,
+            spend_hook: FuncId::none(),
+            user_data: pallas::Base::ZERO,
+            blind: cb,
+        }
+        .to_coin();
+        let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
+        // Raw (ephem_pk || ciphertext) encoding without VarInt length prefix — only
+        // handled by fallback `aead_note_candidates`, NOT `AeadEncryptedNote::decode`!
+        let mut raw_enc = serialize(&enc.ephem_public);
+        raw_enc.extend_from_slice(&enc.ciphertext);
+
+        let block = crate::client::proto::CompactBlock {
+            height: 10,
+            hash: vec![0x02; 32],
+            prev_hash: vec![0x01; 32],
+            timestamp: 1,
+            txs: vec![crate::client::proto::CompactTx {
+                tx_hash: vec![0x99; 32],
+                outputs: vec![crate::client::proto::CompactOutput {
+                    coin: coin.to_bytes().to_vec(),
+                    encrypted_note: raw_enc,
+                    value_commit: Vec::new(),
+                    token_commit: Vec::new(),
+                    omr_clue: Vec::new(),
+                    omr_metadata_enc: Vec::new(),
+                    func_code: 0,
+                }],
+                nullifiers: Vec::new(),
+                fee: 0,
+            }],
+        };
+
+        let hits = batch_open_blocks(&[sk_bytes], &[block]);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.get(&(0, 0, 0)).unwrap().0.value, 123_456);
     }
 }

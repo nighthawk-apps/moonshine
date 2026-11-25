@@ -52,6 +52,39 @@ const MAX_GRPC_MESSAGE_BYTES: usize = 160 * 1024 * 1024;
 const GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 const GRPC_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Maximum total bytes accepted across all chunks of `GetCheckpointSnapshot`
+/// (prevents OOM DoS from a malicious or misbehaving server).
+pub const MAX_CHECKPOINT_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CHECKPOINT_CHUNKS: usize = 4096;
+
+/// Update running checkpoint byte/chunk budget; fails closed when exceeded.
+pub(crate) fn check_checkpoint_chunk_budget(
+    total_bytes: &mut usize,
+    chunk_count: &mut usize,
+    chunk: &proto::CheckpointSnapshot,
+) -> Result<(), String> {
+    *chunk_count = chunk_count.saturating_add(1);
+    if *chunk_count > MAX_CHECKPOINT_CHUNKS {
+        return Err(format!(
+            "checkpoint snapshot exceeded max chunk count ({MAX_CHECKPOINT_CHUNKS})"
+        ));
+    }
+    let chunk_bytes = chunk
+        .tree_data
+        .len()
+        .saturating_add(chunk.nullifier_index.len())
+        .saturating_add(chunk.block_hash.len())
+        .saturating_add(chunk.state_root.len())
+        .saturating_add(chunk.snapshot_hash.len());
+    *total_bytes = total_bytes.saturating_add(chunk_bytes);
+    if *total_bytes > MAX_CHECKPOINT_SNAPSHOT_BYTES {
+        return Err(format!(
+            "checkpoint snapshot exceeded max size cap ({MAX_CHECKPOINT_SNAPSHOT_BYTES} bytes)"
+        ));
+    }
+    Ok(())
+}
+
 /// Exact-host loopback check. `https://localhost.evil.com` is remote.
 pub fn host_is_loopback(server_url: &str) -> bool {
     let rest = server_url.split("://").nth(1).unwrap_or(server_url);
@@ -440,6 +473,7 @@ impl LightwalletClient {
     }
 
     /// Stream checkpoint snapshot chunks from lightwalletd for instant restore.
+    /// Enforces a hard total byte and chunk cap to prevent OOM DoS.
     #[allow(dead_code)]
     pub async fn get_checkpoint_snapshot(
         &mut self,
@@ -451,8 +485,12 @@ impl LightwalletClient {
         let response = client.get_checkpoint_snapshot(req).await?;
         let mut stream = response.into_inner();
         let mut chunks = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut chunk_count = 0usize;
         while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
-            chunks.push(chunk?);
+            let chunk = chunk?;
+            check_checkpoint_chunk_budget(&mut total_bytes, &mut chunk_count, &chunk)?;
+            chunks.push(chunk);
         }
         Ok(chunks)
     }
@@ -850,5 +888,27 @@ mod tests {
         assert_eq!(parse_tls_pin_hex(colon_fmt).unwrap(), bytes);
         assert!(parse_tls_pin_hex("short").is_err());
         assert!(parse_tls_pin_hex(&format!("{valid}00")).is_err());
+    }
+
+    #[test]
+    fn checkpoint_chunk_budget_rejects_oversized_stream() {
+        let mut total = 0usize;
+        let mut count = 0usize;
+        let small = proto::CheckpointSnapshot {
+            tree_data: vec![0u8; 1024],
+            ..Default::default()
+        };
+        assert!(check_checkpoint_chunk_budget(&mut total, &mut count, &small).is_ok());
+        assert_eq!(total, 1024);
+        assert_eq!(count, 1);
+
+        let huge = proto::CheckpointSnapshot {
+            tree_data: vec![0u8; MAX_CHECKPOINT_SNAPSHOT_BYTES],
+            ..Default::default()
+        };
+        assert!(
+            check_checkpoint_chunk_budget(&mut total, &mut count, &huge).is_err(),
+            "oversized checkpoint snapshot stream must be rejected"
+        );
     }
 }

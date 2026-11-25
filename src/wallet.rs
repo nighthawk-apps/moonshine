@@ -307,9 +307,9 @@ impl Wallet {
         // Store seed hash for OMR key derivation (never store the seed/mnemonic)
         let seed_hash = blake3::hash(&secret_bytes);
         db.set_meta("seed_hash", seed_hash.as_bytes())?;
-        // HD derivation seed for index >= 1 (same as mobile UniFFI)
+        // HD derivation seed for index >= 1 (same as mobile UniFFI) — wrapped at rest.
         let derivation_seed = mnemonic::derivation_seed_from_mnemonic(&words);
-        db.set_meta("derivation_seed", &derivation_seed)?;
+        db.set_wrapped_meta("derivation_seed", &derivation_seed)?;
         db.set_meta("wallet_version", &[0x02])?;
         db.set_meta("mnemonic_word_count", &[words.len() as u8])?;
         db.set_meta("network", network.as_bytes())?;
@@ -387,7 +387,7 @@ impl Wallet {
         let seed_hash = blake3::hash(&secret_bytes);
         db.set_meta("seed_hash", seed_hash.as_bytes())?;
         let derivation_seed = mnemonic::derivation_seed_from_mnemonic(mnemonic_words);
-        db.set_meta("derivation_seed", &derivation_seed)?;
+        db.set_wrapped_meta("derivation_seed", &derivation_seed)?;
         db.set_meta("wallet_version", &[0x02])?;
         db.set_meta("network", network.as_bytes())?;
 
@@ -582,7 +582,7 @@ impl Wallet {
             return Err("Wallet has no primary address — recreate or re-import".into());
         }
 
-        let seed_bytes = self.db.get_meta("derivation_seed")?.ok_or(
+        let seed_bytes = self.db.get_wrapped_meta("derivation_seed")?.ok_or(
             "Wallet derivation_seed missing — re-import the mnemonic to enable \
                  mobile-compatible sub-addresses",
         )?;
@@ -752,7 +752,8 @@ mod tests {
         let seed_hash = blake3::hash(b"test-seed-multi").as_bytes().to_vec();
         db.set_meta("seed_hash", &seed_hash).unwrap();
         let derivation_seed = crate::mnemonic::derivation_seed_from_mnemonic(&words);
-        db.set_meta("derivation_seed", &derivation_seed).unwrap();
+        db.set_wrapped_meta("derivation_seed", &derivation_seed)
+            .unwrap();
         db.insert_address("addr0", secret0.as_ref()).unwrap();
         db.set_default_address("addr0").unwrap();
 
@@ -873,7 +874,7 @@ mod tests {
         let seed_hash = blake3::hash(b"test-seed").as_bytes().to_vec();
         db.set_meta("seed_hash", &seed_hash).unwrap();
         let derivation_seed = blake3::hash(b"test-derivation-seed");
-        db.set_meta("derivation_seed", derivation_seed.as_bytes())
+        db.set_wrapped_meta("derivation_seed", derivation_seed.as_bytes())
             .unwrap();
         db.insert_address("addr0", &[0]).unwrap();
 
