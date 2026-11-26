@@ -963,6 +963,10 @@ async fn broadcast_builder(
             tree,
             money_zkas,
             &wallet_secrets,
+            // Callers that shuffled a transfer tag the change index and spend it
+            // in the transfer builder. This path has no such tag, so fee selection
+            // must not treat a tail output as change.
+            None,
         )
         .await?;
         (tx, nf)

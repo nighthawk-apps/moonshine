@@ -185,7 +185,25 @@ enum WalletSubcommand {
         #[arg(long)]
         birthday: Option<u32>,
     },
-    Export,
+    /// Export the UnifOMR detection key.
+    ///
+    /// The key is not printed unless `--show-secret` is set and stdout is a TTY.
+    /// `--out` writes the hex to a new mode-0600 file and prints only that path.
+    Export {
+        /// Print the detection key to a TTY. Refused when stdout is not a terminal.
+        #[arg(
+            long,
+            help = "Print the detection key to a TTY. Refused when stdout is not a terminal."
+        )]
+        show_secret: bool,
+        /// Write the detection key hex to a new mode-0600 file and print only the path.
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Write the detection key hex to a new mode-0600 file and print only the path."
+        )]
+        out: Option<std::path::PathBuf>,
+    },
     Delete,
     List,
     Info,
@@ -344,10 +362,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     println!("Set wallet birthday to height {}.", height);
                 }
             }
-            WalletSubcommand::Export => {
+            WalletSubcommand::Export { show_secret, out } => {
+                let plan = plan_detection_key_export(
+                    show_secret,
+                    std::io::stdout().is_terminal(),
+                    out,
+                )?;
                 let w = wallet::Wallet::open(&args.wallet_name)?;
                 let dk = w.derive_unifomr_detection_key(&config.network)?;
-                println!("UnifOMR detection key (hex): {}", hex::encode(&dk));
+                match plan {
+                    DetectionKeyExport::PrintToTty => {
+                        println!("UnifOMR detection key (hex): {}", hex::encode(&dk));
+                    }
+                    DetectionKeyExport::WriteFile(path) => {
+                        let encoded = hex::encode(&dk);
+                        crate::secret_wrap::write_mode_0600_create_new(&path, encoded.as_bytes())?;
+                        println!("{}", path.display());
+                    }
+                }
                 println!("⚠️  Full seed export requires manual backup.");
             }
             WalletSubcommand::Delete => {
@@ -2683,6 +2715,46 @@ fn parse_stub_recipient_pubkey(raw_tx: &[u8]) -> Option<[u8; 32]> {
     Some(pk)
 }
 
+/// Where `wallet export` may place the UnifOMR detection key.
+#[derive(Debug, PartialEq, Eq)]
+enum DetectionKeyExport {
+    /// Print the hex on a terminal. Never chosen for a pipe or file redirect.
+    PrintToTty,
+    /// Write the hex to a new file. The key itself is not printed.
+    WriteFile(std::path::PathBuf),
+}
+
+/// Refuse to print the detection key unless `--show-secret` is set on a TTY.
+/// `--out` writes a new file and does not print the key, even if `--show-secret`
+/// is also set.
+fn plan_detection_key_export(
+    show_secret: bool,
+    stdout_is_tty: bool,
+    out: Option<std::path::PathBuf>,
+) -> Result<DetectionKeyExport, String> {
+    if let Some(path) = out {
+        if path.as_os_str().is_empty() {
+            return Err("detection key output path is empty".into());
+        }
+        return Ok(DetectionKeyExport::WriteFile(path));
+    }
+    if show_secret && stdout_is_tty {
+        return Ok(DetectionKeyExport::PrintToTty);
+    }
+    if show_secret {
+        return Err(
+            "Refusing to print the UnifOMR detection key: stdout is not a TTY. \
+             Re-run in a terminal with --show-secret, or pass --out <path>."
+                .into(),
+        );
+    }
+    Err(
+        "Refusing to print the UnifOMR detection key. \
+         Pass --show-secret to print it on a TTY, or --out <path> to write it to a new mode-0600 file."
+            .into(),
+    )
+}
+
 #[cfg(test)]
 mod stub_parse_tests {
     use super::*;
@@ -2713,5 +2785,42 @@ mod stub_parse_tests {
         assert_eq!(payment_index_from_self(&[0, 1], 2), 0);
         // No self outputs -> payment at 0.
         assert_eq!(payment_index_from_self(&[], 1), 0);
+    }
+}
+
+#[cfg(test)]
+mod detection_key_export_tests {
+    use super::{plan_detection_key_export, DetectionKeyExport};
+
+    #[test]
+    fn export_refuses_to_print_without_show_secret() {
+        let err = plan_detection_key_export(false, true, None).unwrap_err();
+        assert!(err.contains("--show-secret"));
+        assert!(plan_detection_key_export(false, false, None).is_err());
+    }
+
+    #[test]
+    fn export_prints_only_on_a_tty_with_show_secret() {
+        assert_eq!(
+            plan_detection_key_export(true, true, None).unwrap(),
+            DetectionKeyExport::PrintToTty
+        );
+        let err = plan_detection_key_export(true, false, None).unwrap_err();
+        assert!(err.contains("not a TTY"));
+        assert!(err.contains("--out"));
+    }
+
+    #[test]
+    fn export_out_writes_a_file_and_does_not_print_the_key() {
+        let path = std::path::PathBuf::from("/tmp/moonshine-detection-key.hex");
+        assert_eq!(
+            plan_detection_key_export(false, true, Some(path.clone())).unwrap(),
+            DetectionKeyExport::WriteFile(path.clone())
+        );
+        assert_eq!(
+            plan_detection_key_export(true, true, Some(path.clone())).unwrap(),
+            DetectionKeyExport::WriteFile(path)
+        );
+        assert!(plan_detection_key_export(false, false, Some(std::path::PathBuf::new())).is_err());
     }
 }

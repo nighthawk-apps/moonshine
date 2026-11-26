@@ -146,6 +146,23 @@ fn coin_tie_key(c: &OwnCoin) -> (u64, [u8; 32]) {
     (u64::from(c.leaf_position), c.coin.to_bytes())
 }
 
+/// Wallet cap on TransferV1 inputs (one Halo2 burn proof each).
+///
+/// DarkFi `MAX_TX_CALLS` (20) bounds contract calls in a transaction, not burn
+/// proofs inside one Money transfer. Nothing in this tree caps that proof
+/// count, so a dust wallet stops here and must consolidate.
+pub const MAX_TRANSFER_INPUTS: usize = 8;
+
+/// Selection refused because the transfer would build too many burn proofs.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this transfer would use {attempted} inputs, above the maximum of {max}. Consolidate coins into fewer notes and retry"
+)]
+pub struct TooManyTransferInputs {
+    pub attempted: usize,
+    pub max: usize,
+}
+
 /// Deterministically select minimal unspent coins covering `target`.
 ///
 /// Strategy:
@@ -185,6 +202,13 @@ pub(crate) fn select_coins_deterministic(
     let mut selected = Vec::new();
     let mut total = 0u64;
     for coin in sorted {
+        if selected.len() >= MAX_TRANSFER_INPUTS {
+            return Err(TooManyTransferInputs {
+                attempted: selected.len() + 1,
+                max: MAX_TRANSFER_INPUTS,
+            }
+            .into());
+        }
         total = total
             .checked_add(coin.note.value)
             .ok_or("Selected coin value sum overflow")?;
@@ -322,37 +346,29 @@ pub(crate) fn filter_fee_candidates(spendable: &[OwnCoin], fee: u64) -> Vec<OwnC
         .collect()
 }
 
-/// Select a tx-local change output for `FeeV1` without cannibalizing payment outputs.
+/// Select the tagged tx-local change output for `FeeV1`.
 ///
-/// Iterates from the tail and skips:
-/// - payment outputs (`idx < min_change_index`)
-/// - non-DRK coins or coins smaller than `fee`
-/// - contract-hooked notes (`spend_hook != FuncId::none()`)
-/// - outputs carrying a non-empty payment memo
+/// `change_output_idx` is the shuffled change output. Payment outputs are not
+/// candidates. Also skips non-DRK coins, coins smaller than `fee`, hooked
+/// notes, and outputs carrying a payment memo.
 #[allow(dead_code)]
 pub(crate) fn select_tx_local_fee_output(
     outputs: &[darkfi_money_contract::model::Output],
     secret: &SecretKey,
     fee: u64,
-    min_change_index: usize,
+    change_output_idx: Option<usize>,
 ) -> Option<(usize, MoneyNote)> {
-    for (idx, output) in outputs.iter().enumerate().rev() {
-        if idx < min_change_index {
-            continue;
-        }
-        let Ok(note) = output.note.decrypt::<MoneyNote>(secret) else {
-            continue;
-        };
-        if note.value < fee
-            || note.token_id != *DARK_TOKEN_ID
-            || note.spend_hook != FuncId::none()
-            || !note.memo.is_empty()
-        {
-            continue;
-        }
-        return Some((idx, note));
+    let idx = change_output_idx?;
+    let output = outputs.get(idx)?;
+    let note = output.note.decrypt::<MoneyNote>(secret).ok()?;
+    if note.value < fee
+        || note.token_id != *DARK_TOKEN_ID
+        || note.spend_hook != FuncId::none()
+        || !note.memo.is_empty()
+    {
+        return None;
     }
-    None
+    Some((idx, note))
 }
 
 fn own_coin_commitment(coin: &OwnCoin) -> Vec<u8> {
@@ -602,24 +618,25 @@ pub async fn build_transaction_extended(
                 expected_root: tree.root(0),
             })
         } else if let Some(idx) = change_output_idx {
-            // DEP-0008: spend transfer change inside this tx (tx-local tree).
+            // DEP-0008: spend the tagged change output inside this tx (tx-local tree).
+            // The index comes from the shuffle tag. Position is not a proxy for change.
             // Must match host `merkle_add_local`: dummy ZERO leaf, then local coins.
+            let Some((chosen_idx, secret, note, _)) =
+                crate::fee_attach::select_tx_local_fee_candidate(
+                    &params.outputs,
+                    &[keypair.secret],
+                    &[],
+                    fee,
+                    Some(idx),
+                )
+            else {
+                return Err("Transfer change output is not eligible to pay FeeV1".into());
+            };
             let mut local_tree = MerkleTree::new(1);
             local_tree.append(MerkleNode::from(pallas::Base::ZERO));
-            let output = &mut params.outputs[idx];
-            let note = output
-                .note
-                .decrypt::<MoneyNote>(&keypair.secret)
-                .map_err(|_| "Failed to decrypt transfer change output for tx-local fee")?;
-            if note.value < fee
-                || note.token_id != *DARK_TOKEN_ID
-                || note.spend_hook != FuncId::none()
-                || !note.memo.is_empty()
-            {
-                return Err("Transfer change output is not eligible to pay FeeV1".into());
-            }
+            let output = &mut params.outputs[chosen_idx];
             let derived = CoinAttributes {
-                public_key: PublicKey::from_secret(keypair.secret),
+                public_key: PublicKey::from_secret(secret),
                 value: note.value,
                 token_id: note.token_id,
                 spend_hook: note.spend_hook,
@@ -641,7 +658,7 @@ pub async fn build_transaction_extended(
             let coin = OwnCoin {
                 coin: output.coin,
                 note,
-                secret: keypair.secret,
+                secret,
                 leaf_position,
             };
             let merkle_path = local_tree
@@ -922,21 +939,53 @@ mod tests {
         let change = make_encrypted_output(&kp, 20_000_000, FuncId::none(), vec![]);
 
         let chosen = select_tx_local_fee_output(
-            &[payment.clone(), hooked, change],
+            &[payment.clone(), hooked.clone(), change.clone()],
             &kp.secret,
             5_000_000,
-            1,
+            Some(2),
         )
-        .expect("should pick change output");
+        .expect("should pick the tagged change output");
         assert_eq!(chosen.0, 2);
         assert_eq!(chosen.1.value, 20_000_000);
 
+        // Change shuffled to index 0. An unmemoized payment at index 1 is not the fee.
+        let bare_payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), vec![]);
+        let shuffled = select_tx_local_fee_output(
+            &[change.clone(), bare_payment.clone()],
+            &kp.secret,
+            5_000_000,
+            Some(0),
+        )
+        .expect("change at index 0 is eligible");
+        assert_eq!(shuffled.0, 0);
+        assert_eq!(shuffled.1.value, 20_000_000);
+        assert!(select_tx_local_fee_output(
+            &[change, bare_payment.clone()],
+            &kp.secret,
+            5_000_000,
+            None,
+        )
+        .is_none());
+        assert!(select_tx_local_fee_output(
+            &[bare_payment.clone(), payment.clone()],
+            &kp.secret,
+            5_000_000,
+            Some(1),
+        )
+        .is_none());
+
         let unmemoized_payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), vec![]);
+        assert!(select_tx_local_fee_output(
+            &[unmemoized_payment],
+            &kp.secret,
+            5_000_000,
+            None,
+        )
+        .is_none());
+        assert!(select_tx_local_fee_output(&[payment.clone(), payment], &kp.secret, 5_000_000, None)
+            .is_none());
         assert!(
-            select_tx_local_fee_output(&[unmemoized_payment], &kp.secret, 5_000_000, 1).is_none()
-        );
-        assert!(
-            select_tx_local_fee_output(&[payment.clone(), payment], &kp.secret, 5_000_000, 1)
+            select_tx_local_fee_output(&[hooked, bare_payment], &kp.secret, 5_000_000, Some(0))
                 .is_none()
         );
     }
@@ -1100,5 +1149,51 @@ mod tests {
         assert_eq!(sel[1].coin, t1.coin);
         assert_eq!(chg, 50);
         assert_eq!(fee_coin.as_ref().map(|c| c.coin), Some(drk_fee.coin));
+    }
+
+    #[test]
+    fn transfer_input_cap_asks_to_consolidate() {
+        let dust: Vec<OwnCoin> = (0..12)
+            .map(|i| make_own_coin_at(1_000_000, *DARK_TOKEN_ID, FuncId::none(), i))
+            .collect();
+        let (exact, change) =
+            select_coins_deterministic(&dust, (MAX_TRANSFER_INPUTS as u64) * 1_000_000).unwrap();
+        assert_eq!(exact.len(), MAX_TRANSFER_INPUTS);
+        assert_eq!(change, 0);
+
+        let err = select_coins_deterministic(&dust, (MAX_TRANSFER_INPUTS as u64 + 1) * 1_000_000)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Consolidate"),
+            "cap error should tell the user to consolidate: {msg}"
+        );
+        assert!(
+            msg.contains(&MAX_TRANSFER_INPUTS.to_string()),
+            "cap error should name the limit: {msg}"
+        );
+        let too_many = err.downcast_ref::<TooManyTransferInputs>().expect("structured cap error");
+        assert_eq!(too_many.max, MAX_TRANSFER_INPUTS);
+        assert!(too_many.attempted > MAX_TRANSFER_INPUTS);
+
+        // A single covering coin is still one input, even in a dust wallet.
+        let mut mixed = dust.clone();
+        mixed.push(make_own_coin_at(
+            50_000_000,
+            *DARK_TOKEN_ID,
+            FuncId::none(),
+            100,
+        ));
+        let (one, _) = select_coins_deterministic(&mixed, 40_000_000).unwrap();
+        assert_eq!(one.len(), 1);
+
+        let via_fee = select_transfer_and_fee_coins(
+            &dust,
+            *DARK_TOKEN_ID,
+            (MAX_TRANSFER_INPUTS as u64 + 1) * 1_000_000,
+            0,
+        )
+        .unwrap_err();
+        assert!(via_fee.to_string().contains("Consolidate"));
     }
 }

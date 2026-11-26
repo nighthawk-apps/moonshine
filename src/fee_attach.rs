@@ -42,6 +42,9 @@ pub async fn finish_with_native_fee(
     tree: Option<&MerkleTree>,
     zkas_bins: &[(String, Vec<u8>)],
     wallet_secrets: &[SecretKey],
+    // Change output after shuffling. `None` means there is no tagged change
+    // output; fee selection does not guess from position.
+    change_output_idx: Option<usize>,
 ) -> Result<(Transaction, Vec<u8>, Vec<u8>), Box<dyn Error>> {
     if fee == 0 {
         return Ok((tx_builder.build_signed()?, Vec::new(), Vec::new()));
@@ -61,7 +64,13 @@ pub async fn finish_with_native_fee(
     let spent_nullifiers = collect_spent_nullifiers(&mut tx_builder).await?;
 
     let (coin, fee_tree, is_tx_local) = if let Some((coin, local_tree)) =
-        mark_tx_local_output_for_fee(&mut tx_builder, wallet_secrets, &spent_nullifiers, fee)?
+        mark_tx_local_output_for_fee(
+            &mut tx_builder,
+            wallet_secrets,
+            &spent_nullifiers,
+            fee,
+            change_output_idx,
+        )?
     {
         (coin, local_tree, true)
     } else {
@@ -216,38 +225,38 @@ async fn collect_spent_nullifiers(
     Ok(spent)
 }
 
-/// Pick an unhooked, unmemoized native-DRK change output from `outputs` for `FeeV1`.
-/// Prefers tail change outputs (`idx > 0`) so a self-transfer payment output at index 0
-/// is never cannibalized when change outputs exist.
+/// Pick the tagged change output for `FeeV1`.
+///
+/// `change_output_idx` is the transfer builder's change output after the
+/// output shuffle. Only that index is eligible. A change output at index 0
+/// can pay the fee. A payment output that shuffled to `idx >= 1` cannot.
+/// Memoized, hooked, non-DRK, and already-spent outputs stay ineligible.
 pub(crate) fn select_tx_local_fee_candidate(
     outputs: &[darkfi_money_contract::model::Output],
     wallet_secrets: &[SecretKey],
     spent_nullifiers: &[Nullifier],
     required_fee: u64,
+    change_output_idx: Option<usize>,
 ) -> Option<(
     usize,
     SecretKey,
     MoneyNote,
     darkfi_money_contract::model::Coin,
 )> {
-    let min_idx = if outputs.len() > 1 { 1 } else { 0 };
-    for (idx, output) in outputs.iter().enumerate().rev() {
-        if idx < min_idx {
+    let idx = change_output_idx?;
+    let output = outputs.get(idx)?;
+    for secret in wallet_secrets {
+        let Ok(note) = output.note.decrypt::<MoneyNote>(secret) else {
             continue;
-        }
-        for secret in wallet_secrets {
-            let Ok(note) = output.note.decrypt::<MoneyNote>(secret) else {
-                continue;
-            };
-            let nullifier = Nullifier::from(poseidon_hash([secret.inner(), output.coin.inner()]));
-            let suitable = note.token_id == *DARK_TOKEN_ID
-                && note.value >= required_fee
-                && note.spend_hook == FuncId::none()
-                && note.memo.is_empty()
-                && !spent_nullifiers.contains(&nullifier);
-            if suitable {
-                return Some((idx, *secret, note, output.coin));
-            }
+        };
+        let nullifier = Nullifier::from(poseidon_hash([secret.inner(), output.coin.inner()]));
+        let suitable = note.token_id == *DARK_TOKEN_ID
+            && note.value >= required_fee
+            && note.spend_hook == FuncId::none()
+            && note.memo.is_empty()
+            && !spent_nullifiers.contains(&nullifier);
+        if suitable {
+            return Some((idx, *secret, note, output.coin));
         }
     }
     None
@@ -259,6 +268,7 @@ fn mark_tx_local_output_for_fee(
     wallet_secrets: &[SecretKey],
     spent_nullifiers: &[Nullifier],
     required_fee: u64,
+    change_output_idx: Option<usize>,
 ) -> Result<Option<(OwnCoin, MerkleTree)>, Box<dyn Error>> {
     let mut tree = MerkleTree::new(1);
     tree.append(MerkleNode::from(pallas::Base::ZERO));
@@ -277,6 +287,7 @@ fn mark_tx_local_output_for_fee(
             wallet_secrets,
             spent_nullifiers,
             required_fee,
+            change_output_idx,
         );
 
         if let Some((idx, ..)) = &found {
@@ -295,8 +306,9 @@ fn mark_tx_local_output_for_fee(
             }
         }
 
+        // The explicit index belongs to this transfer. Do not reuse it on a later call.
         let Some((_, secret, note, coin)) = found else {
-            continue;
+            return Ok(None);
         };
         let position = position.ok_or("tx-local fee leaf position missing")?;
 
@@ -323,15 +335,21 @@ fn mark_tx_local_output_for_fee(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkfi_money_contract::model::{CoinAttributes, Output};
+    use darkfi_money_contract::model::{CoinAttributes, Output, TokenId};
     use darkfi_sdk::crypto::Keypair;
     use darkfi_sdk::pasta::group::Group;
 
-    fn mk_out(kp: &Keypair, value: u64, spend_hook: FuncId, memo: Vec<u8>) -> Output {
+    fn mk_out_token(
+        kp: &Keypair,
+        value: u64,
+        token_id: TokenId,
+        spend_hook: FuncId,
+        memo: Vec<u8>,
+    ) -> Output {
         let blind = Blind::random(&mut rand_core::OsRng);
         let note = MoneyNote {
             value,
-            token_id: *DARK_TOKEN_ID,
+            token_id,
             spend_hook,
             user_data: pallas::Base::ZERO,
             coin_blind: blind,
@@ -342,7 +360,7 @@ mod tests {
         let coin = CoinAttributes {
             public_key: kp.public,
             value,
-            token_id: *DARK_TOKEN_ID,
+            token_id,
             spend_hook,
             user_data: pallas::Base::ZERO,
             blind,
@@ -358,6 +376,10 @@ mod tests {
         }
     }
 
+    fn mk_out(kp: &Keypair, value: u64, spend_hook: FuncId, memo: Vec<u8>) -> Output {
+        mk_out_token(kp, value, *DARK_TOKEN_ID, spend_hook, memo)
+    }
+
     #[test]
     fn fee_attach_skips_memoized_and_hooked_outputs_and_prefers_change() {
         let kp = Keypair::random(&mut rand_core::OsRng);
@@ -367,16 +389,108 @@ mod tests {
         let change2 = mk_out(&kp, 15_000_000, FuncId::none(), vec![]);
 
         let chosen = select_tx_local_fee_candidate(
-            &[pay0.clone(), hooked1, change2],
+            &[pay0.clone(), hooked1.clone(), change2.clone()],
             &[kp.secret],
             &[],
             5_000_000,
+            Some(2),
         )
-        .expect("should pick unhooked unmemoized change");
+        .expect("should pick the tagged change output");
         assert_eq!(chosen.0, 2);
         assert_eq!(chosen.2.value, 15_000_000);
 
-        // Single memoized payment output must not be selected.
-        assert!(select_tx_local_fee_candidate(&[pay0], &[kp.secret], &[], 5_000_000).is_none());
+        // Change shuffled to index 0. The unmemoized payment at index 1 must not pay the fee.
+        let payment_tail = mk_out(&kp, 50_000_000, FuncId::none(), vec![]);
+        let shuffled = select_tx_local_fee_candidate(
+            &[change2.clone(), payment_tail.clone()],
+            &[kp.secret],
+            &[],
+            5_000_000,
+            Some(0),
+        )
+        .expect("change at index 0 is eligible");
+        assert_eq!(shuffled.0, 0);
+        assert_eq!(shuffled.2.value, 15_000_000);
+
+        // No tagged change: do not spend a payment that landed at idx >= 1.
+        assert!(select_tx_local_fee_candidate(
+            &[change2.clone(), payment_tail.clone()],
+            &[kp.secret],
+            &[],
+            5_000_000,
+            None,
+        )
+        .is_none());
+        // The tag is the change output, even when a larger payment sits in front of it.
+        let tagged_tail = select_tx_local_fee_candidate(
+            &[payment_tail.clone(), change2.clone()],
+            &[kp.secret],
+            &[],
+            5_000_000,
+            Some(1),
+        )
+        .expect("tagged change at index 1");
+        assert_eq!(tagged_tail.0, 1);
+        assert_eq!(tagged_tail.2.value, 15_000_000);
+
+        // A change output that is too small must not fall through to a later payment.
+        let tiny = mk_out(&kp, 1, FuncId::none(), vec![]);
+        assert!(select_tx_local_fee_candidate(
+            &[tiny, payment_tail],
+            &[kp.secret],
+            &[],
+            5_000_000,
+            Some(0),
+        )
+        .is_none());
+
+        // Single memoized payment output must not be selected, even when tagged.
+        assert!(
+            select_tx_local_fee_candidate(&[pay0.clone()], &[kp.secret], &[], 5_000_000, Some(0))
+                .is_none()
+        );
+        assert!(
+            select_tx_local_fee_candidate(&[pay0], &[kp.secret], &[], 5_000_000, None).is_none()
+        );
+
+        // Hooked and non-DRK change outputs stay ineligible.
+        assert!(select_tx_local_fee_candidate(
+            &[hooked1],
+            &[kp.secret],
+            &[],
+            5_000_000,
+            Some(0),
+        )
+        .is_none());
+        let foreign = mk_out_token(
+            &kp,
+            15_000_000,
+            TokenId::from(pallas::Base::from(9u64)),
+            FuncId::none(),
+            vec![],
+        );
+        assert!(select_tx_local_fee_candidate(
+            &[foreign],
+            &[kp.secret],
+            &[],
+            5_000_000,
+            Some(0),
+        )
+        .is_none());
+
+        // Already-spent change is not reused as the fee.
+        let spent_change = mk_out(&kp, 15_000_000, FuncId::none(), vec![]);
+        let spent_nf = Nullifier::from(poseidon_hash([
+            kp.secret.inner(),
+            spent_change.coin.inner(),
+        ]));
+        assert!(select_tx_local_fee_candidate(
+            &[spent_change],
+            &[kp.secret],
+            &[spent_nf],
+            5_000_000,
+            Some(0),
+        )
+        .is_none());
     }
 }

@@ -1,6 +1,6 @@
 # Moonshine Wallet CLI
 
-**Moonshine 3.1.21** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. DarkFi pin `b87318e80`. Same release as Android/iOS 3.01.21 and desktop 3.1.21. Aligns with lightwalletd 0.3.14.
+**Moonshine 3.1.23** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. Fee selection follows the shuffled change output. DarkFi pin `b87318e80`. Same release as Android/iOS 3.01.23 and desktop 3.1.23. Aligns with lightwalletd 0.3.15.
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 
@@ -189,7 +189,7 @@ moonshine
 | **Contract deploy / lock** | ✅ | Deployooor authority + WASM `deploy` / `lock` through lightwalletd |
 | **Clue PK register on sync** | ✅ | Fail-closed if registration fails for all addresses. Session cache is FIFO-capped at 10,000 ids |
 | **UnifOMR send clue** | ✅ | `GetCluePublicKey` → `build_omr_clue_from_pk`; abort if unavailable. `tx send --no-omr` omits the clue for trial-decrypt receive. Change outputs get `extra_omr_clues`, but strict sync still does not make that change spendable. Run `sync --force-trial` after the change is in a block |
-| **One input per send** | ✅ | Largest coin that covers amount + fee. A two-input proof is not built; darkfid rejects it |
+| **Multi-input send** | ✅ | The transfer builder spends the fewest unhooked coins that cover the amount and fee, then shuffles outputs. A send uses at most 8 inputs (Halo2 burns). Above that the wallet returns an error asking you to consolidate coins |
 | **Localnet UnifOMR (2026-10-21)** | ✅ | 100/100 each way with Android and with desktop. `--no-omr` payments were received by those wallets under trial decrypt |
 | **Payment memo on wire** | ✅ | `--memo` (≤255 UTF-8 bytes) → plain user text in recipient `MoneyNote::memo`; encrypted OMR metadata sent separately in `omr_metadata_enc` when experimental UnifOMR is active |
 | **UnifOMR detection key** | ✅ | Derived from the primary wallet secret (matching registered clue key) and streamed in 1 MiB chunks |
@@ -235,10 +235,9 @@ moonshine
 
 ## Known issues
 
-1. **One input per transaction.** darkfid rejected a two-input transfer proof on the 2026-10-21 localnet. Selection spends a single coin that covers the amount plus the 0.05 DRK fee. It does not combine smaller coins. If no such coin is visible yet, the send stops before broadcast.
-2. **One coin must cover the amount plus fee.** Change from the previous send is visible after the next default trial-decrypt sync includes that block. A second coin is not combined into the proof.
-3. **Experimental UnifOMR can hide funds.** `--unifomr` only sees payments whose clue was registered on this lightwalletd. Leave it off to receive `drk` and other clue-less transfers.
-4. **`git.dark.fi` returns HTTP 504** and does not publish pin `b87318e80`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
+1. **Change is spendable after the next sync.** Change from the previous send is visible after the next default trial-decrypt sync includes that block.
+2. **Experimental UnifOMR can hide funds.** `--unifomr` only sees payments whose clue was registered on this lightwalletd. Leave it off to receive `drk` and other clue-less transfers.
+3. **`git.dark.fi` returns HTTP 504** and does not publish pin `b87318e80`. Clone `nighthawk24/darkfi` (or symlink the Android `third_party/darkfi`). `kvdb-overlay`, RandomX, and `rust-url` are fetched from GitLab, Codeberg, and GitHub.
 
 ---
 

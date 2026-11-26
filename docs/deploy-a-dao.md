@@ -9,12 +9,12 @@ under DAO control, vote, and pay those funds out early.
 | Job | Tool |
 | --- | --- |
 | Mint tokens, create/mint a DAO, deploy/lock WASM, send DRK | **Moonshine** (`token` / `dao` / `contract` / `tx send`) or **`drk`** |
-| Propose, vote, exec, DAO treasury spend-hooks | **`drk` only** (Moonshine lists synced DAO calls but does not vote/exec yet) |
+| Propose, vote, exec, DAO treasury spend-hooks | **Moonshine** (`src/dao_ops.rs`: `build_propose_builder`, `build_vote_builder`, `build_exec_builder`; CLI `dao propose`, `dao vote`, `dao exec`) or **`drk`** |
 
 The long command log below is from a real `drk` run on 31 October 2026 against
 `darkfid` built from `nighthawk24/darkfi` `nighthawk-testnet` at
 `9d7ceaf77da7ccfd29ead3ba168fab284decd8c8`. The current Moonshine pin is
-`1919419364a406b85a68411fa8ad80919b286113`. See [darkfi-pin.md](darkfi-pin.md). A Moonshine 3.1.6 localnet path (token mint → DAO
+`b87318e80968ea071fbd3a56eb1ea17110252753`. See [darkfi-pin.md](darkfi-pin.md). A Moonshine 3.1.6 localnet path (token mint → DAO
 mint → Deployooor deploy/lock through `darkfi-lightwalletd`) was verified on
 7 November 2026.
 
