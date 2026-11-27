@@ -256,7 +256,8 @@ pub(crate) fn select_transfer_and_fee_coins(
 
     if token_id == *DARK_TOKEN_ID {
         let (sel, change) = select_coins_deterministic(&transfer_pool, amount)?;
-        // Check if an unused DRK coin can pay the fee directly (smallest >= fee).
+        // Check if an unused DRK coin can pay the fee directly.
+        // Upstream `drk` requires value > fee so the fee output is non-zero.
         let leftover = fee_pool
             .iter()
             .filter(|c| !sel.iter().any(|s| s.coin == c.coin))
@@ -338,37 +339,12 @@ pub(crate) fn filter_fee_candidates(spendable: &[OwnCoin], fee: u64) -> Vec<OwnC
     spendable
         .iter()
         .filter(|c| {
-            c.note.value >= fee
+            c.note.value > fee
                 && c.note.spend_hook == FuncId::none()
                 && c.note.token_id == *DARK_TOKEN_ID
         })
         .cloned()
         .collect()
-}
-
-/// Select the tagged tx-local change output for `FeeV1`.
-///
-/// `change_output_idx` is the shuffled change output. Payment outputs are not
-/// candidates. Also skips non-DRK coins, coins smaller than `fee`, hooked
-/// notes, and outputs carrying a payment memo.
-#[allow(dead_code)]
-pub(crate) fn select_tx_local_fee_output(
-    outputs: &[darkfi_money_contract::model::Output],
-    secret: &SecretKey,
-    fee: u64,
-    change_output_idx: Option<usize>,
-) -> Option<(usize, MoneyNote)> {
-    let idx = change_output_idx?;
-    let output = outputs.get(idx)?;
-    let note = output.note.decrypt::<MoneyNote>(secret).ok()?;
-    if note.value < fee
-        || note.token_id != *DARK_TOKEN_ID
-        || note.spend_hook != FuncId::none()
-        || !note.memo.is_empty()
-    {
-        return None;
-    }
-    Some((idx, note))
 }
 
 fn own_coin_commitment(coin: &OwnCoin) -> Vec<u8> {
@@ -385,37 +361,6 @@ fn shuffle_osrng<T>(slice: &mut [T]) {
         let j = (rand_core::OsRng.next_u64() as usize) % (i + 1);
         slice.swap(i, j);
     }
-}
-
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub async fn build_transaction(
-    amount: u64,
-    fee: u64,
-    token_id: TokenId,
-    recipient_pubkey: PublicKey,
-    wallet_secret: SecretKey,
-    all_coins: Vec<OwnCoin>,
-    tree: MerkleTree,
-    zkas_bins: Vec<(String, Vec<u8>)>,
-    payment_memo: Option<Vec<u8>>,
-    half_split: bool,
-) -> Result<BuiltTransfer, Box<dyn Error>> {
-    build_transaction_extended(
-        amount,
-        fee,
-        token_id,
-        recipient_pubkey,
-        wallet_secret,
-        all_coins,
-        tree,
-        zkas_bins,
-        payment_memo,
-        half_split,
-        None,
-        None,
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -925,7 +870,11 @@ mod tests {
         let valid = make_own_coin(10_000_000, *DARK_TOKEN_ID, FuncId::none());
         let too_small = make_own_coin(100, *DARK_TOKEN_ID, FuncId::none());
 
-        let kept = filter_fee_candidates(&[hooked, zero_tok, valid.clone(), too_small], 5_000_000);
+        let exact = make_own_coin(5_000_000, *DARK_TOKEN_ID, FuncId::none());
+        let kept = filter_fee_candidates(
+            &[hooked, zero_tok, valid.clone(), too_small, exact],
+            5_000_000,
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].coin, valid.coin);
     }
@@ -938,56 +887,35 @@ mod tests {
         let hooked = make_encrypted_output(&kp, 50_000_000, dao_hook, vec![]);
         let change = make_encrypted_output(&kp, 20_000_000, FuncId::none(), vec![]);
 
-        let chosen = select_tx_local_fee_output(
-            &[payment.clone(), hooked.clone(), change.clone()],
-            &kp.secret,
-            5_000_000,
-            Some(2),
-        )
-        .expect("should pick the tagged change output");
+        let pick = |outputs: &[Output], idx: Option<usize>| {
+            crate::fee_attach::select_tx_local_fee_candidate(
+                outputs,
+                &[kp.secret],
+                &[],
+                5_000_000,
+                idx,
+            )
+            .map(|(i, _, note, _)| (i, note.value))
+        };
+
+        let chosen = pick(&[payment.clone(), hooked.clone(), change.clone()], Some(2))
+            .expect("should pick the tagged change output");
         assert_eq!(chosen.0, 2);
-        assert_eq!(chosen.1.value, 20_000_000);
+        assert_eq!(chosen.1, 20_000_000);
 
         // Change shuffled to index 0. An unmemoized payment at index 1 is not the fee.
         let bare_payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), vec![]);
-        let shuffled = select_tx_local_fee_output(
-            &[change.clone(), bare_payment.clone()],
-            &kp.secret,
-            5_000_000,
-            Some(0),
-        )
-        .expect("change at index 0 is eligible");
+        let shuffled = pick(&[change.clone(), bare_payment.clone()], Some(0))
+            .expect("change at index 0 is eligible");
         assert_eq!(shuffled.0, 0);
-        assert_eq!(shuffled.1.value, 20_000_000);
-        assert!(select_tx_local_fee_output(
-            &[change, bare_payment.clone()],
-            &kp.secret,
-            5_000_000,
-            None,
-        )
-        .is_none());
-        assert!(select_tx_local_fee_output(
-            &[bare_payment.clone(), payment.clone()],
-            &kp.secret,
-            5_000_000,
-            Some(1),
-        )
-        .is_none());
+        assert_eq!(shuffled.1, 20_000_000);
+        assert!(pick(&[change, bare_payment.clone()], None).is_none());
+        assert!(pick(&[bare_payment.clone(), payment.clone()], Some(1)).is_none());
 
         let unmemoized_payment = make_encrypted_output(&kp, 50_000_000, FuncId::none(), vec![]);
-        assert!(select_tx_local_fee_output(
-            &[unmemoized_payment],
-            &kp.secret,
-            5_000_000,
-            None,
-        )
-        .is_none());
-        assert!(select_tx_local_fee_output(&[payment.clone(), payment], &kp.secret, 5_000_000, None)
-            .is_none());
-        assert!(
-            select_tx_local_fee_output(&[hooked, bare_payment], &kp.secret, 5_000_000, Some(0))
-                .is_none()
-        );
+        assert!(pick(&[unmemoized_payment], None).is_none());
+        assert!(pick(&[payment.clone(), payment], None).is_none());
+        assert!(pick(&[hooked, bare_payment], Some(0)).is_none());
     }
 
     #[test]
@@ -1172,7 +1100,9 @@ mod tests {
             msg.contains(&MAX_TRANSFER_INPUTS.to_string()),
             "cap error should name the limit: {msg}"
         );
-        let too_many = err.downcast_ref::<TooManyTransferInputs>().expect("structured cap error");
+        let too_many = err
+            .downcast_ref::<TooManyTransferInputs>()
+            .expect("structured cap error");
         assert_eq!(too_many.max, MAX_TRANSFER_INPUTS);
         assert!(too_many.attempted > MAX_TRANSFER_INPUTS);
 
