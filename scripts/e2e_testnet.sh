@@ -15,7 +15,7 @@
 # Prerequisites:
 #   - Rust toolchain installed
 #   - darkfi repo at ../darkfi-nighthawk-testnet (relative to moonshine)
-#   - nighthawk-android-wallet at ../nighthawk-android-wallet
+#   - blackhawk repo at ../blackhawk
 #
 # Usage:
 #   ./scripts/e2e_testnet.sh [--skip-build] [--testnet-url tcp://...]
@@ -28,13 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOONSHINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DARKFI_DIR="$(cd "$MOONSHINE_DIR/../darkfi-nighthawk-testnet" && pwd)"
 LIGHTWALLETD_DIR="$(cd "$MOONSHINE_DIR/../darkfi-lightwalletd" && pwd)"
-ANDROID_DIR="$(cd "$MOONSHINE_DIR/../nighthawk-android-wallet" && pwd)"
 IOS_DIR="$MOONSHINE_DIR/../nighthawk-ios-wallet"
-IOS_FFI_DIR="$IOS_DIR/rust/darkfi-mobile-ffi"
 IOS_BUILD_SCRIPT="$IOS_DIR/scripts/build-darkfi-mobile-ffi-ios.sh"
-if [ -d "$IOS_FFI_DIR" ]; then
-    IOS_FFI_DIR="$(cd "$IOS_FFI_DIR" && pwd)"
-fi
 # Prefer an already-running testnet stack (do not kill external darkfid).
 KEEP_EXTERNAL_STACK=false
 EXTERNAL_LIGHTWALLETD=false
@@ -155,7 +150,7 @@ echo -e "\n${CYAN}▶ Phase 2: Unit Tests${NC}"
 
 echo "  Running moonshine unit tests..."
 cd "$MOONSHINE_DIR"
-MOONSHINE_TEST_OUTPUT=$(cargo test 2>&1)
+MOONSHINE_TEST_OUTPUT=$(cargo test 2>&1) || true
 MOONSHINE_RESULT=$(echo "$MOONSHINE_TEST_OUTPUT" | grep "test result:" | head -1)
 if echo "$MOONSHINE_RESULT" | grep -q "ok"; then
     MOONSHINE_COUNT=$(echo "$MOONSHINE_RESULT" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
@@ -166,7 +161,7 @@ fi
 
 echo "  Running lightwalletd unit tests..."
 cd "$LIGHTWALLETD_DIR"
-LWD_TEST_OUTPUT=$(cargo test 2>&1)
+LWD_TEST_OUTPUT=$(cargo test 2>&1) || true
 LWD_RESULTS=$(echo "$LWD_TEST_OUTPUT" | grep "test result:")
 LWD_TOTAL=0
 while IFS= read -r line; do
@@ -180,9 +175,9 @@ else
 fi
 
 if [ "$SKIP_MOBILE_TESTS" = false ]; then
-    echo "  Running Android mobile FFI unit tests..."
-    cd "$ANDROID_DIR/rust/darkfi-mobile-ffi"
-    FFI_TEST_OUTPUT=$(cargo test --lib 2>&1)
+    echo "  Running Blackhawk (mobile FFI) unit tests..."
+    cd "$MOONSHINE_DIR/../blackhawk/crates/blackhawk"
+    FFI_TEST_OUTPUT=$(cargo test --lib 2>&1) || true
     FFI_RESULTS=$(echo "$FFI_TEST_OUTPUT" | grep "test result:")
     FFI_TOTAL=0
     while IFS= read -r line; do
@@ -190,30 +185,15 @@ if [ "$SKIP_MOBILE_TESTS" = false ]; then
         FFI_TOTAL=$((FFI_TOTAL + COUNT))
     done <<< "$FFI_RESULTS"
     if echo "$FFI_RESULTS" | grep -q "FAILED"; then
-        report FAIL "android mobile-ffi: tests failed"
+        report FAIL "blackhawk mobile-ffi: tests failed"
     else
-        report PASS "android mobile-ffi: $FFI_TOTAL tests passed"
+        report PASS "blackhawk mobile-ffi: $FFI_TOTAL tests passed"
     fi
 
-    if [ -f "$IOS_FFI_DIR/Cargo.toml" ]; then
-        echo "  Running iOS mobile FFI unit tests..."
-        cd "$IOS_FFI_DIR"
-        IOS_FFI_OUTPUT=$(cargo test --lib 2>&1)
-        IOS_FFI_RESULTS=$(echo "$IOS_FFI_OUTPUT" | grep "test result:")
-        IOS_FFI_TOTAL=0
-        while IFS= read -r line; do
-            COUNT=$(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
-            IOS_FFI_TOTAL=$((IOS_FFI_TOTAL + COUNT))
-        done <<< "$IOS_FFI_RESULTS"
-        if echo "$IOS_FFI_RESULTS" | grep -q "FAILED"; then
-            report FAIL "ios mobile-ffi: tests failed"
-        else
-            report PASS "ios mobile-ffi: $IOS_FFI_TOTAL tests passed"
-        fi
-    elif [ -f "$IOS_BUILD_SCRIPT" ]; then
+    if [ -f "$IOS_BUILD_SCRIPT" ]; then
         echo "  Verifying unified iOS mobile FFI build script..."
         if bash -n "$IOS_BUILD_SCRIPT" && \
-           grep -q "nighthawk-android-wallet/rust/darkfi-mobile-ffi" "$IOS_BUILD_SCRIPT" && \
+           grep -qE "BLACKHAWK_ROOT|crates/blackhawk" "$IOS_BUILD_SCRIPT" && \
            ! echo "$FFI_RESULTS" | grep -q "FAILED"; then
             report PASS "ios mobile-ffi: unified via shared crate ($FFI_TOTAL tests passed)"
         else
@@ -481,7 +461,7 @@ else
 fi
 
 if [ "$SKIP_MOBILE_TESTS" = false ]; then
-    cd "$ANDROID_DIR/rust/darkfi-mobile-ffi"
+    cd "$MOONSHINE_DIR/../blackhawk/crates/blackhawk"
     FFI_MNEM_OUT=$(cargo test mnemonic 2>&1 || true)
     if echo "$FFI_MNEM_OUT" | grep -qE 'test result: ok\.'; then
         COMPAT_PASS=$((COMPAT_PASS + 1))
@@ -499,12 +479,12 @@ fi
 echo -e "\n${CYAN}▶ Phase 6: OMR Scheme Dispatch Tests${NC}"
 
 cd "$LIGHTWALLETD_DIR"
-OMR_OUTPUT=$(cargo test dispatch 2>&1)
-if echo "$OMR_OUTPUT" | grep -q "ok"; then
-    OMR_COUNT=$(echo "$OMR_OUTPUT" | grep "test result:" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
-    report PASS "OMR dispatch: ${OMR_COUNT:-?} tests passed (BFV/PerfOMR/LWEmongrass/FMD)"
+OMR_OUTPUT=$(cargo test --features fhe-omr unifomr -- --skip measure_hosting_timings 2>&1) || true
+OMR_COUNT=$(echo "$OMR_OUTPUT" | grep "test result:" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1 || echo "0")
+if echo "$OMR_OUTPUT" | grep -q "test result: ok" && [ "${OMR_COUNT:-0}" -gt 0 ]; then
+    report PASS "UnifOMR tests: $OMR_COUNT tests passed"
 else
-    report FAIL "OMR dispatch tests"
+    report FAIL "UnifOMR tests failed (passed=${OMR_COUNT:-0})"
 fi
 
 # =============================================================================

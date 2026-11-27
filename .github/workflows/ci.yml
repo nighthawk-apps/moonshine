@@ -17,6 +17,7 @@ env:
 # Path deps expect siblings:
 #   darkfi-nighthawk-testnet/  ← nighthawk24 pin (not git.dark.fi master; do not use the GitHub mirror)
 #   darkfi-lightwalletd/
+#   blackhawk/                 ← Nighthawk FFI + blackhawk-unifomr
 #   moonshine/                 ← this repo
 jobs:
   check:
@@ -42,6 +43,20 @@ jobs:
         with:
           repository: nighthawk-apps/darkfi-lightwalletd
           path: darkfi-lightwalletd
+
+      - name: Checkout blackhawk
+        uses: actions/checkout@v4
+        with:
+          repository: nighthawk-apps/blackhawk
+          ref: v0.3.1
+          path: blackhawk
+
+      - name: Checkout blackhawk
+        uses: actions/checkout@v4
+        with:
+          repository: nighthawk-apps/blackhawk
+          ref: v0.3.1
+          path: blackhawk
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -85,6 +100,13 @@ jobs:
         with:
           repository: nighthawk-apps/darkfi-lightwalletd
           path: darkfi-lightwalletd
+
+      - name: Checkout blackhawk
+        uses: actions/checkout@v4
+        with:
+          repository: nighthawk-apps/blackhawk
+          ref: v0.3.1
+          path: blackhawk
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -144,6 +166,13 @@ jobs:
           repository: nighthawk-apps/darkfi-lightwalletd
           path: darkfi-lightwalletd
 
+      - name: Checkout blackhawk
+        uses: actions/checkout@v4
+        with:
+          repository: nighthawk-apps/blackhawk
+          ref: v0.3.1
+          path: blackhawk
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -188,6 +217,13 @@ jobs:
         with:
           repository: nighthawk-apps/darkfi-lightwalletd
           path: darkfi-lightwalletd
+
+      - name: Checkout blackhawk
+        uses: actions/checkout@v4
+        with:
+          repository: nighthawk-apps/blackhawk
+          ref: v0.3.1
+          path: blackhawk
 
       - uses: dtolnay/rust-toolchain@stable
 

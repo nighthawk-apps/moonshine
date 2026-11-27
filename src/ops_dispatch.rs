@@ -61,6 +61,12 @@ pub enum DaoSubcommand {
         early_exec_quorum: String,
         approval_ratio: f64,
         gov_token: String,
+        /// Print full DAO role secret keys TOML on a TTY.
+        #[arg(long)]
+        show_secret: bool,
+        /// Write DAO params TOML (including role keys) to a new mode-0600 file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     Import {
         name: String,
@@ -82,6 +88,12 @@ pub enum DaoSubcommand {
     /// View stored DAO details, bulla, and treasury payment address
     View {
         name: String,
+        /// Print full DAO role secret keys TOML on a TTY.
+        #[arg(long)]
+        show_secret: bool,
+        /// Write DAO params TOML (including role keys) to a new mode-0600 file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     /// List synced DAO calls and proposals
     Proposals {
@@ -317,6 +329,8 @@ pub async fn run_dao(
             early_exec_quorum,
             approval_ratio,
             gov_token,
+            show_secret,
+            out,
         } => {
             tx_status::begin("dao-create", "sign");
             let parse_amount = |s: &str| -> Result<u64, Box<dyn Error>> {
@@ -333,7 +347,7 @@ pub async fn run_dao(
             let eq = parse_amount(&early_exec_quorum)?;
             let toml =
                 dao_ops::create_dao(&w.db, &name, p_limit, q, eq, approval_ratio, &gov_token)?;
-            println!("{toml}");
+            export_secret_dao_toml(&toml, show_secret, out, true)?;
             println!("Stored DAO '{name}' in wallet.");
             tx_status::emit(
                 "dao-create",
@@ -454,7 +468,11 @@ pub async fn run_dao(
                 );
             }
         }
-        DaoSubcommand::View { name } => {
+        DaoSubcommand::View {
+            name,
+            show_secret,
+            out,
+        } => {
             let Some(toml_str) = w.db.get_dao_toml(&name)? else {
                 return Err(format!("DAO '{name}' not found").into());
             };
@@ -482,10 +500,12 @@ pub async fn run_dao(
                     dao.approval_ratio_quot,
                     dao.approval_ratio_base
                 );
-                println!("\nStored TOML:\n{toml_str}");
             } else {
-                println!("{toml_str}");
+                println!(
+                    "DAO '{name}' is stored in wallet (metadata could not be parsed cleanly)."
+                );
             }
+            export_secret_dao_toml(&toml_str, show_secret, out, false)?;
         }
         DaoSubcommand::Proposals { name } => {
             let filter_bulla: Option<([u8; 32], String)> = if let Some(ref dao_name) = name {
@@ -1019,11 +1039,22 @@ async fn broadcast_builder(
         let primary = if let (Some(rpk), false) = (recipient_pk, own_indexes.contains(&p_idx)) {
             let net_byte = Wallet::network_byte(&config.network);
             let rpk_bytes = rpk.to_bytes();
+            let mut lookup_client =
+                LightwalletClient::new(&config.server_url, config.tls_pin_sha256.clone())
+                    .with_tor(config.use_tor);
             match (
-                client.get_light_info().await,
-                client.get_clue_public_key(rpk_bytes.to_vec()).await,
+                lookup_client.get_light_info().await,
+                lookup_client.get_clue_public_key(rpk_bytes.to_vec()).await,
             ) {
-                (Ok(info), Ok(resp)) if info.directory_attest_pubkey.len() == 32 => {
+                (Ok(info), Ok(resp))
+                    if info.directory_attest_pubkey.len() == 32
+                        && crate::wallet::check_directory_attest_pin(
+                            &w.db,
+                            &config.server_url,
+                            &info.directory_attest_pubkey,
+                        )
+                        .is_ok() =>
+                {
                     match darkfi_lightwalletd::unifomr::verify_directory_attestation(
                         &info.directory_attest_pubkey,
                         net_byte,
@@ -1075,23 +1106,8 @@ async fn broadcast_builder(
     if !resp.error.is_empty() && resp.error != "0" {
         return Err(format!("SendTransaction error: {}", resp.error).into());
     }
-    let confirm_hash: [u8; 32] = if resp.tx_hash.len() == 32 {
-        resp.tx_hash
-            .clone()
-            .try_into()
-            .unwrap_or(*tx.hash().inner())
-    } else {
-        *tx.hash().inner()
-    };
-    client
-        .confirm_transaction_in_mempool(&confirm_hash)
-        .await
-        .map_err(|e| {
-            eprintln!("TX hex written to {}", last_tx_path.display());
-            format!(
-                "Transaction not confirmed in lightwalletd mempool ({e}). Refusing to mark as Broadcasted."
-            )
-        })?;
+    // darkfid accepted the tx; reserve inputs and record history immediately so a
+    // slow mempool poll never lets a retry double-spend the same coins.
     let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
     if !nf.is_empty() {
         let _ = w.db.reserve_note(&nf, reserved_at);
@@ -1111,6 +1127,23 @@ async fn broadcast_builder(
         None,
         None,
     );
+    let confirm_hash: [u8; 32] = if resp.tx_hash.len() == 32 {
+        resp.tx_hash
+            .clone()
+            .try_into()
+            .unwrap_or(*tx.hash().inner())
+    } else {
+        *tx.hash().inner()
+    };
+    client
+        .confirm_transaction_in_mempool(&confirm_hash)
+        .await
+        .map_err(|e| {
+            eprintln!("TX hex written to {}", last_tx_path.display());
+            format!(
+                "Transaction not confirmed in lightwalletd mempool ({e}). Refusing to mark as Broadcasted."
+            )
+        })?;
     println!("Broadcasted (confirmed in lightwalletd mempool; awaiting block confirmation).");
     println!("TX hash: {tx_hash}");
     tx_status::emit(
@@ -1128,6 +1161,37 @@ async fn broadcast_builder(
     println!("Explorer: {}/tx/{tx_hash}", config.explorer_base_url());
     println!("Last tx hex: {}", last_tx_path.display());
     Ok(tx_hash)
+}
+
+fn export_secret_dao_toml(
+    toml_str: &str,
+    show_secret: bool,
+    out: Option<PathBuf>,
+    quiet_when_omitted: bool,
+) -> Result<(), Box<dyn Error>> {
+    use std::io::IsTerminal;
+    if let Some(path) = out {
+        crate::secret_wrap::write_mode_0600_create_new(&path, toml_str.as_bytes())?;
+        println!("Wrote DAO params TOML (mode 0600) to {}", path.display());
+        return Ok(());
+    }
+    if show_secret {
+        if !std::io::stdout().is_terminal() {
+            return Err(
+                "Refusing to print DAO secret keys TOML: stdout is not a TTY. \
+                 Re-run in a terminal with --show-secret or pass --out <path>."
+                    .into(),
+            );
+        }
+        println!("\nStored TOML:\n{toml_str}");
+        return Ok(());
+    }
+    if !quiet_when_omitted {
+        println!(
+            "  Role secret keys omitted (pass --show-secret on a TTY or --out <path> to export)."
+        );
+    }
+    Ok(())
 }
 
 fn pick_fee_coin(
@@ -1153,42 +1217,53 @@ fn pick_fee_coin(
         }
         let mut sk_arr = [0u8; 32];
         sk_arr.copy_from_slice(&owner_secret[..32]);
-        let secret = SecretKey::from_bytes(sk_arr)
-            .map_err(|e| format!("Invalid note owner secret: {e:?}"))?;
-        let coin_blind = {
+        let Ok(secret) = SecretKey::from_bytes(sk_arr) else {
+            continue;
+        };
+        let Some(coin_blind) = ({
             let mut a = [0u8; 32];
             a.copy_from_slice(&cb[..32]);
-            pallas::Base::from_repr(a)
-                .into_option()
-                .ok_or("bad coin_blind")?
+            pallas::Base::from_repr(a).into_option()
+        }) else {
+            continue;
         };
-        let value_blind = {
+        let Some(value_blind) = ({
             let mut a = [0u8; 32];
             a.copy_from_slice(&vb[..32]);
-            pallas::Scalar::from_repr(a)
-                .into_option()
-                .ok_or("bad value_blind")?
+            pallas::Scalar::from_repr(a).into_option()
+        }) else {
+            continue;
         };
-        let token_blind = {
+        let Some(token_blind) = ({
             let mut a = [0u8; 32];
             a.copy_from_slice(&tb[..32]);
-            pallas::Base::from_repr(a)
-                .into_option()
-                .ok_or("bad token_blind")?
+            pallas::Base::from_repr(a).into_option()
+        }) else {
+            continue;
         };
-        let token_id = darkfi_money_contract::model::TokenId::from_bytes(
-            hex::decode(&tok)?
-                .as_slice()
-                .try_into()
-                .map_err(|_| "token id len")?,
-        )?;
+        let token_id = if crate::db::WalletDb::is_drk_token(&tok) {
+            *darkfi_money_contract::model::DARK_TOKEN_ID
+        } else {
+            let Ok(decoded) = hex::decode(&tok) else {
+                continue;
+            };
+            let Ok(arr) = <[u8; 32]>::try_from(decoded.as_slice()) else {
+                continue;
+            };
+            let Ok(tid) = darkfi_money_contract::model::TokenId::from_bytes(arr) else {
+                continue;
+            };
+            tid
+        };
         let mut hook_bytes = [0u8; 32];
         if hook.len() == 32 {
             hook_bytes.copy_from_slice(&hook);
         } else if !hook.is_empty() {
             hook_bytes[0] = hook[0];
         }
-        let spend_hook = FuncId::from_bytes(hook_bytes)?;
+        let Ok(spend_hook) = FuncId::from_bytes(hook_bytes) else {
+            continue;
+        };
         if spend_hook != FuncId::none() {
             continue;
         }
@@ -1229,6 +1304,15 @@ fn pick_fee_coin(
             secret,
             leaf_position: Position::from(lpos as u64),
         };
+        if crate::tx_builder::assert_witness_at_tip(
+            &tree,
+            darkfi_sdk::crypto::MerkleNode::from(coin.coin.inner()),
+            coin.leaf_position,
+        )
+        .is_err()
+        {
+            continue;
+        }
         if best.as_ref().map(|c| c.note.value).unwrap_or(0) < coin.note.value {
             best = Some(coin);
         }

@@ -1,141 +1,4 @@
-/* This file is part of Nighthawk Apps (https://nighthawkapps.com)
- *
- * Copyright (C) 2026 Nighthawk Apps
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
-//! Sync engine for Moonshine light wallet.
-//!
-//! Moonshine is a **light client**: it fetches compact Money/DAO/auth-token
-//! records from `darkfi-lightwalletd` and keeps a local SQLCipher wallet. It
-//! does **not** validate the full chain like `darkfid`, and it does **not**
-//! pull full blocks over darkfid JSON-RPC the way `drk` does.
-//!
-//! Default path (padded trial decryption — same semantics as `drk` scan):
-//! 1. `GetCompactOutputBodies` over a power-of-2 padded window
-//! 2. Trial-decrypt Money notes into the local DB; store compact DAO calls
-//!    and auth-token mint/freeze markers for the same window
-//! 3. `GetNoteCommitments` — append **all** coins to the Money Merkle tree
-//!    from height 0 (dummy ZERO leaf + genesis mints). Note trial-decrypt
-//!    may start at the wallet birthday, but the tree must not: skipping
-//!    pre-birthday leaves makes spend proofs use a root the contract never
-//!    stored (Money `Custom(5)`).
-//! 4. `GetNullifiers(scan_start..scan_end)` — mark spent notes
-//!
-//! Experimental `--unifomr` / `experimental_unifomr` uses sparse UnifOMR +
-//! Batch PIR instead. Tip advances only after commitments + nullifiers for
-//! the full range succeed (and, in UnifOMR mode, after sparse fetches for
-//! every matching height succeed).
-//!
-//! Privacy mitigations:
-//! - Power-of-2 bucket block-range padding (parity with mobile UniFFI)
-//! - Jittered sleep between requests (anti-fingerprinting)
-//! - Error redaction (strips IPs/URLs from error messages)
-//! - TLS + cert pin required for non-localhost HTTPS
-//! - Compact blocks in the local cache are encrypted (`NHC1`) and deleted
-//!   as soon as trial decrypt applies them
-
-use crate::block_cache::BlockCache;
-use crate::client::LightwalletClient;
-use crate::db::WalletDb;
-use darkfi_sdk::crypto::{MerkleNode, MerkleTree};
-use darkfi_sdk::pasta::pallas;
-
-use futures::StreamExt;
-use tokio::time::Duration;
-
-/// Maximum blocks to request in a single range RPC.
-/// Must stay ≤ lightwalletd `max_range_per_request` (10_000) **after**
-/// power-of-2 privacy padding (padding can nearly double the window).
-pub const MAX_BLOCKS_PER_REQUEST: u32 = 4096;
-
-/// Server cap for one padded commitment, nullifier, or digest window.
-const MAX_RANGE_PER_REQUEST: u32 = 10_000;
-
-/// Minimum padding bucket size (blocks) — matches mobile lightwallet_client.
-const MIN_BUCKET_SIZE: u32 = 1024;
-
-/// Base sleep duration between sync iterations (seconds). CLI polls faster.
-const POLL_BASE_SECS: u64 = 1;
-
-/// Inclusive LWD height range that must sit after the dummy ZERO leaf before
-/// a birthday-clamped note scan. Height 0 holds genesis mint coins; the dummy
-/// leaf is not block 0. `None` only when there is no pre-history to backfill.
-#[allow(dead_code)] // covered by unit tests; Android FFI has the same helper
-pub fn pre_birthday_commitment_range(birthday_height: u32) -> Option<(u32, u32)> {
-    if birthday_height == 0 {
-        None
-    } else {
-        Some((0, birthday_height.saturating_sub(1)))
-    }
-}
-
-fn genesis_money_tree() -> MerkleTree {
-    // Match darkfid: dummy zero coin at position 0 (dummy inputs).
-    let mut tree = MerkleTree::new(u32::MAX as usize);
-    tree.append(MerkleNode::from(pallas::Base::from(0u64)));
-    let _ = tree.mark();
-    tree
-}
-
-/// Canonical checkpoint digest: blake3(height LE || tree_data || nullifier_index).
-/// Must stay lockstep with darkfi-mobile-ffi and darkfi-lightwalletd.
-pub fn snapshot_integrity_hash(height: u32, tree_data: &[u8], nullifier_index: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&height.to_le_bytes());
-    hasher.update(tree_data);
-    hasher.update(nullifier_index);
-    *hasher.finalize().as_bytes()
-}
-
-/// Shared lightwalletd preflight: checks proto major version (`get_light_info`),
-/// TOFU directory attestation pin (when a wallet DB is supplied), and `chain_name`
-/// network alignment before any write/spend/rebuild operation.
-pub async fn preflight_server_opt(
-    client: &mut LightwalletClient,
-    db: Option<&WalletDb>,
-    server_url: &str,
-    network: &str,
-) -> Result<crate::client::proto::LightInfo, Box<dyn std::error::Error>> {
-    let info = client.get_light_info().await?;
-    if let Some(db) = db {
-        crate::wallet::check_directory_attest_pin(db, server_url, &info.directory_attest_pubkey)?;
-    }
-    ensure_chain_matches_network(
-        &info.chain_name,
-        crate::wallet::Wallet::network_byte(network),
-    )?;
-    Ok(info)
-}
-
-/// Shared lightwalletd preflight with wallet DB attestation pinning.
-pub async fn preflight_server(
-    client: &mut LightwalletClient,
-    db: &WalletDb,
-    server_url: &str,
-    network: &str,
-) -> Result<crate::client::proto::LightInfo, Box<dyn std::error::Error>> {
-    preflight_server_opt(client, Some(db), server_url, network).await
-}
-
-/// Target height when chain tip drops below `last_synced`.
-/// Clamped to `tip_height.saturating_sub(1)` (never above `tip_height`) so
-/// `tip_height < birthday` can never loop indefinitely.
-pub fn reorg_rewind_height(tip_height: u32) -> u32 {
-    tip_height.saturating_sub(1)
-}
+use super::*;
 
 /// Sync engine state.
 pub struct SyncEngine {
@@ -154,6 +17,17 @@ pub struct SyncEngine {
     pub block_cache: Option<BlockCache>,
     /// Route remote lightwalletd traffic through embedded Tor (config `use_tor`).
     pub use_tor: bool,
+    /// Configured network name (`mainnet` / `testnet` / `localnet`) when known.
+    pub network_name: Option<String>,
+}
+
+impl Drop for SyncEngine {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for sk in &mut self.secret_keys {
+            sk.zeroize();
+        }
+    }
 }
 
 impl SyncEngine {
@@ -180,7 +54,14 @@ impl SyncEngine {
             strict_omr,
             block_cache,
             use_tor,
+            network_name: None,
         }
+    }
+
+    /// Attach full config network name so `localnet` vs `testnet` is strictly checked.
+    pub fn with_network(mut self, network: &str) -> Self {
+        self.network_name = Some(network.to_string());
+        self
     }
 
     /// Run a single sparse OMR sync cycle (or force-trial full decrypt).
@@ -195,7 +76,15 @@ impl SyncEngine {
             &self.server_url,
             &info.directory_attest_pubkey,
         )?;
-        ensure_chain_matches_network(&info.chain_name, self.network_byte)?;
+        if let Some(ref net) = self.network_name {
+            ensure_chain_matches_network_name(&info.chain_name, net)?;
+        } else {
+            if let Some(ref net) = self.network_name {
+                ensure_chain_matches_network_name(&info.chain_name, net)?;
+            } else {
+                ensure_chain_matches_network(&info.chain_name, self.network_byte)?;
+            }
+        }
 
         let tip = client.get_chain_tip().await?;
         let tip_height = tip.height;
@@ -379,7 +268,17 @@ impl SyncEngine {
         //    so that discovered coins are in the DB when the tree is built (allowing
         //    inline marking of owned positions).
         let mut notes_found = 0u32;
-        let mut window_end_hash: Option<[u8; 32]> = None;
+        let mut window_anchors: Vec<(u32, [u8; 32])> = Vec::new();
+        let collect_anchors = |blocks: &[crate::client::proto::CompactBlock],
+                               out: &mut Vec<(u32, [u8; 32])>| {
+            for b in blocks {
+                if b.hash.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b.hash);
+                    out.push((b.height, arr));
+                }
+            }
+        };
         // Default and `--force-trial` trial-decrypt the full padded window so
         // clue-less payments (`drk`, other lightwalletds) are received.
         let use_full_window_trial = self.force_trial || !self.strict_omr;
@@ -408,13 +307,7 @@ impl SyncEngine {
                 .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
                 .cloned()
                 .collect();
-            for b in &in_window {
-                if b.height == scan_end && b.hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b.hash);
-                    window_end_hash = Some(arr);
-                }
-            }
+            collect_anchors(&in_window, &mut window_anchors);
             notes_found += self.trial_decrypt_blocks(&in_window)?;
             self.store_contract_records(&mut client, padded_start, padded_end)
                 .await?;
@@ -444,25 +337,26 @@ impl SyncEngine {
                 .into_iter()
                 .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
                 .collect();
-            for b in &in_window {
-                if b.height == scan_end && b.hash.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b.hash);
-                    window_end_hash = Some(arr);
-                }
-            }
-            let extra = self
+            let extra: Vec<_> = self
                 .fetch_outputs_by_func(&mut client, padded_start, padded_end, MONEY_FUNC_TOKEN_MINT)
-                .await?;
+                .await?
+                .into_iter()
+                .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
+                .collect();
             let extra = dedup_extra_blocks_against_window(&in_window, extra);
             in_window.extend(extra);
+            collect_anchors(&in_window, &mut window_anchors);
             self.store_contract_records(&mut client, padded_start, padded_end)
                 .await?;
             notes_found += self.trial_decrypt_blocks(&in_window)?;
         } else {
-            let extra = self
+            let extra: Vec<_> = self
                 .fetch_outputs_by_func(&mut client, padded_start, padded_end, MONEY_FUNC_TOKEN_MINT)
-                .await?;
+                .await?
+                .into_iter()
+                .filter(|block| height_in_scan_window(block.height, scan_start, scan_end))
+                .collect();
+            collect_anchors(&extra, &mut window_anchors);
             notes_found += self.trial_decrypt_blocks(&extra)?;
             self.store_contract_records(&mut client, padded_start, padded_end)
                 .await?;
@@ -495,8 +389,7 @@ impl SyncEngine {
             let mut out = Vec::new();
             darkfi_serial::Encodable::encode(&genesis_money_tree(), &mut out)
                 .map_err(|e| format!("encode genesis tree: {e}"))?;
-            self.db.set_meta("tree_state", &out)?;
-            self.db.set_merkle_from_genesis(false)?;
+            self.db.save_money_tree_state(&out, 0, false)?;
             self.db.delete_meta("tree_applied_height")?;
         }
 
@@ -509,14 +402,15 @@ impl SyncEngine {
         }
         self.ensure_genesis_merkle(&mut client, scan_start, tip_height)
             .await?;
-        self.apply_note_commitments(&mut client, scan_start, scan_end, tip_height)
-            .await?;
-        if scan_start == 0 || self.db.merkle_from_genesis() {
-            self.db.set_merkle_from_genesis(true)?;
-        }
-        if scan_end > self.tree_applied_height() || self.tree_applied_recorded().is_none() {
-            self.set_tree_applied_height(scan_end)?;
-        }
+        let merkle_complete = scan_start == 0 || self.db.merkle_from_genesis();
+        self.apply_note_commitments(
+            &mut client,
+            scan_start,
+            scan_end,
+            tip_height,
+            merkle_complete,
+        )
+        .await?;
 
         // 3) Nullifiers → mark spent (full scan range, padded on the wire)
         let notes_spent = self
@@ -538,6 +432,11 @@ impl SyncEngine {
         // A force-trial backfill must not rewind a cursor that is already at the tip.
         if scan_end > last_synced {
             self.db.set_sync_height(scan_end)?;
+            // Record hashes solely from the tip RPC or the already-fetched padded window
+            // so we never leak the exact sync cursor via unpadded GetBlock(height).
+            for (h, bh) in window_anchors.iter().rev().take(16).rev() {
+                let _ = self.db.record_synced_block_hash(*h, bh);
+            }
             if scan_end == tip_height {
                 if tip_height > 0 && tip.prev_hash.len() == 32 {
                     let _ = self
@@ -546,12 +445,6 @@ impl SyncEngine {
                 }
                 if tip.hash.len() == 32 {
                     let _ = self.db.record_synced_block_hash(tip_height, &tip.hash);
-                }
-            } else if let Some(hash) = window_end_hash {
-                let _ = self.db.record_synced_block_hash(scan_end, &hash);
-            } else if let Ok(blk) = client.get_block(scan_end).await {
-                if blk.hash.len() == 32 {
-                    let _ = self.db.record_synced_block_hash(scan_end, &blk.hash);
                 }
             }
         }
@@ -574,7 +467,10 @@ impl SyncEngine {
         })
     }
 
-    fn perform_reorg_rewind(&self, rewind_to: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn perform_reorg_rewind(
+        &self,
+        rewind_to: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(cache) = &self.block_cache {
             if let Err(e) = cache.delete_above(rewind_to) {
                 tracing::warn!("block cache reorg prune failed: {e}");
@@ -609,7 +505,7 @@ impl SyncEngine {
 
     /// Verify block hash continuity at `last_synced`. Returns `Some(common_ancestor)`
     /// when a same-height or longer-chain reorg is detected.
-    async fn detect_hash_reorg_ancestor(
+    pub(super) async fn detect_hash_reorg_ancestor(
         &self,
         client: &mut LightwalletClient,
         last_synced: u32,
@@ -638,12 +534,20 @@ impl SyncEngine {
         } else if tip.height == last_synced.saturating_add(1) && tip.prev_hash.len() == 32 {
             tip.prev_hash.as_slice() == expected_hash.as_slice()
         } else {
-            match client.get_block(last_synced).await {
-                Ok(blk) if blk.hash.len() == 32 => blk.hash.as_slice() == expected_hash.as_slice(),
-                Ok(_) => true,
-                Err(e) if grpc_code_is(e.as_ref(), tonic::Code::NotFound) => false,
+            // Check continuity using a padded window fetch rather than an unpadded
+            // GetBlock(last_synced), which would reveal the wallet's exact cursor.
+            match self
+                .fetch_padded_window_blocks(client, last_synced, last_synced, tip.height)
+                .await
+            {
+                Ok(blocks) => match blocks.into_iter().find(|b| b.height == last_synced) {
+                    Some(blk) if blk.hash.len() == 32 => {
+                        blk.hash.as_slice() == expected_hash.as_slice()
+                    }
+                    _ => true,
+                },
                 Err(e) if grpc_code_is(e.as_ref(), tonic::Code::Unimplemented) => {
-                    tracing::debug!("GetBlock unimplemented; skipping hash continuity check");
+                    tracing::debug!("GetCompactOutputBodies unimplemented; skipping hash check");
                     return Ok(None);
                 }
                 Err(e) => return Err(e),
@@ -655,12 +559,10 @@ impl SyncEngine {
         }
 
         // Walk stored anchors descending to find the highest common ancestor.
-        let mut earliest_checked = last_synced;
         for &(anchor_h, anchor_hash) in anchors.iter().rev() {
             if anchor_h >= last_synced {
                 continue;
             }
-            earliest_checked = anchor_h;
             match client.get_block(anchor_h).await {
                 Ok(blk)
                     if blk.hash.len() == 32 && blk.hash.as_slice() == anchor_hash.as_slice() =>
@@ -672,15 +574,18 @@ impl SyncEngine {
                 Err(e) => return Err(e),
             }
         }
-        Ok(Some(earliest_checked.saturating_sub(1)))
+        // If no stored anchor matches, the fork is deeper than all recorded anchors;
+        // trigger a clean rewind to 0 so orphaned notes/spends are cleared completely.
+        Ok(Some(0))
     }
 
-    async fn apply_note_commitments(
+    pub(super) async fn apply_note_commitments(
         &self,
         client: &mut LightwalletClient,
         scan_start: u32,
         scan_end: u32,
         tip: u32,
+        merkle_from_genesis: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let owned = self.owned_commitment_set()?;
         let stored_tree = self.db.get_meta("tree_state")?;
@@ -696,6 +601,9 @@ impl SyncEngine {
             scan_start
         };
         if start > scan_end {
+            if merkle_from_genesis && !self.db.merkle_from_genesis() {
+                self.db.set_merkle_from_genesis(true)?;
+            }
             return Ok(());
         }
         let tree_bytes = stored_tree.unwrap_or_else(|| {
@@ -719,14 +627,11 @@ impl SyncEngine {
             );
         }
 
-        let mut out = Vec::new();
-        darkfi_serial::Encodable::encode(&tree, &mut out)
-            .map_err(|e| format!("Failed to encode MerkleTree: {}", e))?;
-        self.db.set_meta("tree_state", &out)?;
+        self.save_money_tree(&tree, scan_end, merkle_from_genesis)?;
         Ok(())
     }
 
-    fn owned_commitment_set(
+    pub(super) fn owned_commitment_set(
         &self,
     ) -> Result<std::collections::HashSet<[u8; 32]>, Box<dyn std::error::Error>> {
         Ok(self
@@ -750,7 +655,7 @@ impl SyncEngine {
     ///
     /// Heights outside the scan window are dropped so a power-of-two bucket
     /// does not append leaves the previous cycle already applied.
-    async fn append_note_commitments_range(
+    pub(super) async fn append_note_commitments_range(
         &self,
         client: &mut LightwalletClient,
         tree: &mut MerkleTree,
@@ -776,8 +681,7 @@ impl SyncEngine {
                 heights_in_batch += 1;
                 if heights_in_batch >= 256 {
                     if let Some(done) = prev_height {
-                        self.persist_money_tree(tree)?;
-                        self.set_tree_applied_height(done)?;
+                        self.save_money_tree(tree, done, self.db.merkle_from_genesis())?;
                     }
                     heights_in_batch = 0;
                 }
@@ -807,7 +711,7 @@ impl SyncEngine {
 
     /// If the Money tree is not known to include height 0, replay 0..=scan_start-1
     /// onto a fresh dummy leaf. Never append a birthday window onto a dummy-only tree.
-    async fn ensure_genesis_merkle(
+    pub(super) async fn ensure_genesis_merkle(
         &self,
         client: &mut LightwalletClient,
         scan_start: u32,
@@ -859,16 +763,11 @@ impl SyncEngine {
         if marked > 0 {
             eprintln!("[DEBUG] Marked {marked} owned positions during genesis backfill");
         }
-        let mut out = Vec::new();
-        darkfi_serial::Encodable::encode(&tree, &mut out)
-            .map_err(|e| format!("Failed to encode MerkleTree: {e}"))?;
-        self.db.set_meta("tree_state", &out)?;
-        self.db.set_merkle_from_genesis(true)?;
-        self.set_tree_applied_height(end)?;
+        self.save_money_tree(&tree, end, true)?;
         Ok(())
     }
 
-    fn trial_cursor(&self) -> Option<u32> {
+    pub(super) fn trial_cursor(&self) -> Option<u32> {
         match self.db.get_meta("trial_synced_height") {
             Ok(Some(bytes)) if bytes.len() == 4 => Some(u32::from_le_bytes(
                 bytes.as_slice().try_into().unwrap_or([0; 4]),
@@ -877,13 +776,13 @@ impl SyncEngine {
         }
     }
 
-    fn set_trial_cursor(&self, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn set_trial_cursor(&self, height: u32) -> Result<(), Box<dyn std::error::Error>> {
         self.db
             .set_meta("trial_synced_height", &height.to_le_bytes())
             .map_err(|e| format!("set trial_synced_height: {e}").into())
     }
 
-    fn tree_applied_recorded(&self) -> Option<u32> {
+    pub(super) fn tree_applied_recorded(&self) -> Option<u32> {
         match self.db.get_meta("tree_applied_height") {
             Ok(Some(bytes)) if bytes.len() == 4 => Some(u32::from_le_bytes(
                 bytes.as_slice().try_into().unwrap_or([0; 4]),
@@ -892,28 +791,37 @@ impl SyncEngine {
         }
     }
 
-    fn tree_applied_height(&self) -> u32 {
+    pub(super) fn tree_applied_height(&self) -> u32 {
         self.tree_applied_recorded().unwrap_or(0)
     }
 
-    fn persist_money_tree(&self, tree: &MerkleTree) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn save_money_tree(
+        &self,
+        tree: &MerkleTree,
+        applied_height: u32,
+        merkle_from_genesis: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut out = Vec::new();
         darkfi_serial::Encodable::encode(tree, &mut out).map_err(
             |e| -> Box<dyn std::error::Error> {
                 format!("Failed to encode MerkleTree: {e}").into()
             },
         )?;
-        self.db.set_meta("tree_state", &out)?;
+        self.db
+            .save_money_tree_state(&out, applied_height, merkle_from_genesis)?;
         Ok(())
     }
 
-    fn set_tree_applied_height(&self, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn set_tree_applied_height(
+        &self,
+        height: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.db
             .set_meta("tree_applied_height", &height.to_le_bytes())
             .map_err(|e| format!("set tree_applied_height: {e}").into())
     }
 
-    fn load_money_tree(&self) -> Result<MerkleTree, Box<dyn std::error::Error>> {
+    pub(super) fn load_money_tree(&self) -> Result<MerkleTree, Box<dyn std::error::Error>> {
         let bytes = self
             .db
             .get_meta("tree_state")?
@@ -928,7 +836,7 @@ impl SyncEngine {
     /// `birthday == 0` requests the latest snapshot. `Ok(None)` means replay
     /// commitments (NOT_FOUND, a tip-only server, or a snapshot the client will
     /// not install). The tree is written only after the hash and decode succeed.
-    async fn try_install_checkpoint(
+    pub(super) async fn try_install_checkpoint(
         &self,
         client: &mut LightwalletClient,
         birthday: u32,
@@ -1045,13 +953,7 @@ impl SyncEngine {
                 return Ok(None);
             }
         }
-        let mut out = Vec::new();
-        darkfi_serial::Encodable::encode(&tree, &mut out).map_err(
-            |e| -> Box<dyn std::error::Error> { format!("checkpoint tree encode: {e}").into() },
-        )?;
-        self.db.set_meta("tree_state", &out)?;
-        self.db.set_merkle_from_genesis(true)?;
-        self.set_tree_applied_height(height)?;
+        self.save_money_tree(&tree, height, true)?;
         eprintln!(
             "Installed Money tree snapshot at height {height} (birthday {birthday}); \
              commitments at or below the snapshot are not replayed"
@@ -1064,7 +966,7 @@ impl SyncEngine {
     /// Local `CoinAttributes::to_coin()` can diverge from the on-chain coin
     /// (truncated spend_hook, overwritten commitments). Spends and Merkle
     /// marks require the exact leaf bytes in `GetNoteCommitments`.
-    async fn restore_commitments_from_compact(
+    pub(super) async fn restore_commitments_from_compact(
         &self,
         client: &mut LightwalletClient,
     ) -> Result<(u32, u32), Box<dyn std::error::Error>> {
@@ -1075,18 +977,29 @@ impl SyncEngine {
         }
         let min_h = locs.iter().map(|l| l.2).min().unwrap_or(0);
         let max_h = locs.iter().map(|l| l.2).max().unwrap_or(0);
-        // Pad the window so the server does not learn the exact heights of
-        // unspent notes. A sparse height list would reveal those heights.
+        // Pad each <= MAX_BLOCKS_PER_REQUEST chunk so the server does not learn
+        // exact note heights and wide historical gaps still fit within server limits.
         let tip = client.get_chain_tip().await?.height.max(max_h);
-        let (pad_start, pad_end) = require_padded_range(min_h.min(tip), max_h.min(tip), tip)?;
-        eprintln!(
-            "  fetching compact blocks {pad_start}..={pad_end} to restore coin commitments..."
-        );
-        let blocks = self.fetch_window_range(client, pad_start, pad_end).await?;
         let mut by_h: std::collections::HashMap<u32, crate::client::proto::CompactBlock> =
             std::collections::HashMap::new();
-        for b in blocks {
-            by_h.insert(b.height, b);
+        let mut chunk_start = min_h.min(tip);
+        let end_h = max_h.min(tip);
+        while chunk_start <= end_h {
+            let chunk_end = chunk_start
+                .saturating_add(MAX_BLOCKS_PER_REQUEST - 1)
+                .min(end_h);
+            let (pad_start, pad_end) = require_padded_range(chunk_start, chunk_end, tip)?;
+            eprintln!(
+                "  fetching compact blocks {pad_start}..={pad_end} to restore coin commitments..."
+            );
+            let blocks = self.fetch_window_range(client, pad_start, pad_end).await?;
+            for b in blocks {
+                by_h.entry(b.height).or_insert(b);
+            }
+            chunk_start = chunk_end.saturating_add(1);
+            if chunk_start == 0 {
+                break;
+            }
         }
         let mut updated = 0u32;
         let mut missing_block = 0u32;
@@ -1151,20 +1064,22 @@ impl SyncEngine {
                 if let Some(note) = trial_decrypt_note(&output.encrypted_note, sk) {
                     let derived = derived_coin_from_note(&note, sk);
                     let matches_chain = derived.as_deref() == Some(output.coin.as_slice());
-                    if matches_chain {
-                        decrypted += 1;
-                    } else if decrypted == 0 && !refreshed {
-                        eprintln!(
-                            "  decrypt coin mismatch at {}:{} derived={} chain={}",
-                            tx_hash,
-                            idx,
-                            derived
-                                .as_ref()
-                                .map(hex::encode)
-                                .unwrap_or_else(|| "-".into()),
-                            hex::encode(&output.coin)
-                        );
+                    if !matches_chain {
+                        if decrypted == 0 && !refreshed {
+                            eprintln!(
+                                "  decrypt coin mismatch at {}:{} derived={} chain={} (skipping overwrite)",
+                                tx_hash,
+                                idx,
+                                derived
+                                    .as_ref()
+                                    .map(hex::encode)
+                                    .unwrap_or_else(|| "-".into()),
+                                hex::encode(&output.coin)
+                            );
+                        }
+                        continue;
                     }
+                    decrypted += 1;
                     let Ok(value_i64) = i64::try_from(note.value) else {
                         tracing::error!(
                             "Skipping note {}:{} with value {} exceeding i64::MAX",
@@ -1188,6 +1103,7 @@ impl SyncEngine {
                         &output.coin,
                         sk,
                     )?;
+                    updated += 1;
                     refreshed = true;
                     break;
                 }
@@ -1246,7 +1162,11 @@ impl SyncEngine {
             &self.server_url,
             &info.directory_attest_pubkey,
         )?;
-        ensure_chain_matches_network(&info.chain_name, self.network_byte)?;
+        if let Some(ref net) = self.network_name {
+            ensure_chain_matches_network_name(&info.chain_name, net)?;
+        } else {
+            ensure_chain_matches_network(&info.chain_name, self.network_byte)?;
+        }
 
         let tip = client.get_chain_tip().await?.height;
         match self.restore_commitments_from_compact(&mut client).await {
@@ -1410,28 +1330,18 @@ impl SyncEngine {
             }
         }
 
-        let mut out = Vec::new();
-        darkfi_serial::Encodable::encode(&tree, &mut out)
-            .map_err(|e| format!("Failed to encode MerkleTree: {e}"))?;
-        self.db.set_meta("tree_state", &out)?;
-        self.db.set_merkle_from_genesis(true)?;
+        self.save_money_tree(&tree, tip, true)?;
 
         let now = client.get_chain_tip().await?.height;
-        let final_tip = if now > tip {
+        if now > tip {
             eprintln!(
                 "  catching up Merkle {}..={now} (blocks mined during rebuild)",
                 tip + 1
             );
-            self.apply_note_commitments(&mut client, tip + 1, now, now)
+            self.apply_note_commitments(&mut client, tip + 1, now, now, true)
                 .await?;
-            now
-        } else {
-            tip
-        };
-        // Record tree_applied_height (NOT last_synced_height!) so the following
-        // `sync_once` still trial-decrypts `(old_last_synced..=tip]` without
-        // re-appending commitments already present in the rebuilt tree.
-        self.set_tree_applied_height(final_tip)?;
+        }
+        let final_tip = now.max(tip);
         match self.db.recompute_owned_nullifiers() {
             Ok(n) => eprintln!("  recomputed nullifiers for {n} unspent notes"),
             Err(e) => eprintln!("  warning: recompute nullifiers failed: {e}"),
@@ -1459,7 +1369,7 @@ impl SyncEngine {
     /// This method is called as a safety net for coins discovered in the current
     /// sync batch (which weren't in the DB yet when the tree was built).
     #[allow(dead_code)]
-    fn mark_owned_positions(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn mark_owned_positions(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Reload tree and rebuild with marks for newly discovered coins.
         // We re-run apply_note_commitments conceptually, but since the tree is
         // already fully built we need to walk it. BridgeTree::mark() only marks
@@ -1477,7 +1387,7 @@ impl SyncEngine {
     /// Recomputes `poseidon(secret, coin)` first so rows inserted before that
     /// column was populated still match the LWD stream. Chunks stay inside a
     /// 4096-block window so padding cannot exceed the server range cap.
-    async fn apply_nullifiers_range(
+    pub(super) async fn apply_nullifiers_range(
         &self,
         client: &mut LightwalletClient,
         start: u32,
@@ -1520,7 +1430,7 @@ impl SyncEngine {
     /// when available, and on any PIR failure fall back to streaming the
     /// **entire padded window** (`GetBlockRange`) — which leaks nothing beyond
     /// the window — rather than a sparse per-height fetch of the matches.
-    async fn fetch_matching_blocks(
+    pub(super) async fn fetch_matching_blocks(
         &self,
         client: &mut LightwalletClient,
         window_start: u32,
@@ -1570,7 +1480,7 @@ impl SyncEngine {
 
     /// Stream every compact block in `[window_start, window_end]` (the padded
     /// digest window). Reveals only the window — never the OMR match set.
-    async fn fetch_window_range(
+    pub(super) async fn fetch_window_range(
         &self,
         client: &mut LightwalletClient,
         window_start: u32,
@@ -1585,7 +1495,7 @@ impl SyncEngine {
         Ok(blocks)
     }
 
-    async fn fetch_matching_blocks_sparse(
+    pub(super) async fn fetch_matching_blocks_sparse(
         &self,
         client: &mut LightwalletClient,
         matching_heights: &[u32],
@@ -1632,7 +1542,7 @@ impl SyncEngine {
     }
 
     /// UnifOMR Round 2: multi-hot BFV PIR over compact-block limbs in the padded window.
-    async fn fetch_matching_blocks_pir(
+    pub(super) async fn fetch_matching_blocks_pir(
         &self,
         client: &mut LightwalletClient,
         window_start: u32,
@@ -1649,7 +1559,7 @@ impl SyncEngine {
 
         let pir_seed =
             darkfi_lightwalletd::pir_server::derive_pir_seed(&secret_arr, self.network_byte)?;
-        let pir = darkfi_lightwalletd::pir_server::BatchPirClient::from_seed(pir_seed);
+        let pir = darkfi_lightwalletd::pir_server::BatchPirClient::from_seed(pir_seed)?;
 
         let window_size = (window_end - window_start + 1) as usize;
         let indices: Vec<usize> = matching_heights
@@ -1728,7 +1638,7 @@ impl SyncEngine {
         Ok(blocks)
     }
 
-    async fn fetch_outputs_by_func(
+    pub(super) async fn fetch_outputs_by_func(
         &self,
         client: &mut LightwalletClient,
         start: u32,
@@ -1755,7 +1665,7 @@ impl SyncEngine {
             .collect())
     }
 
-    async fn store_contract_records(
+    pub(super) async fn store_contract_records(
         &self,
         client: &mut LightwalletClient,
         start: u32,
@@ -1816,7 +1726,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    fn trial_decrypt_blocks(
+    pub(super) fn trial_decrypt_blocks(
         &self,
         blocks: &[crate::client::proto::CompactBlock],
     ) -> Result<u32, Box<dyn std::error::Error>> {
@@ -1836,7 +1746,7 @@ impl SyncEngine {
         Ok(notes_found)
     }
 
-    fn trial_decrypt_block(
+    pub(super) fn trial_decrypt_block(
         &self,
         block_pos: usize,
         block: &crate::client::proto::CompactBlock,
@@ -2009,7 +1919,7 @@ impl SyncEngine {
     /// the server truncated the digest at its DoS cap (`complete == false`) and
     /// only covered heights up to `h`; the caller must clamp its scan window to
     /// `h` so the dropped tail is re-requested next cycle. `None` ⇒ full coverage.
-    async fn try_omr_detect(
+    pub(super) async fn try_omr_detect(
         &self,
         client: &mut LightwalletClient,
         start: u32,
@@ -2175,7 +2085,7 @@ impl SyncEngine {
     }
 
     /// Trial-decrypt download for one padded window.
-    async fn fetch_padded_window_blocks(
+    pub(super) async fn fetch_padded_window_blocks(
         &self,
         client: &mut LightwalletClient,
         window_start: u32,
@@ -2194,7 +2104,7 @@ impl SyncEngine {
     /// Register the detection key once per process, then ask for a pooled digest.
     /// `NOT_FOUND` drops the handle, builds a fresh key, and registers again.
     /// The handle is never logged.
-    async fn pooled_unif_omr_digest(
+    pub(super) async fn pooled_unif_omr_digest(
         &self,
         client: &mut LightwalletClient,
         omr_clients: &[darkfi_lightwalletd::unifomr::UnifOmrClient],
@@ -2217,7 +2127,7 @@ impl SyncEngine {
         }
     }
 
-    async fn digest_from_pool_or_register(
+    pub(super) async fn digest_from_pool_or_register(
         &self,
         client: &mut LightwalletClient,
         detection_keys: &[Vec<u8>],
@@ -2263,1344 +2173,5 @@ impl SyncEngine {
             }
             Err(e) => Err(e),
         }
-    }
-}
-
-/// Decrypt UnifOMR Round-1 digest(s) and collect matching heights.
-///
-/// `slot_heights` is the response's packed slot → height map (same for every
-/// key); slot `i` decrypts to a match iff its clue is pertinent, mapping to
-/// `slot_heights[i]`. Single-key responses are unframed; multi-key responses are
-/// length-prefixed frames (one digest per detection key), matching lightwalletd.
-fn decrypt_unif_omr_heights(
-    clients: &[darkfi_lightwalletd::unifomr::UnifOmrClient],
-    encrypted_digest: &[u8],
-    slot_heights: &[u32],
-) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    use std::collections::BTreeSet;
-
-    if clients.is_empty() {
-        return Err("No UnifOMR clients for digest decrypt".into());
-    }
-    if clients.len() == 1 {
-        let slots = clients[0]
-            .decrypt_digest_slots(encrypted_digest)
-            .map_err(|e| format!("UnifOMR digest decrypt failed: {e}"))?;
-        return Ok(
-            darkfi_lightwalletd::unifomr::UnifOmrClient::range_check_matches(&slots, slot_heights),
-        );
-    }
-
-    let mut heights = BTreeSet::new();
-    let mut off = 0usize;
-    for (i, client_crypto) in clients.iter().enumerate() {
-        if off + 4 > encrypted_digest.len() {
-            return Err(format!("truncated multi-key UnifOMR digest at key[{i}]").into());
-        }
-        let len = u32::from_le_bytes(encrypted_digest[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        if off + len > encrypted_digest.len() {
-            return Err(format!("truncated UnifOMR digest frame for key[{i}]").into());
-        }
-        let frame = &encrypted_digest[off..off + len];
-        off += len;
-        let slots = client_crypto
-            .decrypt_digest_slots(frame)
-            .map_err(|e| format!("UnifOMR digest decrypt failed for key[{i}]: {e}"))?;
-        for h in
-            darkfi_lightwalletd::unifomr::UnifOmrClient::range_check_matches(&slots, slot_heights)
-        {
-            heights.insert(h);
-        }
-    }
-    Ok(heights.into_iter().collect())
-}
-
-/// True when `height` is inside the inclusive scan window.
-pub fn height_in_scan_window(height: u32, start: u32, end: u32) -> bool {
-    height >= start && height <= end
-}
-
-/// Pad a block range to a power-of-2 bucket boundary (P6 — mobile parity).
-///
-/// Rounds the range to the next power-of-2 bucket size (minimum 1024 blocks)
-/// and aligns the start to a bucket boundary. End is clamped to `tip`.
-///
-/// ```text
-/// pad_block_range(42000, 42500, tip) → (~41984, min(43007, tip))
-/// pad_block_range(100, 100, tip)     → (0, min(1023, tip))
-/// ```
-pub fn pad_block_range(start: u32, end: u32, tip: u32) -> (u32, u32) {
-    let range_size = end.saturating_sub(start).saturating_add(1);
-    let bucket = range_size.max(MIN_BUCKET_SIZE).next_power_of_two();
-
-    let aligned_start = (start / bucket) * bucket;
-    let mut aligned_end = aligned_start.saturating_add(bucket).saturating_sub(1);
-
-    while aligned_end < end {
-        aligned_end = aligned_end.saturating_add(bucket);
-    }
-
-    (aligned_start, aligned_end.min(tip))
-}
-
-/// A wire range lightwalletd accepts for commitments, nullifiers, and compact
-/// output bodies, i.e. any shape [`pad_block_range`] emits, with a span of at
-/// most [`MAX_RANGE_PER_REQUEST`]. `start` sits on a multiple of
-/// `max(next_pow2(span) / 2, MIN_BUCKET_SIZE)`, and the span is either a power
-/// of two of at least [`MIN_BUCKET_SIZE`] or a bucket cut short at `tip`. The
-/// server also takes unaligned power-of-two spans; refusing them here keeps a
-/// raw chunk start off the wire.
-pub fn padded_range_accepted(start: u32, end: u32, tip: u32) -> bool {
-    if start > end || end > tip {
-        return false;
-    }
-    let span = u64::from(end - start) + 1;
-    if span > u64::from(MAX_RANGE_PER_REQUEST) {
-        return false;
-    }
-    let full = span.max(u64::from(MIN_BUCKET_SIZE)).next_power_of_two();
-    let align = (full / 2).max(u64::from(MIN_BUCKET_SIZE));
-    if u64::from(start) % align != 0 {
-        return false;
-    }
-    span == full || end == tip
-}
-
-/// Pad `[start, end]` and refuse to return a range the server would reject.
-pub fn require_padded_range(start: u32, end: u32, tip: u32) -> Result<(u32, u32), String> {
-    if start > end {
-        return Err(format!("invalid block range {start}..={end}"));
-    }
-    if start > tip {
-        return Err(format!(
-            "block range {start}..={end} starts above tip {tip}"
-        ));
-    }
-    let end = end.min(tip);
-    // Re-padding a two-bucket window can widen it, so keep one already padded.
-    if padded_range_accepted(start, end, tip) {
-        return Ok((start, end));
-    }
-    let (padded_start, padded_end) = pad_block_range(start, end, tip);
-    if !padded_range_accepted(padded_start, padded_end, tip) {
-        return Err(format!(
-            "refusing unpadded or oversized range {padded_start}..={padded_end} (tip {tip})"
-        ));
-    }
-    Ok((padded_start, padded_end))
-}
-
-/// Where note discovery starts.
-///
-/// `--force-trial` follows `trial_synced_height` (missing means "start at the
-/// birthday") so clue-less payments hidden by an earlier strict scan are
-/// decrypted. The Money tree cursor is intentionally not part of that start:
-/// commitments already applied are skipped in `apply_note_commitments`.
-pub fn note_scan_start(
-    force_trial: bool,
-    trial_cursor: Option<u32>,
-    last_synced: u32,
-    birthday: u32,
-    merkle_from_genesis: bool,
-    tree_applied: u32,
-) -> u32 {
-    if force_trial {
-        return match trial_cursor {
-            Some(covered) => covered.saturating_add(1).max(birthday),
-            None => birthday,
-        };
-    }
-    scan_start_for_sync(last_synced, birthday, merkle_from_genesis, tree_applied)
-}
-
-/// First height to scan after optional checkpoint state.
-///
-/// Note discovery scans every block from birthday to tip (default trial decrypt).
-/// A Money-tree checkpoint snapshot (`tree_applied`) only skips commitment replay
-/// in `apply_note_commitments`, never trial decryption.
-pub fn scan_start_for_sync(
-    last_synced: u32,
-    birthday: u32,
-    _merkle_from_genesis: bool,
-    _tree_applied: u32,
-) -> u32 {
-    if last_synced == 0 {
-        birthday
-    } else {
-        last_synced.saturating_add(1).max(birthday)
-    }
-}
-
-/// `birthday == 0` asks for the latest snapshot. Any other birthday is the
-/// preferred height (greatest snapshot `<=` birthday).
-pub fn preferred_checkpoint_height(birthday: u32) -> u32 {
-    birthday
-}
-
-/// Accept the greatest snapshot at or below the birthday. A birthday of 0
-/// means "latest", so any returned height is acceptable.
-pub fn checkpoint_snapshot_accepted(snapshot_height: u32, birthday: u32) -> bool {
-    birthday == 0 || snapshot_height <= birthday
-}
-
-/// `expires_unix == 0` means the server did not set an expiry.
-pub fn pool_handle_usable(expires_unix: u64, now_unix: u64) -> bool {
-    expires_unix == 0 || now_unix < expires_unix
-}
-
-fn grpc_code_is(err: &(dyn std::error::Error + 'static), code: tonic::Code) -> bool {
-    err.downcast_ref::<tonic::Status>()
-        .is_some_and(|status| status.code() == code)
-}
-
-fn checkpoint_status_falls_back(err: &(dyn std::error::Error + 'static)) -> bool {
-    grpc_code_is(err, tonic::Code::NotFound) || grpc_code_is(err, tonic::Code::FailedPrecondition)
-}
-
-fn rebuild_detection_keys(
-    clients: &[darkfi_lightwalletd::unifomr::UnifOmrClient],
-    network: u8,
-) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
-    let mut keys = Vec::with_capacity(clients.len());
-    for client in clients {
-        keys.push(client.build_detection_key(network)?);
-    }
-    if keys.is_empty() {
-        return Err("no detection key to re-register".into());
-    }
-    Ok(keys)
-}
-
-struct ProcessDetectionPool {
-    server: String,
-    network: u8,
-    handle: Vec<u8>,
-    expires_unix: u64,
-}
-
-fn detection_pool() -> &'static std::sync::Mutex<Option<ProcessDetectionPool>> {
-    static POOL: std::sync::OnceLock<std::sync::Mutex<Option<ProcessDetectionPool>>> =
-        std::sync::OnceLock::new();
-    POOL.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-fn detection_pool_handle(server: &str, network: u8) -> Option<Vec<u8>> {
-    let mut slot = detection_pool().lock().unwrap_or_else(|e| e.into_inner());
-    let now = unix_now();
-    let usable = slot.as_ref().is_some_and(|state| {
-        state.server == server
-            && state.network == network
-            && pool_handle_usable(state.expires_unix, now)
-    });
-    if !usable {
-        if slot.is_some() {
-            *slot = None;
-        }
-        return None;
-    }
-    slot.as_ref().map(|state| state.handle.clone())
-}
-
-fn store_detection_pool(server: &str, network: u8, handle: Vec<u8>, expires_unix: u64) {
-    *detection_pool().lock().unwrap_or_else(|e| e.into_inner()) = Some(ProcessDetectionPool {
-        server: server.to_string(),
-        network,
-        handle,
-        expires_unix,
-    });
-}
-
-fn clear_detection_pool() {
-    *detection_pool().lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn compact_blocks_from_output_bodies(
-    bodies: Vec<crate::client::proto::CompactOutputBody>,
-) -> Vec<crate::client::proto::CompactBlock> {
-    use std::collections::BTreeMap;
-    struct HeightAcc {
-        hash: Vec<u8>,
-        prev_hash: Vec<u8>,
-        txs: BTreeMap<Vec<u8>, Vec<crate::client::proto::CompactOutput>>,
-    }
-    let mut by_height: BTreeMap<u32, HeightAcc> = BTreeMap::new();
-    for body in bodies {
-        let entry = by_height.entry(body.height).or_insert_with(|| HeightAcc {
-            hash: body.hash.clone(),
-            prev_hash: body.prev_hash.clone(),
-            txs: BTreeMap::new(),
-        });
-        entry.txs.entry(body.tx_hash.clone()).or_default().push(
-            crate::client::proto::CompactOutput {
-                coin: body.coin,
-                encrypted_note: body.encrypted_note,
-                value_commit: Vec::new(),
-                token_commit: Vec::new(),
-                omr_clue: body.omr_clue,
-                omr_metadata_enc: body.omr_metadata_enc,
-                func_code: body.func_code,
-            },
-        );
-    }
-    by_height
-        .into_iter()
-        .map(|(height, acc)| crate::client::proto::CompactBlock {
-            height,
-            hash: acc.hash,
-            prev_hash: acc.prev_hash,
-            timestamp: 0,
-            txs: acc
-                .txs
-                .into_iter()
-                .map(|(tx_hash, outputs)| crate::client::proto::CompactTx {
-                    tx_hash,
-                    outputs,
-                    nullifiers: Vec::new(),
-                    fee: 0,
-                })
-                .collect(),
-        })
-        .collect()
-}
-
-/// Jittered sleep for anti-fingerprinting.
-///
-/// Sleeps for a base duration ± small jitter using thread_rng.
-pub async fn jittered_sleep(base_secs: u64) {
-    use rand::Rng;
-    let jitter = rand::rng().random_range(0..=(base_secs / 4).max(1));
-    let total = base_secs + jitter;
-    tokio::time::sleep(Duration::from_secs(total)).await;
-}
-
-/// Redact sensitive information (URLs, IPs, IPv6, `.onion`, `host:port`) from error messages.
-pub fn redact_sync_error(msg: &str) -> String {
-    let mut result = msg.to_string();
-
-    let url_re = regex_lite::Regex::new(r"(https?|tcp(\+tls)?|grpc)://[^\s]+").unwrap();
-    result = url_re.replace_all(&result, "[redacted-url]").to_string();
-
-    let onion_re = regex_lite::Regex::new(r"[a-zA-Z2-7]{16,56}\.onion(:\d+)?").unwrap();
-    result = onion_re
-        .replace_all(&result, "[redacted-onion]")
-        .to_string();
-
-    let ipv6_re = regex_lite::Regex::new(r"\[[0-9a-fA-F:]+\](:\d+)?").unwrap();
-    result = ipv6_re.replace_all(&result, "[redacted-addr]").to_string();
-
-    let ip_re = regex_lite::Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?").unwrap();
-    result = ip_re.replace_all(&result, "[redacted-addr]").to_string();
-
-    let hostport_re = regex_lite::Regex::new(
-        r"\b[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9-]+)+:\d+\b",
-    )
-    .unwrap();
-    result = hostport_re
-        .replace_all(&result, "[redacted-addr]")
-        .to_string();
-
-    result
-}
-
-/// Result of a sync cycle.
-#[derive(Debug)]
-pub struct SyncResult {
-    pub blocks_scanned: u32,
-    pub notes_found: u32,
-    pub notes_spent: u32,
-    pub tip_height: u32,
-    /// Served tip was last refreshed from darkfid more than two minutes ago.
-    /// `false` when the server did not report a poll time.
-    pub tip_stale: bool,
-    /// True when this cycle performed a reorg rewind and the caller should run
-    /// another pass to sync the canonical fork.
-    pub rewound: bool,
-}
-
-/// `0` is unknown (older server, or the poll has not succeeded). A reported
-/// time older than two minutes means the served tip may be frozen.
-pub fn tip_poll_is_stale(fetched_unix: u64) -> bool {
-    if fetched_unix == 0 {
-        return false;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now.saturating_sub(fetched_unix) > 120
-}
-
-/// A decrypted note from trial decryption (blinds extracted; commitment from caller).
-pub struct DecryptedNote {
-    pub value: u64,
-    pub token_id: Vec<u8>,
-    pub serial: Vec<u8>,
-    pub memo: Option<String>,
-    pub coin_blind: Vec<u8>,
-    pub value_blind: Vec<u8>,
-    pub token_blind: Vec<u8>,
-    /// First byte of spend_hook field (matches `insert_note` `Option<u8>`).
-    pub spend_hook: u8,
-    /// Full 32-byte `FuncId::to_repr()` — required for `CoinAttributes::to_coin()`.
-    pub spend_hook_bytes: Vec<u8>,
-    pub user_data: Vec<u8>,
-}
-
-/// Remaining AEAD plaintext (MoneyNote decode is applied separately so a
-/// truncated/odd memo cannot fail-closed the spend fields).
-struct RemainingBytes(Vec<u8>);
-
-impl darkfi_serial::Decodable for RemainingBytes {
-    fn decode<D: std::io::Read>(d: &mut D) -> std::io::Result<Self> {
-        let mut v = Vec::new();
-        d.read_to_end(&mut v)?;
-        Ok(Self(v))
-    }
-}
-
-fn aead_note_candidates(encrypted_note: &[u8]) -> Vec<darkfi_sdk::crypto::note::AeadEncryptedNote> {
-    use darkfi_sdk::crypto::note::AeadEncryptedNote;
-    use darkfi_sdk::crypto::PublicKey;
-    use darkfi_serial::Decodable;
-    use std::io::Cursor;
-
-    let mut out = Vec::new();
-    let mut cursor = Cursor::new(encrypted_note);
-    if let Ok(n) = AeadEncryptedNote::decode(&mut cursor) {
-        if cursor.position() as usize == encrypted_note.len() {
-            out.push(n);
-        }
-    }
-    if encrypted_note.len() >= 48 {
-        let mut c = Cursor::new(encrypted_note);
-        if let Ok(ephem) = PublicKey::decode(&mut c) {
-            out.push(AeadEncryptedNote {
-                ciphertext: encrypted_note[32..].to_vec(),
-                ephem_public: ephem,
-            });
-        }
-        let (ct, ep) = encrypted_note.split_at(encrypted_note.len() - 32);
-        let mut c = Cursor::new(ep);
-        if let Ok(ephem) = PublicKey::decode(&mut c) {
-            out.push(AeadEncryptedNote {
-                ciphertext: ct.to_vec(),
-                ephem_public: ephem,
-            });
-        }
-    }
-    out
-}
-
-fn money_note_from_plaintext(pt: &[u8]) -> Option<darkfi_money_contract::client::MoneyNote> {
-    use darkfi_money_contract::client::MoneyNote;
-    use darkfi_money_contract::model::TokenId;
-    use darkfi_sdk::crypto::{BaseBlind, FuncId, ScalarBlind};
-    use darkfi_sdk::pasta::pallas;
-    use darkfi_serial::Decodable;
-    use std::io::Cursor;
-
-    let mut c = Cursor::new(pt);
-    if let Ok(n) = MoneyNote::decode(&mut c) {
-        return Some(n);
-    }
-    // PoW / older notes: spend fields present, memo VarInt missing or truncated.
-    let mut c = Cursor::new(pt);
-    let value = u64::decode(&mut c).ok()?;
-    let token_id = TokenId::decode(&mut c).ok()?;
-    let spend_hook = FuncId::decode(&mut c).ok()?;
-    let user_data = pallas::Base::decode(&mut c).ok()?;
-    let coin_blind = BaseBlind::decode(&mut c).ok()?;
-    let value_blind = ScalarBlind::decode(&mut c).ok()?;
-    let token_blind = BaseBlind::decode(&mut c).ok()?;
-    let memo = Vec::<u8>::decode(&mut c).unwrap_or_default();
-    Some(MoneyNote {
-        value,
-        token_id,
-        spend_hook,
-        user_data,
-        coin_blind,
-        value_blind,
-        token_blind,
-        memo,
-    })
-}
-
-fn decrypted_from_money_note(
-    note: darkfi_money_contract::client::MoneyNote,
-) -> Option<DecryptedNote> {
-    use darkfi_sdk::crypto::pasta_prelude::PrimeField;
-    use darkfi_serial::Encodable;
-
-    let mut coin_blind = Vec::new();
-    note.coin_blind.inner().encode(&mut coin_blind).ok()?;
-    let mut value_blind = Vec::new();
-    note.value_blind.inner().encode(&mut value_blind).ok()?;
-    let mut token_blind = Vec::new();
-    note.token_blind.inner().encode(&mut token_blind).ok()?;
-    let mut user_data = Vec::new();
-    note.user_data.encode(&mut user_data).ok()?;
-
-    let spend_hook_bytes = note.spend_hook.inner().to_repr().to_vec();
-    let spend_hook = spend_hook_bytes.first().copied().unwrap_or(0);
-    let memo = {
-        let raw = &note.memo;
-        if raw.is_empty() {
-            None
-        } else {
-            String::from_utf8(raw.clone())
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        }
-    };
-
-    Some(DecryptedNote {
-        value: note.value,
-        token_id: note.token_id.to_bytes().to_vec(),
-        serial: coin_blind.clone(),
-        memo,
-        coin_blind,
-        value_blind,
-        token_blind,
-        spend_hook,
-        spend_hook_bytes,
-        user_data,
-    })
-}
-
-/// `CoinAttributes::to_coin()` bytes for a decrypted note + owner secret.
-pub fn derived_coin_from_note(note: &DecryptedNote, wallet_key: &[u8]) -> Option<Vec<u8>> {
-    use darkfi_money_contract::model::{CoinAttributes, TokenId};
-    use darkfi_sdk::crypto::{FuncId, PublicKey, SecretKey};
-    use darkfi_sdk::pasta::pallas;
-    use darkfi_serial::Decodable;
-    use std::io::Cursor;
-
-    if wallet_key.len() < 32
-        || note.token_id.len() != 32
-        || note.coin_blind.len() != 32
-        || note.user_data.len() != 32
-        || note.spend_hook_bytes.len() != 32
-    {
-        return None;
-    }
-    let mut sk_arr = [0u8; 32];
-    sk_arr.copy_from_slice(&wallet_key[..32]);
-    let sk = SecretKey::from_bytes(sk_arr).ok()?;
-    let mut tok = [0u8; 32];
-    tok.copy_from_slice(&note.token_id);
-    let token_id = TokenId::from_bytes(tok).ok()?;
-    let mut hook = [0u8; 32];
-    hook.copy_from_slice(&note.spend_hook_bytes);
-    let spend_hook = FuncId::from_bytes(hook).ok()?;
-    let coin_blind = pallas::Base::decode(&mut Cursor::new(&note.coin_blind)).ok()?;
-    let user_data = pallas::Base::decode(&mut Cursor::new(&note.user_data)).ok()?;
-    Some(
-        CoinAttributes {
-            public_key: PublicKey::from_secret(sk),
-            value: note.value,
-            token_id,
-            spend_hook,
-            user_data,
-            blind: darkfi_sdk::crypto::Blind(coin_blind),
-        }
-        .to_coin()
-        .to_bytes()
-        .to_vec(),
-    )
-}
-
-/// Keyed by `(block_pos, tx_pos, out_pos)` in the caller's `blocks` slice so
-/// supplemental blocks at the same height (e.g. `TOKEN_MINT` extra blocks)
-/// never collide with regular compact blocks.
-type TrialHits = std::collections::HashMap<(usize, usize, usize), (DecryptedNote, Vec<u8>)>;
-
-/// Strip outputs from supplemental `TOKEN_MINT` blocks that are already present
-/// in `in_window` (matching `(height, tx_hash, coin)`), avoiding duplicate work
-/// and synthetic `idx = 0` collisions.
-fn dedup_extra_blocks_against_window(
-    in_window: &[crate::client::proto::CompactBlock],
-    extra: Vec<crate::client::proto::CompactBlock>,
-) -> Vec<crate::client::proto::CompactBlock> {
-    let mut seen: std::collections::HashSet<(u32, Vec<u8>, Vec<u8>)> =
-        std::collections::HashSet::new();
-    for block in in_window {
-        for tx in &block.txs {
-            for out in &tx.outputs {
-                if out.coin.len() == 32 {
-                    seen.insert((block.height, tx.tx_hash.clone(), out.coin.clone()));
-                }
-            }
-        }
-    }
-    let mut out_blocks = Vec::new();
-    for mut block in extra {
-        for tx in &mut block.txs {
-            tx.outputs.retain(|o| {
-                if o.coin.len() == 32 {
-                    !seen.contains(&(block.height, tx.tx_hash.clone(), o.coin.clone()))
-                } else {
-                    true
-                }
-            });
-        }
-        block.txs.retain(|tx| !tx.outputs.is_empty());
-        if !block.txs.is_empty() {
-            out_blocks.push(block);
-        }
-    }
-    out_blocks
-}
-
-const MONEY_FUNC_AUTH_TOKEN_MINT: u32 = 0x04;
-const MONEY_FUNC_AUTH_TOKEN_FREEZE: u32 = 0x05;
-const MONEY_FUNC_TOKEN_MINT: u32 = 0x06;
-
-fn batch_open_blocks(
-    secrets: &[Vec<u8>],
-    blocks: &[crate::client::proto::CompactBlock],
-) -> TrialHits {
-    use darkfi_sdk::crypto::diffie_hellman::sapling_ka_agree_batch as note_key_agree_batch;
-    use darkfi_sdk::crypto::note::AeadEncryptedNote;
-    use darkfi_sdk::crypto::SecretKey;
-    use darkfi_serial::Decodable;
-    use std::io::Cursor;
-
-    struct Job {
-        block_pos: usize,
-        tx_pos: usize,
-        out_pos: usize,
-        coin: Vec<u8>,
-        note: AeadEncryptedNote,
-    }
-
-    let mut jobs = Vec::new();
-    let mut fallback = Vec::new();
-    for (block_pos, block) in blocks.iter().enumerate() {
-        for (tx_pos, tx) in block.txs.iter().enumerate() {
-            if tx.tx_hash.len() != 32 {
-                continue;
-            }
-            for (out_pos, output) in tx.outputs.iter().enumerate() {
-                if output.encrypted_note.len() < 48 {
-                    continue;
-                }
-                let mut cursor = Cursor::new(output.encrypted_note.as_slice());
-                let decoded_exact = AeadEncryptedNote::decode(&mut cursor)
-                    .ok()
-                    .filter(|_| cursor.position() as usize == output.encrypted_note.len());
-                if let Some(note) = decoded_exact {
-                    jobs.push(Job {
-                        block_pos,
-                        tx_pos,
-                        out_pos,
-                        coin: output.coin.clone(),
-                        note,
-                    });
-                } else {
-                    fallback.push((
-                        block_pos,
-                        tx_pos,
-                        out_pos,
-                        output.coin.clone(),
-                        output.encrypted_note.clone(),
-                    ));
-                }
-            }
-        }
-    }
-
-    let mut out = std::collections::HashMap::new();
-    for secret_bytes in secrets {
-        if secret_bytes.len() < 32 {
-            continue;
-        }
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&secret_bytes[..32]);
-        let Ok(secret) = SecretKey::from_bytes(raw) else {
-            continue;
-        };
-        let pending: Vec<usize> = jobs
-            .iter()
-            .enumerate()
-            .filter(|(_, job)| !out.contains_key(&(job.block_pos, job.tx_pos, job.out_pos)))
-            .map(|(index, _)| index)
-            .collect();
-        if pending.is_empty() {
-            continue;
-        }
-        // Chunks of 48 notes do Diffie-Hellman and AEAD together on the Rayon
-        // pool. The caller still writes SQLite after the join. Smaller windows
-        // stay on this thread.
-        const BATCH_CHUNK: usize = 48;
-        let open = |indexes: &[usize]| -> Vec<(usize, DecryptedNote)> {
-            let epks: Vec<_> = indexes
-                .iter()
-                .map(|index| jobs[*index].note.ephem_public)
-                .collect();
-            let shared = note_key_agree_batch(&secret, &epks);
-            indexes
-                .iter()
-                .zip(shared)
-                .filter_map(|(index, shared)| {
-                    let shared = shared.ok()?;
-                    let Ok(RemainingBytes(plaintext)) =
-                        jobs[*index].note.decrypt_with_shared(&shared)
-                    else {
-                        return None;
-                    };
-                    let money = money_note_from_plaintext(&plaintext)?;
-                    let note = decrypted_from_money_note(money)?;
-                    // Fail closed if note attributes cannot derive a valid coin commitment.
-                    let derived = derived_coin_from_note(&note, secret_bytes)?;
-                    if jobs[*index].coin.len() == 32
-                        && derived.as_slice() != jobs[*index].coin.as_slice()
-                    {
-                        return None;
-                    }
-                    Some((*index, note))
-                })
-                .collect()
-        };
-        let hits: Vec<(usize, DecryptedNote)> = if pending.len() <= BATCH_CHUNK {
-            open(&pending)
-        } else {
-            use rayon::prelude::*;
-            pending
-                .par_chunks(BATCH_CHUNK)
-                .flat_map_iter(open)
-                .collect()
-        };
-        for (index, note) in hits {
-            out.insert(
-                (
-                    jobs[index].block_pos,
-                    jobs[index].tx_pos,
-                    jobs[index].out_pos,
-                ),
-                (note, secret_bytes.clone()),
-            );
-        }
-    }
-    for (block_pos, tx_pos, out_pos, coin, encrypted) in fallback {
-        if out.contains_key(&(block_pos, tx_pos, out_pos)) {
-            continue;
-        }
-        for secret_bytes in secrets {
-            let Some(note) = trial_decrypt_note(&encrypted, secret_bytes) else {
-                continue;
-            };
-            // Fail closed if note attributes cannot derive a valid coin commitment.
-            let Some(derived) = derived_coin_from_note(&note, secret_bytes) else {
-                continue;
-            };
-            if coin.len() == 32 && derived.as_slice() != coin.as_slice() {
-                continue;
-            }
-            out.insert((block_pos, tx_pos, out_pos), (note, secret_bytes.clone()));
-            break;
-        }
-    }
-    out
-}
-
-/// Trial decrypt a compact block note using the wallet's secret key.
-///
-/// AEAD-decrypts the compact `AeadEncryptedNote`, then parses `MoneyNote`
-/// (full decode, or spend-fields-only if memo is truncated) so blinds match
-/// `CoinAttributes::to_coin()` / on-chain `output.coin`.
-pub fn trial_decrypt_note(encrypted_note: &[u8], wallet_key: &[u8]) -> Option<DecryptedNote> {
-    use darkfi_sdk::crypto::SecretKey;
-
-    if encrypted_note.len() < 48 || wallet_key.len() < 32 {
-        return None;
-    }
-
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&wallet_key[..32]);
-    let secret = SecretKey::from_bytes(key_bytes).ok()?;
-    for enc_note in aead_note_candidates(encrypted_note) {
-        let Ok(RemainingBytes(plaintext)) = enc_note.decrypt(&secret) else {
-            continue;
-        };
-        if let Some(note) = money_note_from_plaintext(&plaintext) {
-            return decrypted_from_money_note(note);
-        }
-    }
-    None
-}
-
-/// Why `trial_decrypt_note` returned None (first failing step).
-pub fn trial_decrypt_fail_reason(encrypted_note: &[u8], wallet_key: &[u8]) -> &'static str {
-    use darkfi_sdk::crypto::SecretKey;
-
-    if encrypted_note.len() < 48 {
-        return "too_short";
-    }
-    if wallet_key.len() < 32 {
-        return "key_short";
-    }
-    let cands = aead_note_candidates(encrypted_note);
-    if cands.is_empty() {
-        return "aead_decode";
-    }
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&wallet_key[..32]);
-    let Ok(secret) = SecretKey::from_bytes(key_bytes) else {
-        return "bad_secret";
-    };
-    let mut aead_ok = false;
-    for enc_note in cands {
-        let Ok(RemainingBytes(plaintext)) = enc_note.decrypt(&secret) else {
-            continue;
-        };
-        aead_ok = true;
-        if money_note_from_plaintext(&plaintext).is_some() {
-            return "ok";
-        }
-    }
-    if aead_ok {
-        "note_parse"
-    } else {
-        "aead"
-    }
-}
-
-/// Ensure lightwalletd chain_name matches the wallet network byte.
-pub fn ensure_chain_matches_network(
-    chain_name: &str,
-    network_byte: u8,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let c = chain_name.to_ascii_lowercase();
-    let ok = if network_byte == 0x00 {
-        c.contains("mainnet") && !c.contains("testnet") && !c.contains("localnet")
-    } else {
-        c.contains("testnet") || c.contains("localnet")
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!(
-            "lightwalletd chain_name '{chain_name}' does not match wallet network byte 0x{network_byte:02x}. \
-             Use the same darkfi-lightwalletd network for all clients."
-        )
-        .into())
-    }
-}
-
-#[allow(dead_code)]
-pub fn compute_supplemental_heights(
-    scan_start: u32,
-    scan_end: u32,
-    tip_height: u32,
-    matching_heights: &[u32],
-) -> Vec<u32> {
-    let mut extra: Vec<u32> = Vec::new();
-    if matching_heights.is_empty() {
-        return extra;
-    }
-    let first = matching_heights[0];
-    if first.saturating_sub(scan_start) > 10 {
-        extra.extend(scan_start..first);
-    }
-    for w in matching_heights.windows(2) {
-        let gap_start = w[0] + 1;
-        let gap_end = w[1].saturating_sub(1);
-        if gap_end >= gap_start && (gap_end - gap_start + 1) > 10 {
-            extra.extend(gap_start..=gap_end);
-        }
-    }
-    let last = *matching_heights.last().unwrap();
-    if tip_height.min(scan_end).saturating_sub(last) > 10 {
-        extra.extend((last + 1)..=scan_end);
-    }
-    extra
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unknown_tip_poll_time_is_not_stale() {
-        assert!(!tip_poll_is_stale(0));
-        assert!(tip_poll_is_stale(1));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(!tip_poll_is_stale(now));
-    }
-
-    #[test]
-    fn raw_cursor_range_is_rejected() {
-        assert!(!padded_range_accepted(42000, 42100, 50_000));
-        assert!(!padded_range_accepted(100, 100, 50_000));
-        assert!(!padded_range_accepted(0, 9999, 50_000));
-        assert!(require_padded_range(100, 100, 50_000).unwrap() != (100, 100));
-    }
-
-    #[test]
-    fn padded_power_of_two_bucket_is_accepted() {
-        let (start, end) = require_padded_range(42000, 42100, 50_000).unwrap();
-        assert!(padded_range_accepted(start, end, 50_000));
-        assert!(start <= 42000 && end >= 42100);
-        let span = end - start + 1;
-        assert!(span >= 1024);
-        assert!(span.is_power_of_two());
-        assert!(span <= 10_000);
-        assert_eq!(
-            require_padded_range(start, end, 50_000).unwrap(),
-            (start, end)
-        );
-    }
-
-    #[test]
-    fn tip_clamped_bucket_is_accepted_and_oversized_bucket_is_rejected() {
-        let (start, end) = require_padded_range(49900, 50000, 50_000).unwrap();
-        assert!(padded_range_accepted(start, end, 50_000));
-        assert_eq!(end, 50_000);
-        assert!(start <= 49900);
-        assert!(!padded_range_accepted(0, 16_383, 100_000));
-        assert!(require_padded_range(0, 9999, 100_000).is_err());
-    }
-
-    #[test]
-    fn two_bucket_windows_are_accepted_and_not_widened() {
-        // 1500..=2500 crosses the 2048 boundary: two 1024 buckets.
-        let (start, end) = require_padded_range(1500, 2500, 50_000).unwrap();
-        assert_eq!((start, end), (1024, 3071));
-        assert!(padded_range_accepted(start, end, 50_000));
-        assert_eq!(require_padded_range(start, end, end).unwrap(), (start, end));
-        // The same window cut at the tip.
-        let (start, end) = require_padded_range(1500, 2500, 2600).unwrap();
-        assert_eq!((start, end), (1024, 2600));
-        assert_eq!(
-            require_padded_range(start, end, 2600).unwrap(),
-            (start, end)
-        );
-        // A raw power-of-two chunk off the bucket grid is still padded.
-        assert!(!padded_range_accepted(1500, 5595, 50_000));
-        // A chain shorter than one bucket is served whole from genesis.
-        assert_eq!(require_padded_range(0, 10, 10).unwrap(), (0, 10));
-        assert!(!padded_range_accepted(5, 10, 10));
-    }
-
-    #[test]
-    fn checkpoint_accepts_snapshot_at_or_below_birthday() {
-        assert_eq!(preferred_checkpoint_height(0), 0);
-        assert_eq!(preferred_checkpoint_height(5000), 5000);
-        assert!(checkpoint_snapshot_accepted(4096, 5000));
-        assert!(checkpoint_snapshot_accepted(5000, 5000));
-        assert!(!checkpoint_snapshot_accepted(5001, 5000));
-        assert!(checkpoint_snapshot_accepted(80_000, 0));
-    }
-
-    #[test]
-    fn scan_start_skips_snapshot_prefix() {
-        assert_eq!(scan_start_for_sync(0, 5000, false, 0), 5000);
-        assert_eq!(scan_start_for_sync(0, 5000, true, 4096), 5000);
-        // Fresh wallet: birthday is the note cursor even if the tree snapshot
-        // sits at the birthday height (commitments are skipped separately).
-        assert_eq!(scan_start_for_sync(0, 5000, true, 5000), 5000);
-        assert_eq!(scan_start_for_sync(5000, 0, true, 5000), 5001);
-        // Multi-window scan: last_synced progresses sequentially without skipping to tree_applied
-        assert_eq!(scan_start_for_sync(100, 0, true, 5000), 101);
-        assert_eq!(scan_start_for_sync(0, 0, false, 0), 0);
-        assert_eq!(scan_start_for_sync(0, 0, true, 117), 0);
-    }
-
-    #[test]
-    fn force_trial_ignores_a_strict_cursor_already_at_the_tip() {
-        // Strict sync left last_synced and the Money tree at the tip.
-        // force-trial with no trial cursor starts at the birthday.
-        assert_eq!(note_scan_start(true, None, 6000, 0, true, 6000), 0);
-        // A recorded trial cursor continues after that height, not after the tree.
-        assert_eq!(note_scan_start(true, Some(100), 6000, 0, true, 6000), 101);
-        // Strict sync still starts after the tree.
-        assert_eq!(note_scan_start(false, None, 6000, 0, true, 6000), 6001);
-    }
-
-    #[test]
-    fn pool_handle_expiry() {
-        assert!(pool_handle_usable(0, 1_000));
-        assert!(pool_handle_usable(2_000, 1_999));
-        assert!(!pool_handle_usable(2_000, 2_000));
-    }
-
-    #[test]
-    fn padded_commitment_window_drops_heights_outside_scan() {
-        let (pad_start, pad_end) = pad_block_range(42000, 42100, 50_000);
-        assert!(pad_start < 42000);
-        assert!(pad_end > 42100);
-        let returned = [pad_start, 41999, 42000, 42100, pad_end];
-        let kept: Vec<u32> = returned
-            .into_iter()
-            .filter(|h| height_in_scan_window(*h, 42000, 42100))
-            .collect();
-        assert_eq!(kept, vec![42000, 42100]);
-    }
-
-    #[test]
-    fn test_pre_birthday_commitment_range() {
-        assert_eq!(pre_birthday_commitment_range(0), None);
-        assert_eq!(pre_birthday_commitment_range(1), Some((0, 0)));
-        assert_eq!(pre_birthday_commitment_range(53000), Some((0, 52999)));
-    }
-
-    #[test]
-    fn test_chain_matches_testnet() {
-        ensure_chain_matches_network("darkfi-testnet", 0x01).unwrap();
-        ensure_chain_matches_network("darkfi-localnet", 0x01).unwrap();
-        assert!(ensure_chain_matches_network("darkfi-mainnet", 0x01).is_err());
-    }
-
-    #[test]
-    fn test_chain_matches_mainnet() {
-        ensure_chain_matches_network("darkfi-mainnet", 0x00).unwrap();
-        assert!(ensure_chain_matches_network("darkfi-testnet", 0x00).is_err());
-    }
-
-    #[test]
-    fn test_pad_block_range_min_bucket() {
-        let (ps, pe) = pad_block_range(100, 100, 50000);
-        assert_eq!(ps, 0);
-        assert_eq!(pe, 1023);
-    }
-
-    #[test]
-    fn test_pad_block_range_small() {
-        let (ps, pe) = pad_block_range(42000, 42100, 50000);
-        assert_eq!(pe - ps + 1, 1024);
-        assert_eq!(ps % 1024, 0);
-        assert!(ps <= 42000);
-        assert!(pe >= 42100);
-    }
-
-    #[test]
-    fn test_pad_block_range_medium() {
-        let (ps, pe) = pad_block_range(10000, 12000, 50000);
-        assert_eq!(ps % 2048, 0);
-        assert!(ps <= 10000);
-        assert!(pe >= 12000);
-    }
-
-    #[test]
-    fn test_pad_block_range_near_tip() {
-        let (ps, pe) = pad_block_range(49900, 50000, 50000);
-        assert_eq!(pe, 50000);
-        assert!(ps <= 49900);
-    }
-
-    #[test]
-    fn test_pad_block_range_deterministic() {
-        let a = pad_block_range(42000, 42500, 100_000);
-        let b = pad_block_range(42000, 42500, 100_000);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_redact_sync_error_ips() {
-        let msg = "connection failed to 192.168.1.100:9067";
-        let redacted = redact_sync_error(msg);
-        assert!(!redacted.contains("192.168.1.100"));
-        assert!(redacted.contains("[redacted-addr]"));
-    }
-
-    #[test]
-    fn test_redact_sync_error_urls() {
-        let msg = "failed: http://lw.darkfi.xyz:9067/rpc timeout";
-        let redacted = redact_sync_error(msg);
-        assert!(!redacted.contains("lw.darkfi.xyz"));
-        assert!(redacted.contains("[redacted-url]"));
-    }
-
-    #[test]
-    fn test_redact_preserves_safe() {
-        let msg = "OMR not available on server";
-        assert_eq!(redact_sync_error(msg), msg);
-    }
-
-    #[test]
-    fn test_trial_decrypt_too_short() {
-        assert!(trial_decrypt_note(&[0u8; 10], &[0u8; 32]).is_none());
-    }
-
-    #[test]
-    fn trial_decrypt_roundtrip_pow_style_memo() {
-        use darkfi_money_contract::client::MoneyNote;
-        use darkfi_money_contract::model::DARK_TOKEN_ID;
-        use darkfi_sdk::crypto::note::AeadEncryptedNote;
-        use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
-        use darkfi_sdk::crypto::{Blind, FuncId, Keypair};
-        use darkfi_sdk::pasta::pallas;
-        use darkfi_serial::serialize;
-
-        let kp = Keypair::default();
-        let note = MoneyNote {
-            value: 100_000_000,
-            token_id: *DARK_TOKEN_ID,
-            spend_hook: FuncId::none(),
-            user_data: pallas::Base::ZERO,
-            coin_blind: Blind::from(1u64),
-            value_blind: Blind(pallas::Scalar::from(2u64)),
-            token_blind: Blind::from(3u64),
-            memo: serialize(&kp.secret),
-        };
-        let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
-        let bytes = serialize(&enc);
-        let dec = trial_decrypt_note(&bytes, &kp.secret.inner().to_repr()).expect("decrypt");
-        assert_eq!(dec.value, note.value);
-        assert_eq!(dec.token_id, note.token_id.to_bytes());
-        let derived = derived_coin_from_note(&dec, &kp.secret.inner().to_repr()).unwrap();
-        let coin = darkfi_money_contract::model::CoinAttributes {
-            public_key: kp.public,
-            value: note.value,
-            token_id: note.token_id,
-            spend_hook: note.spend_hook,
-            user_data: note.user_data,
-            blind: note.coin_blind,
-        }
-        .to_coin();
-        assert_eq!(derived, coin.to_bytes());
-    }
-
-    #[test]
-    fn test_inter_match_gap_11_blocks() {
-        // Gap of exactly 11 empty blocks between matches (100 -> 112)
-        // 112 - 100 - 1 = 11 blocks (101..=111)
-        let matches = vec![100, 112];
-        let extra = compute_supplemental_heights(0, 200, 200, &matches);
-
-        assert!(extra.contains(&101));
-        assert!(extra.contains(&111));
-        assert_eq!(extra.iter().filter(|&&h| h > 100 && h < 112).count(), 11);
-    }
-
-    #[test]
-    fn snapshot_integrity_hash_lockstep() {
-        let height = 42u32;
-        let tree = b"tree-bytes";
-        let nfs = b"nullifiers";
-        let a = snapshot_integrity_hash(height, tree, nfs);
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&height.to_le_bytes());
-        hasher.update(tree);
-        hasher.update(nfs);
-        assert_eq!(a, *hasher.finalize().as_bytes());
-        assert!(
-            snapshot_integrity_hash(height, tree, b"").as_slice() != blake3::hash(tree).as_bytes()
-        );
-    }
-
-    #[test]
-    fn reorg_rewind_never_exceeds_tip_even_when_tip_below_birthday() {
-        assert_eq!(reorg_rewind_height(0), 0);
-        assert_eq!(reorg_rewind_height(1), 0);
-        assert_eq!(reorg_rewind_height(50), 49);
-        // Must never be pushed back up above tip_height when birthday = 100 > tip_height = 50.
-        assert!(reorg_rewind_height(50) < 50);
-    }
-
-    #[test]
-    fn redact_sync_error_strips_onion_ipv6_and_hostport() {
-        let onion =
-            "dial failed to abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv.onion:9067";
-        let r_onion = redact_sync_error(onion);
-        assert!(!r_onion.contains(".onion"));
-        assert!(r_onion.contains("[redacted-onion]"));
-
-        let v6 = "connect [2001:db8::1]:9067 refused";
-        let r_v6 = redact_sync_error(v6);
-        assert!(!r_v6.contains("2001:db8"));
-        assert!(r_v6.contains("[redacted-addr]"));
-
-        let hp = "connect lwd.darkfi.example:9067 reset";
-        let r_hp = redact_sync_error(hp);
-        assert!(!r_hp.contains("lwd.darkfi.example"));
-        assert!(r_hp.contains("[redacted-addr]"));
-    }
-
-    #[test]
-    fn batch_open_and_trial_decrypt_multi_output_and_extra_token_mint_no_collision() {
-        use darkfi_money_contract::client::MoneyNote;
-        use darkfi_money_contract::model::{CoinAttributes, DARK_TOKEN_ID};
-        use darkfi_sdk::crypto::note::AeadEncryptedNote;
-        use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
-        use darkfi_sdk::crypto::{Blind, FuncId, Keypair};
-        use darkfi_sdk::pasta::pallas;
-        use darkfi_serial::serialize;
-
-        let kp = Keypair::random(&mut rand_core::OsRng);
-        let sk_bytes = kp.secret.inner().to_repr().to_vec();
-        let mk_out = |val: u64, memo: Vec<u8>| {
-            let cb = Blind::random(&mut rand_core::OsRng);
-            let note = MoneyNote {
-                value: val,
-                token_id: *DARK_TOKEN_ID,
-                spend_hook: FuncId::none(),
-                user_data: pallas::Base::ZERO,
-                coin_blind: cb,
-                value_blind: Blind::random(&mut rand_core::OsRng),
-                token_blind: Blind::random(&mut rand_core::OsRng),
-                memo,
-            };
-            let coin = CoinAttributes {
-                public_key: kp.public,
-                value: val,
-                token_id: *DARK_TOKEN_ID,
-                spend_hook: FuncId::none(),
-                user_data: pallas::Base::ZERO,
-                blind: cb,
-            }
-            .to_coin();
-            let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
-            crate::client::proto::CompactOutput {
-                coin: coin.to_bytes().to_vec(),
-                encrypted_note: serialize(&enc),
-                value_commit: Vec::new(),
-                token_commit: Vec::new(),
-                omr_clue: Vec::new(),
-                omr_metadata_enc: Vec::new(),
-                func_code: 0,
-            }
-        };
-
-        let tx_hash = vec![0x42u8; 32];
-        let out0 = mk_out(300, b"part1".to_vec());
-        let out1 = mk_out(450, Vec::new());
-        let out_mint_extra = mk_out(250, Vec::new());
-
-        // Block 0: normal compact block with 2 outputs for our wallet.
-        let main_block = crate::client::proto::CompactBlock {
-            height: 77,
-            hash: vec![0x01; 32],
-            prev_hash: vec![0x00; 32],
-            timestamp: 1,
-            txs: vec![crate::client::proto::CompactTx {
-                tx_hash: tx_hash.clone(),
-                outputs: vec![out0.clone(), out1],
-                nullifiers: Vec::new(),
-                fee: 0,
-            }],
-        };
-        // Extra TOKEN_MINT block at the SAME height and SAME tx_hash with synthetic idx=0:
-        // contains both a duplicate of out0 and a distinct extra output out_mint_extra!
-        let extra_raw = vec![crate::client::proto::CompactBlock {
-            height: 77,
-            hash: vec![0x01; 32],
-            prev_hash: vec![0x00; 32],
-            timestamp: 1,
-            txs: vec![crate::client::proto::CompactTx {
-                tx_hash: tx_hash.clone(),
-                outputs: vec![out0, out_mint_extra],
-                nullifiers: Vec::new(),
-                fee: 0,
-            }],
-        }];
-        let mut combined = vec![main_block];
-        let extra_deduped = dedup_extra_blocks_against_window(&combined, extra_raw);
-        assert_eq!(extra_deduped.len(), 1);
-        assert_eq!(extra_deduped[0].txs[0].outputs.len(), 1);
-        combined.extend(extra_deduped);
-
-        let db = WalletDb::in_memory().unwrap();
-        let engine = SyncEngine::new(
-            db,
-            "http://127.0.0.1:9067",
-            vec![sk_bytes],
-            None,
-            0x01,
-            false,
-            false,
-            None,
-            false,
-        );
-        let found = engine.trial_decrypt_blocks(&combined).unwrap();
-        assert_eq!(
-            found, 3,
-            "all 3 distinct outputs must be stored without synthetic idx=0 collision"
-        );
-        assert_eq!(engine.db.confirmed_balance("DRK").unwrap(), 1000);
-        let tx_row = engine
-            .db
-            .get_transaction(&hex::encode(&tx_hash))
-            .unwrap()
-            .expect("incoming tx row must exist");
-        assert_eq!(
-            tx_row.value_raw, 1000,
-            "multi-output incoming tx must sum all 3 outputs"
-        );
-    }
-
-    #[test]
-    fn batch_open_blocks_enforces_trailing_byte_check_and_falls_back() {
-        use darkfi_money_contract::client::MoneyNote;
-        use darkfi_money_contract::model::{CoinAttributes, DARK_TOKEN_ID};
-        use darkfi_sdk::crypto::note::AeadEncryptedNote;
-        use darkfi_sdk::crypto::pasta_prelude::{Field, PrimeField};
-        use darkfi_sdk::crypto::{Blind, FuncId, Keypair};
-        use darkfi_sdk::pasta::pallas;
-        use darkfi_serial::serialize;
-
-        let kp = Keypair::random(&mut rand_core::OsRng);
-        let sk_bytes = kp.secret.inner().to_repr().to_vec();
-        let cb = Blind::random(&mut rand_core::OsRng);
-        let note = MoneyNote {
-            value: 123_456,
-            token_id: *DARK_TOKEN_ID,
-            spend_hook: FuncId::none(),
-            user_data: pallas::Base::ZERO,
-            coin_blind: cb,
-            value_blind: Blind::random(&mut rand_core::OsRng),
-            token_blind: Blind::random(&mut rand_core::OsRng),
-            memo: Vec::new(),
-        };
-        let coin = CoinAttributes {
-            public_key: kp.public,
-            value: 123_456,
-            token_id: *DARK_TOKEN_ID,
-            spend_hook: FuncId::none(),
-            user_data: pallas::Base::ZERO,
-            blind: cb,
-        }
-        .to_coin();
-        let enc = AeadEncryptedNote::encrypt(&note, &kp.public, &mut rand_core::OsRng).unwrap();
-        // Raw (ephem_pk || ciphertext) encoding without VarInt length prefix — only
-        // handled by fallback `aead_note_candidates`, NOT `AeadEncryptedNote::decode`!
-        let mut raw_enc = serialize(&enc.ephem_public);
-        raw_enc.extend_from_slice(&enc.ciphertext);
-
-        let block = crate::client::proto::CompactBlock {
-            height: 10,
-            hash: vec![0x02; 32],
-            prev_hash: vec![0x01; 32],
-            timestamp: 1,
-            txs: vec![crate::client::proto::CompactTx {
-                tx_hash: vec![0x99; 32],
-                outputs: vec![crate::client::proto::CompactOutput {
-                    coin: coin.to_bytes().to_vec(),
-                    encrypted_note: raw_enc,
-                    value_commit: Vec::new(),
-                    token_commit: Vec::new(),
-                    omr_clue: Vec::new(),
-                    omr_metadata_enc: Vec::new(),
-                    func_code: 0,
-                }],
-                nullifiers: Vec::new(),
-                fee: 0,
-            }],
-        };
-
-        let hits = batch_open_blocks(&[sk_bytes], &[block]);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits.get(&(0, 0, 0)).unwrap().0.value, 123_456);
     }
 }

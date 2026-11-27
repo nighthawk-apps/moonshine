@@ -125,14 +125,11 @@ impl Config {
         }
     }
 
-    /// Save the configuration to the config path.
+    /// Save the configuration to the config path atomically with mode 0600.
     pub fn save(&self) -> Result<(), Box<dyn Error>> {
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let serialized = toml::to_string_pretty(self)?;
-        fs::write(path, serialized)?;
+        crate::secret_wrap::write_mode_0600_overwrite(&path, serialized.as_bytes())?;
         Ok(())
     }
 }

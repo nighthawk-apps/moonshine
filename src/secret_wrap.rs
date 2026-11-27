@@ -116,7 +116,7 @@ pub fn heuristic_pass_kdf(pass: &str) -> PassKdf {
 pub fn resolve_pass_kdf(pass: &str, recorded: Option<&[u8]>) -> Result<PassKdf, String> {
     match recorded {
         None => Ok(heuristic_pass_kdf(pass)),
-        Some(bytes) if bytes.is_empty() => Ok(heuristic_pass_kdf(pass)),
+        Some([]) => Ok(heuristic_pass_kdf(pass)),
         Some(bytes) => PassKdf::from_meta(bytes),
     }
 }

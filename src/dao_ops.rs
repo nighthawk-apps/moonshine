@@ -459,6 +459,13 @@ pub async fn build_propose_builder(
         .into());
     }
 
+    // Backfill compact DAO Mint records from genesis for birthday wallets before
+    // building the global DAO Merkle tree.
+    let info = client.get_light_info().await?;
+    let tip = info.block_height;
+    let block_target = info.block_target.max(1);
+    ensure_dao_calls_backfilled(db, client, tip).await?;
+
     // Reconstruct the DAO Merkle tree from synced compact DAO Mint records.
     let (daos_tree, dao_leaf_position) = build_daos_merkle_tree(db, &dao_bulla)?;
     let dao_merkle_root = daos_tree
@@ -467,10 +474,6 @@ pub async fn build_propose_builder(
     let dao_merkle_path = daos_tree
         .witness(dao_leaf_position, 0)
         .map_err(|_| "DAO Merkle witness missing — sync and rebuild DAO state")?;
-
-    let info = client.get_light_info().await?;
-    let tip = info.block_height;
-    let block_target = info.block_target.max(1);
 
     let money_tree = load_tip_money_tree(db)?;
     let money_merkle_coin_root = money_tree
@@ -632,7 +635,9 @@ pub async fn build_vote_builder(
         return Err("Proposal voting window has already closed".into());
     }
 
-    let snap_height = mint_height.map(|h| h.min(tip)).unwrap_or(tip);
+    let mint_h = mint_height
+        .ok_or("Proposal mint height is not confirmed yet — run `moonshine sync` before voting")?;
+    let snap_height = mint_h.saturating_sub(1).min(tip);
 
     // Check prior votes for duplicate vote nullifiers if we hold the votes secret key.
     let mut prior_vote_nullifiers: HashSet<[u8; 32]> = HashSet::new();
@@ -654,19 +659,10 @@ pub async fn build_vote_builder(
     }
     let owned_cm: HashSet<[u8; 32]> = gov_coins.iter().map(|c| c.coin.to_bytes()).collect();
 
-    let (snapshot_tree, money_null_smt) = if snap_height == tip {
-        (
-            load_tip_money_tree(db)?,
-            build_money_nullifier_smt(client, tip, tip).await?,
-        )
-    } else {
-        // Proposal snapshots Money before/at block `mint_height`; use `mint_height.saturating_sub(1)`.
-        let h = snap_height.saturating_sub(1);
-        (
-            build_money_tree_at_height(client, h, tip, &owned_cm).await?,
-            build_money_nullifier_smt(client, h, tip).await?,
-        )
-    };
+    let (snapshot_tree, money_null_smt) = (
+        build_money_tree_at_height(client, snap_height, tip, &owned_cm).await?,
+        build_money_nullifier_smt(client, snap_height, tip).await?,
+    );
 
     let mut inputs = Vec::new();
     for gov in gov_coins {
@@ -1074,6 +1070,43 @@ fn resolve_proposal(
     Err(format!("DAO proposal '{b58}' not found locally or in synced dao_calls").into())
 }
 
+/// Backfill compact DAO calls from genesis (height 0) so birthday-skipped wallets
+/// observe all prior `DAO_KIND_MINT` leaves before constructing `daos_tree`.
+pub async fn ensure_dao_calls_backfilled(
+    db: &WalletDb,
+    client: &mut LightwalletClient,
+    tip: u32,
+) -> Result<(), Box<dyn Error>> {
+    use futures::StreamExt;
+    if db.get_meta("dao_calls_backfilled_genesis")?.as_deref() == Some(b"1") {
+        return Ok(());
+    }
+    let mut start = 0u32;
+    while start <= tip {
+        let end = start
+            .saturating_add(crate::sync::MAX_BLOCKS_PER_REQUEST - 1)
+            .min(tip);
+        let (pad_start, pad_end) = crate::sync::require_padded_range(start, end, tip)?;
+        let mut stream = client.get_compact_dao_calls(pad_start, pad_end).await?;
+        while let Some(call) = stream.next().await {
+            let call = call?;
+            db.insert_dao_call(
+                call.height,
+                &call.tx_hash,
+                call.kind,
+                &call.bulla,
+                &call.payload,
+            )?;
+        }
+        start = end.saturating_add(1);
+        if start == 0 {
+            break;
+        }
+    }
+    db.set_meta("dao_calls_backfilled_genesis", b"1")?;
+    Ok(())
+}
+
 /// Reconstruct the DAO Merkle tree in chain order and locate `target_dao`'s leaf position.
 pub fn build_daos_merkle_tree(
     db: &WalletDb,
@@ -1277,15 +1310,21 @@ fn decode_coin_rows(
         else {
             continue;
         };
-        let Ok(tok_raw) = hex::decode(&tok_id) else {
-            continue;
+        let token_id = if WalletDb::is_drk_token(&tok_id) {
+            *darkfi_money_contract::model::DARK_TOKEN_ID
+        } else {
+            let Ok(tok_raw) = hex::decode(&tok_id) else {
+                continue;
+            };
+            let Ok(tok_arr) = <[u8; 32]>::try_from(tok_raw.as_slice()) else {
+                continue;
+            };
+            let Ok(tid) = TokenId::from_bytes(tok_arr) else {
+                continue;
+            };
+            tid
         };
-        let Ok(tok_arr) = <[u8; 32]>::try_from(tok_raw.as_slice()) else {
-            continue;
-        };
-        let Ok(note_token_id) = TokenId::from_bytes(tok_arr) else {
-            continue;
-        };
+        let note_token_id = token_id;
         if let Some(req_tok) = token_filter {
             if note_token_id != req_tok {
                 continue;

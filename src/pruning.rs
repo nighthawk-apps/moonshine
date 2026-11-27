@@ -177,8 +177,8 @@ mod tests {
         db.mark_note_spent_at(&[2], Some(250)).unwrap();
         // Old coin spent recently (above cutoff 4000) must NOT be pruned.
         db.mark_note_spent_at(&[4], Some(4500)).unwrap();
-        // Unconfirmed broadcast reservation (spent_height IS NULL) must NOT be pruned.
-        db.reserve_note(&[5], 4999).unwrap();
+        // Unconfirmed broadcast reservation below fork point (spent_height IS NULL) must NOT be pruned.
+        db.reserve_note(&[5], 4100).unwrap();
 
         let result = prune_wallet(&db).unwrap();
         assert_eq!(result.notes_pruned, 2);

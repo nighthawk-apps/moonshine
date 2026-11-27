@@ -1,10 +1,19 @@
 # Moonshine Wallet CLI
 
-**Moonshine 3.1.23** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC. The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. Fee selection follows the shuffled change output. DarkFi pin `b87318e80`. Same release as Android/iOS 3.01.23 and desktop 3.1.23. Aligns with lightwalletd 0.3.15.
+**Moonshine 3.2.1** is a private, lightweight CLI light wallet for the **DarkFi** blockchain. It connects to **`darkfi-lightwalletd`** over gRPC using the standalone MIT [`blackhawk-unifomr`](https://github.com/nighthawk-apps/blackhawk) crate (`0.3.0`). The default sync is padded trial decryption. Experimental UnifOMR is off unless you pass `--unifomr` or set `experimental_unifomr = true`. Fee selection follows the shuffled change output. DarkFi pin `b87318e80`. Same release as Android 3.2.01 and desktop 3.2.1 (iOS 3.01.24 pending 3.2.01). Aligns with lightwalletd 0.3.15.
 
 > **Trial decryption is the default.** Payments from `drk`, Nighthawk, and Moonshine are found from the note itself. `--force-trial` still forces a full pass. `--unifomr` registers clue keys and can miss funds when the other wallet is not registered on this same lightwalletd.
 
 Unlike full nodes (`darkfid`) or the heavy CLI wallet (`drk`), Moonshine keeps a **pruned SQLite** wallet (SQLCipher + wrapped secrets) and a small on-disk footprint.
+
+## Executive Summary: Why Nighthawk Leads in Privacy
+
+Nighthawk is engineered as a full-stack private money and communications suite with zero transparent escape hatches:
+
+- **Shielded-only ZK base layer (DarkFi Halo2):** Every transfer, custom token mint/send, and DAO governance action is shielded inside Halo2 zero-knowledge proofs against the global Merkle tree. Unlike Zcash, there are no transparent `t-addr` pools, no multi-pool value splits, and no TEX-style forced deshielding; unlike Monero (pre-FCMP++), anonymity sets are not limited to finite decoy ring signatures; unlike Namada/Penumbra/Pirate Chain, full-stack privacy spans CLI, mobile, desktop, and integrated P2P chat.
+- **Network-layer privacy on by default:** Moonshine defaults to **Tor** with fail-closed leaf TLS certificate pinning and strict refusal of non-loopback cleartext HTTP, while Android and iOS default to the **Nym mixnet** (with atomic embedded Arti Tor switching and persistent Direct-disable locks).
+- **Private light-client sync:** Padded trial decryption runs by default over Tor; opt-in **UnifOMR (Param2, ePrint 2026/910) + batch PIR** uses power-of-2 padded digest windows, decoy clue directories with ≥250 ms timing padding, and fail-closed full-window streaming on PIR failures.
+- **Hardened local secrets:** Moonshine enforces Argon2id passphrase stretching (`pass_kdf`), OS-CSPRNG per-wallet wrap keys, `XChaCha20-Poly1305` secret wrapping at rest in SQLCipher, and `0600` atomic key-file handling.
 
 ## Contents
 
@@ -247,7 +256,7 @@ moonshine
 |-------------------|------|
 | `../darkfi-nighthawk-testnet` | DarkFi SDK pin `b87318e80` (symlink to `nighthawk-android-wallet/third_party/darkfi`) |
 | `../darkfi-lightwalletd` | gRPC lightwalletd + shared UnifOMR |
-| `../darkfi-mobile-ffi` | Shared UniFFI crate (Android / iOS / desktop) |
+| `../blackhawk` | Shared UniFFI + C-ABI core crate (Android / iOS / desktop) |
 | `../nighthawk-android-wallet` | Android wallet (`third_party/darkfi` = same pin) |
 | `../nighthawk-ios-wallet` | iOS wallet |
 | `../nighthawk-app-desktop` | Desktop wallet (Tauri) |

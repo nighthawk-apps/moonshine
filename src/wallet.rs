@@ -30,6 +30,7 @@ use darkfi_sdk::crypto::SecretKey;
 use std::error::Error;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
 /// Domain separation for `RegisterCluePublicKey` ownership proofs.
 /// The signed message binds the network byte and `key_version`.
@@ -292,23 +293,23 @@ impl Wallet {
 
         // Generate a new DarkFi 22-word mnemonic
         let mnemonic_engine = DarkfiMnemonic::default();
-        let phrase = mnemonic_engine
+        let mut phrase = mnemonic_engine
             .make_seed(None, None)
             .map_err(|e| format!("Failed to generate mnemonic: {e}"))?;
 
-        let words: Vec<String> = phrase.split_whitespace().map(|s| s.to_string()).collect();
+        let mut words: Vec<String> = phrase.split_whitespace().map(|s| s.to_string()).collect();
 
         // Derive the secret key (same derivation as Android/iOS)
         let secret_key = mnemonic::secret_key_from_mnemonic(&words)
             .map_err(|e| format!("Key derivation failed: {e}"))?;
 
-        let secret_bytes = secret_key.inner().to_repr();
+        let mut secret_bytes = secret_key.inner().to_repr();
 
         // Store seed hash for OMR key derivation (never store the seed/mnemonic)
         let seed_hash = blake3::hash(&secret_bytes);
         db.set_meta("seed_hash", seed_hash.as_bytes())?;
         // HD derivation seed for index >= 1 (same as mobile UniFFI) — wrapped at rest.
-        let derivation_seed = mnemonic::derivation_seed_from_mnemonic(&words);
+        let mut derivation_seed = mnemonic::derivation_seed_from_mnemonic(&words);
         db.set_wrapped_meta("derivation_seed", &derivation_seed)?;
         db.set_meta("wallet_version", &[0x02])?;
         db.set_meta("mnemonic_word_count", &[words.len() as u8])?;
@@ -340,6 +341,13 @@ impl Wallet {
         eprintln!("╚════════════════════════════════════════════════╝");
         eprintln!();
 
+        phrase.zeroize();
+        for w in &mut words {
+            w.zeroize();
+        }
+        secret_bytes.zeroize();
+        derivation_seed.zeroize();
+
         println!("Wallet '{}' created successfully.", name);
         println!("Default address: {}", public_hex);
 
@@ -370,8 +378,10 @@ impl Wallet {
 
         // Validate the mnemonic
         let engine = DarkfiMnemonic::default();
-        let phrase = mnemonic_words.join(" ");
-        if !engine.validate(&phrase) {
+        let mut phrase = mnemonic_words.join(" ");
+        let valid = engine.validate(&phrase);
+        phrase.zeroize();
+        if !valid {
             return Err("Invalid DarkFi mnemonic phrase. Check your words and try again.".into());
         }
 
@@ -379,14 +389,14 @@ impl Wallet {
         let secret_key = mnemonic::secret_key_from_mnemonic(mnemonic_words)
             .map_err(|e| format!("Key derivation failed: {e}"))?;
 
-        let secret_bytes = secret_key.inner().to_repr();
+        let mut secret_bytes = secret_key.inner().to_repr();
 
         let db = WalletDb::open(&db_path)?;
 
         // Store seed hash (same as create) + HD derivation seed for sub-addresses
         let seed_hash = blake3::hash(&secret_bytes);
         db.set_meta("seed_hash", seed_hash.as_bytes())?;
-        let derivation_seed = mnemonic::derivation_seed_from_mnemonic(mnemonic_words);
+        let mut derivation_seed = mnemonic::derivation_seed_from_mnemonic(mnemonic_words);
         db.set_wrapped_meta("derivation_seed", &derivation_seed)?;
         db.set_meta("wallet_version", &[0x02])?;
         db.set_meta("network", network.as_bytes())?;
@@ -399,6 +409,9 @@ impl Wallet {
         let public_hex = addr.to_string();
         db.insert_address(&public_hex, &secret_bytes)?;
         db.set_default_address(&public_hex)?;
+
+        secret_bytes.zeroize();
+        derivation_seed.zeroize();
 
         println!("Wallet '{}' imported successfully.", name);
         println!("Default address: {}", public_hex);
@@ -422,6 +435,35 @@ impl Wallet {
             name: name.to_string(),
             db,
         })
+    }
+
+    /// Validate a config network name (`mainnet`, `testnet`, `localnet`).
+    pub fn validate_network_name(network: &str) -> Result<String, Box<dyn Error>> {
+        let norm = network.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "mainnet" | "testnet" | "localnet" => Ok(norm),
+            _ => Err(format!(
+                "Invalid network '{network}' (expected: mainnet, testnet, or localnet)"
+            )
+            .into()),
+        }
+    }
+
+    /// Verify that an opened wallet's stored network matches the active config network.
+    pub fn ensure_network_matches(&self, config_network: &str) -> Result<(), Box<dyn Error>> {
+        let cfg = Self::validate_network_name(config_network)?;
+        if let Some(bytes) = self.db.get_meta("network")? {
+            let stored_raw = String::from_utf8_lossy(&bytes).trim().to_ascii_lowercase();
+            if !stored_raw.is_empty() && stored_raw != cfg {
+                return Err(format!(
+                    "Wallet '{}' was created for network '{}', but config network is '{}'. \
+                     Refusing to mix networks or derive mismatched addresses.",
+                    self.name, stored_raw, cfg
+                )
+                .into());
+            }
+        }
+        Ok(())
     }
 
     /// Max wallet pubkeys registered for UnifOMR clue PK (sub-address cap).
@@ -582,19 +624,23 @@ impl Wallet {
             return Err("Wallet has no primary address — recreate or re-import".into());
         }
 
-        let seed_bytes = self.db.get_wrapped_meta("derivation_seed")?.ok_or(
+        let mut seed_bytes = self.db.get_wrapped_meta("derivation_seed")?.ok_or(
             "Wallet derivation_seed missing — re-import the mnemonic to enable \
                  mobile-compatible sub-addresses",
         )?;
         if seed_bytes.len() < 32 {
+            seed_bytes.zeroize();
             return Err("Wallet derivation_seed too short".into());
         }
         let mut seed32 = [0u8; 32];
         seed32.copy_from_slice(&seed_bytes[..32]);
+        seed_bytes.zeroize();
 
         let sk = mnemonic::secret_key_from_seed_index(&seed32, index)
-            .map_err(|e| format!("HD address derivation failed: {e}"))?;
-        let secret_bytes = sk.inner().to_repr();
+            .map_err(|e| format!("HD address derivation failed: {e}"));
+        seed32.zeroize();
+        let sk = sk?;
+        let mut secret_bytes = sk.inner().to_repr();
         let public_key = darkfi_sdk::crypto::PublicKey::from_secret(sk);
         let addr = Address::Standard(StandardAddress::from_public(
             self.stored_network(),
@@ -602,7 +648,9 @@ impl Wallet {
         ));
         let public_hex = addr.to_string();
 
-        self.db.insert_address(&public_hex, &secret_bytes)?;
+        let res = self.db.insert_address(&public_hex, &secret_bytes);
+        secret_bytes.zeroize();
+        res?;
         println!("New address: {}", public_hex);
         Ok(public_hex)
     }

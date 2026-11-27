@@ -85,22 +85,25 @@ pub(crate) fn check_checkpoint_chunk_budget(
     Ok(())
 }
 
-/// Exact-host loopback check. `https://localhost.evil.com` is remote.
+/// Exact-host loopback check using RFC 3986 URI authority parsing.
+/// Rejects userinfo (`@`), query tricks (`?@localhost`), and subdomain lookalikes.
 pub fn host_is_loopback(server_url: &str) -> bool {
-    let rest = server_url.split("://").nth(1).unwrap_or(server_url);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let hostport = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
-    let host = if let Some(inside) = hostport.strip_prefix('[') {
-        inside.split(']').next().unwrap_or(inside)
-    } else {
-        hostport
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(hostport)
+    let Ok(uri) = server_url.trim().parse::<tonic::transport::Uri>() else {
+        return false;
     };
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let Some(raw_host) = uri.host() else {
+        return false;
+    };
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw_host);
     matches!(host, "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1")
         || host.eq_ignore_ascii_case("localhost")
 }
@@ -287,7 +290,11 @@ impl LightwalletClient {
             return Ok(());
         }
 
-        let is_https = self.server_url.starts_with("https://");
+        let parsed_uri = self.server_url.trim().parse::<tonic::transport::Uri>().ok();
+        let is_https = parsed_uri
+            .as_ref()
+            .and_then(|u| u.scheme_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"));
 
         // S8: Enforce TLS for non-localhost connections
         if !self.is_localhost() {
@@ -343,11 +350,13 @@ impl LightwalletClient {
         let connector = tower::service_fn(move |dst: tonic::transport::Uri| {
             let pin_hash = pin_hash;
             async move {
-                let host = dst
-                    .host()
-                    .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing host")
-                    })?
+                let raw_host = dst.host().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing host")
+                })?;
+                let host = raw_host
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(raw_host)
                     .to_string();
                 let port = dst.port_u16().unwrap_or(443);
 
@@ -359,8 +368,7 @@ impl LightwalletClient {
                     })?;
                     Box::new(stream)
                 } else {
-                    let addr = format!("{host}:{port}");
-                    Box::new(tokio::net::TcpStream::connect(addr).await?)
+                    Box::new(tokio::net::TcpStream::connect((host.as_str(), port)).await?)
                 };
 
                 let verifier = Arc::new(PinnedVerifier {
@@ -552,7 +560,12 @@ impl LightwalletClient {
         tx_hash: &[u8],
     ) -> Result<(), Box<dyn Error>> {
         let mut last_err = "transaction not found in lightwalletd mempool".to_string();
-        for (attempt, delay_ms) in [0u64, 400, 800, 1200].into_iter().enumerate() {
+        let delays: &[u64] = if self.use_tor && !self.is_localhost() {
+            &[0, 500, 1000, 2000, 3000, 4000]
+        } else {
+            &[0, 400, 800, 1200]
+        };
+        for (attempt, &delay_ms) in delays.iter().enumerate() {
             if attempt > 0 && delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
@@ -874,8 +887,15 @@ mod tests {
         assert!(host_is_loopback("http://127.0.0.1:9067"));
         assert!(host_is_loopback("http://localhost:9067"));
         assert!(host_is_loopback("http://[::1]:9067"));
+        assert!(host_is_loopback("https://[::1]:9067"));
+        assert!(!host_is_loopback("http://evil.com?@localhost"));
+        assert!(!host_is_loopback("http://evil.com#@localhost"));
+        assert!(!host_is_loopback("http://localhost@evil.com:9067"));
         assert!(!host_is_loopback("https://localhost.evil.com:443"));
         assert!(!host_is_loopback("https://lwd.example:9067"));
+
+        let ipv6_sni: Result<rustls::pki_types::ServerName<'_>, _> = "::1".try_into();
+        assert!(ipv6_sni.is_ok());
     }
 
     #[test]

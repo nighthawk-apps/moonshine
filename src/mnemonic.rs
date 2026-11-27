@@ -18,7 +18,7 @@
 
 //! DarkFi-compatible 22-word mnemonic generation and key derivation.
 //!
-//! This module is a direct port of the mnemonic engine from `darkfi-mobile-ffi`.
+//! This module is a direct port of the mnemonic engine from `blackhawk`.
 //! It produces the **exact same** 22-word seed phrases and derives the **exact
 //! same** secret keys, ensuring wallets created in Moonshine are compatible with
 //! the Android/iOS apps and vice versa.
@@ -48,8 +48,9 @@ use pbkdf2::pbkdf2;
 use sha2::Sha512;
 use thiserror::Error;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+use zeroize::Zeroize;
 
-/// Blake3 KDF context — must match `darkfi-mobile-ffi/src/mnemonic.rs`
+/// Blake3 KDF context — must match `blackhawk/crates/blackhawk/src/mnemonic.rs`
 const DERIVE_CONTEXT: &str = "nighthawk-drk-v1";
 
 /// 32-byte HD derivation seed from mnemonic — same as mobile FFI.
@@ -58,8 +59,10 @@ pub fn derivation_seed_from_mnemonic(mnemonic: &[String]) -> [u8; 32] {
     hasher.update(DERIVE_CONTEXT.as_bytes());
     hasher.update(&[0]);
     for word in mnemonic {
-        hasher.update(normalize_text(word).as_bytes());
+        let mut normalized = normalize_text(word);
+        hasher.update(normalized.as_bytes());
         hasher.update(&[0]);
+        normalized.zeroize();
     }
     *hasher.finalize().as_bytes()
 }
@@ -74,19 +77,19 @@ pub fn secret_key_from_mnemonic(mnemonic: &[String]) -> Result<SecretKey, String
         let mut bytes = seed_bytes;
         bytes[31] ^= counter;
         if let Ok(key) = SecretKey::from_bytes(bytes) {
-            bytes.fill(0);
-            seed_bytes.fill(0);
+            bytes.zeroize();
+            seed_bytes.zeroize();
             return Ok(key);
         }
-        bytes.fill(0);
+        bytes.zeroize();
     }
-    seed_bytes.fill(0);
+    seed_bytes.zeroize();
 
     Err("could not derive canonical SecretKey from mnemonic".into())
 }
 
 /// Derive a [`SecretKey`] from a persisted 32-byte seed and address index.
-/// Must match `darkfi-mobile-ffi` `secret_key_from_seed_index` for `index >= 1`.
+/// Must match `blackhawk` `secret_key_from_seed_index` for `index >= 1`.
 pub fn secret_key_from_seed_index(seed32: &[u8; 32], index: u32) -> Result<SecretKey, String> {
     let mut hasher = blake3::Hasher::new_derive_key(DERIVE_CONTEXT);
     hasher.update(seed32);
@@ -97,13 +100,13 @@ pub fn secret_key_from_seed_index(seed32: &[u8; 32], index: u32) -> Result<Secre
         let mut bytes = seed_bytes;
         bytes[31] ^= counter;
         if let Ok(key) = SecretKey::from_bytes(bytes) {
-            bytes.fill(0);
-            seed_bytes.fill(0);
+            bytes.zeroize();
+            seed_bytes.zeroize();
             return Ok(key);
         }
-        bytes.fill(0);
+        bytes.zeroize();
     }
-    seed_bytes.fill(0);
+    seed_bytes.zeroize();
     Err("could not derive canonical SecretKey from seed index".into())
 }
 

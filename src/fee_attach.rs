@@ -70,8 +70,7 @@ pub async fn finish_with_native_fee(
             &spent_nullifiers,
             fee,
             change_output_idx,
-        )?
-    {
+        )? {
         (coin, local_tree, true)
     } else {
         let coin = fee_coin
@@ -445,23 +444,23 @@ mod tests {
         .is_none());
 
         // Single memoized payment output must not be selected, even when tagged.
-        assert!(
-            select_tx_local_fee_candidate(&[pay0.clone()], &[kp.secret], &[], 5_000_000, Some(0))
-                .is_none()
-        );
+        assert!(select_tx_local_fee_candidate(
+            std::slice::from_ref(&pay0),
+            &[kp.secret],
+            &[],
+            5_000_000,
+            Some(0)
+        )
+        .is_none());
         assert!(
             select_tx_local_fee_candidate(&[pay0], &[kp.secret], &[], 5_000_000, None).is_none()
         );
 
         // Hooked and non-DRK change outputs stay ineligible.
-        assert!(select_tx_local_fee_candidate(
-            &[hooked1],
-            &[kp.secret],
-            &[],
-            5_000_000,
-            Some(0),
-        )
-        .is_none());
+        assert!(
+            select_tx_local_fee_candidate(&[hooked1], &[kp.secret], &[], 5_000_000, Some(0),)
+                .is_none()
+        );
         let foreign = mk_out_token(
             &kp,
             15_000_000,
@@ -469,14 +468,10 @@ mod tests {
             FuncId::none(),
             vec![],
         );
-        assert!(select_tx_local_fee_candidate(
-            &[foreign],
-            &[kp.secret],
-            &[],
-            5_000_000,
-            Some(0),
-        )
-        .is_none());
+        assert!(
+            select_tx_local_fee_candidate(&[foreign], &[kp.secret], &[], 5_000_000, Some(0),)
+                .is_none()
+        );
 
         // Already-spent change is not reused as the fee.
         let spent_change = mk_out(&kp, 15_000_000, FuncId::none(), vec![]);

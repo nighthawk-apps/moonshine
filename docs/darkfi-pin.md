@@ -1,7 +1,7 @@
 # DarkFi revision pin (Moonshine)
 
 Moonshine path-depends on sibling `../darkfi-nighthawk-testnet` (directory name is
-literal) and `../darkfi-lightwalletd`. A checkout named `darkfi` on master will not
+literal) and `../darkfi-lightwalletd` (which path-depends on `../blackhawk/crates/blackhawk-unifomr` when `fhe-omr` is enabled). A checkout named `darkfi` on master will not
 resolve. Reuse the Android pin:
 
 ```bash

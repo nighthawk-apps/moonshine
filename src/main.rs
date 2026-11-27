@@ -273,6 +273,9 @@ enum TxSubcommand {
     },
     Broadcast {
         hex: String,
+        /// Recipient DarkFi address (when broadcasting under experimental UnifOMR with clue).
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Decode a serialized tx (hex file or `$TMPDIR/moonshine-last-tx.hex`).
     Inspect {
@@ -363,11 +366,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
             WalletSubcommand::Export { show_secret, out } => {
-                let plan = plan_detection_key_export(
-                    show_secret,
-                    std::io::stdout().is_terminal(),
-                    out,
-                )?;
+                let plan =
+                    plan_detection_key_export(show_secret, std::io::stdout().is_terminal(), out)?;
                 let w = wallet::Wallet::open(&args.wallet_name)?;
                 let dk = w.derive_unifomr_detection_key(&config.network)?;
                 match plan {
@@ -425,6 +425,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 AddressSubcommand::New => {
+                    w.ensure_network_matches(&config.network)?;
                     w.generate_address()?;
                 }
                 AddressSubcommand::Default => match w.db.get_default_address()? {
@@ -470,6 +471,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Balance => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             let balances = w.db.list_token_balances()?;
             if balances.is_empty() {
                 println!("Balance: 0 DRK (0 atomic units)");
@@ -498,6 +500,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Coins { sub } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             match sub {
                 CoinsSubcommand::List => {
                     let unspent = w.db.list_unspent()?;
@@ -532,6 +535,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             } => {
                 tx_status::begin("send", "build");
                 let w = wallet::Wallet::open(&args.wallet_name)?;
+                w.ensure_network_matches(&config.network)?;
 
                 // Validate recipient as a DarkFi Address (base58 with checksum) and check network.
                 let recipient_addr = match darkfi_sdk::crypto::keypair::Address::from_str(&to) {
@@ -714,7 +718,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     if fee_atomic > 0 {
                         let drk_ok = unspent.iter().any(|(_, _, val, tok_id)| {
                             u64::try_from(*val).is_ok_and(|v| {
-                                crate::db::WalletDb::is_drk_token(tok_id) && v >= fee_atomic
+                                crate::db::WalletDb::is_drk_token(tok_id) && v > fee_atomic
                             })
                         });
                         if !drk_ok {
@@ -869,7 +873,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         true,
                         None,
                         config.use_tor,
-                    );
+                    )
+                    .with_network(&config.network);
                     engine
                         .rebuild_money_tree_from_genesis()
                         .await
@@ -941,16 +946,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     else {
                         continue;
                     };
-                    let Ok(tok_raw) = hex::decode(&tok_id) else {
-                        continue;
-                    };
-                    let Ok(tok_arr) = <[u8; 32]>::try_from(tok_raw.as_slice()) else {
-                        continue;
-                    };
-                    let Ok(note_token_id) =
-                        darkfi_money_contract::model::TokenId::from_bytes(tok_arr)
-                    else {
-                        continue;
+                    let note_token_id = if crate::db::WalletDb::is_drk_token(&tok_id) {
+                        *darkfi_money_contract::model::DARK_TOKEN_ID
+                    } else {
+                        let Ok(tok_raw) = hex::decode(&tok_id) else {
+                            continue;
+                        };
+                        let Ok(tok_arr) = <[u8; 32]>::try_from(tok_raw.as_slice()) else {
+                            continue;
+                        };
+                        let Ok(tid) = darkfi_money_contract::model::TokenId::from_bytes(tok_arr)
+                        else {
+                            continue;
+                        };
+                        tid
                     };
                     let mut hook_bytes = [0u8; 32];
                     if hook.len() == 32 {
@@ -1190,6 +1199,39 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 )
                                 .into());
                             }
+                            // Transaction was accepted by darkfid; reserve inputs and record history
+                            // immediately so a clue warning or slow mempool poll cannot double-spend.
+                            let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
+                            let mut marked = 0usize;
+                            for nf in &built.spent_nullifiers {
+                                marked += w.db.reserve_note(nf, reserved_at).unwrap_or(0);
+                            }
+                            for commit in &built.spent_commitments {
+                                marked +=
+                                    w.db.reserve_note_by_commitment(commit, reserved_at)
+                                        .unwrap_or(0);
+                            }
+                            if marked == 0 {
+                                eprintln!(
+                                    "Warning: broadcast OK but no local notes marked spent — \
+                                     refuse a second send until sync marks nullifiers."
+                                );
+                            } else {
+                                println!(
+                                    "Reserved {marked} local note update(s) so the next send cannot double-spend."
+                                );
+                            }
+                            if let Err(e) = w.db.insert_transaction(
+                                &tx_hash,
+                                0, // block height unknown until confirmed
+                                "outgoing",
+                                amount_atomic as i64,
+                                &token,
+                                Some(&to), // counterparty = recipient
+                                memo.as_deref(),
+                            ) {
+                                eprintln!("Warning: failed to record transaction locally: {}", e);
+                            }
                             if !omr_clue.is_empty() && !resp.clue_accepted {
                                 eprintln!("TX hex written to {}", last_tx_path.display());
                                 return Err(
@@ -1235,38 +1277,6 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 println!(
                                     "UnifOMR clue hint stored (24h TTL) — confirm while LWD indexes."
                                 );
-                            }
-                            let reserved_at = w.db.get_sync_state().map(|(h, _)| h).unwrap_or(0);
-                            let mut marked = 0usize;
-                            for nf in &built.spent_nullifiers {
-                                marked += w.db.reserve_note(nf, reserved_at).unwrap_or(0);
-                            }
-                            for commit in &built.spent_commitments {
-                                marked +=
-                                    w.db.reserve_note_by_commitment(commit, reserved_at)
-                                        .unwrap_or(0);
-                            }
-                            if marked == 0 {
-                                eprintln!(
-                                    "Warning: broadcast OK but no local notes marked spent — \
-                                     refuse a second send until sync marks nullifiers."
-                                );
-                            } else {
-                                println!(
-                                    "Reserved {marked} local note update(s) so the next send cannot double-spend."
-                                );
-                            }
-                            // Record sent transaction in wallet DB only after confirmed broadcast.
-                            if let Err(e) = w.db.insert_transaction(
-                                &tx_hash,
-                                0, // block height unknown until confirmed
-                                "outgoing",
-                                amount_atomic as i64,
-                                &token,
-                                Some(&to), // counterparty = recipient
-                                memo.as_deref(),
-                            ) {
-                                eprintln!("Warning: failed to record transaction locally: {}", e);
                             }
                         }
                         Err(e) => {
@@ -1367,7 +1377,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            TxSubcommand::Broadcast { hex } => {
+            TxSubcommand::Broadcast { hex, to } => {
                 tx_status::begin("broadcast", "build");
                 let mut client = client::LightwalletClient::new(
                     &config.server_url,
@@ -1395,7 +1405,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
                 let maybe_wallet =
                     if std::path::Path::new(&wallet::Wallet::db_path(&args.wallet_name)).exists() {
-                        Some(wallet::Wallet::open(&args.wallet_name)?)
+                        let w = wallet::Wallet::open(&args.wallet_name)?;
+                        w.ensure_network_matches(&config.network)?;
+                        Some(w)
                     } else {
                         None
                     };
@@ -1431,52 +1443,48 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
                 let omr_clue = if !config.experimental_unifomr {
                     Vec::new()
-                } else {
-                    match parse_stub_recipient_pubkey(&raw_tx) {
-                        Some(recipient_pk) => {
-                            if maybe_wallet.is_none() {
-                                let _ = wallet::Wallet::open(&args.wallet_name)?;
-                            }
-                            match client.get_clue_public_key(recipient_pk.to_vec()).await {
-                                Ok(resp) => {
-                                    let network_byte =
-                                        wallet::Wallet::network_byte(&config.network);
-                                    match verified_unifomr_clue(
-                                        network_byte,
-                                        &recipient_pk,
-                                        &resp,
-                                        &preflight_info.directory_attest_pubkey,
-                                    ) {
-                                        Ok(clue) => {
-                                            println!(
-                                                "UnifOMR clue from verified directory PK ({} bytes)",
-                                                clue.len()
-                                            );
-                                            clue
-                                        }
-                                        Err(e) => {
-                                            tx_status::phase("broadcast");
-                                            tx_status::emit(
-                                                "broadcast",
-                                                "broadcast",
-                                                "fail",
-                                                "failed",
-                                                "",
-                                                None,
-                                                "",
-                                                None,
-                                                "",
-                                                &e,
-                                            );
-                                            return Err(format!(
-                                                "UnifOMR clue rejected ({e}). No PerfOMR fallback."
-                                            )
-                                            .into());
-                                        }
-                                    }
+                } else if let Some(ref to_addr) = to {
+                    let recipient_addr = darkfi_sdk::crypto::keypair::Address::from_str(to_addr)
+                        .map_err(|e| format!("Invalid DarkFi address '{to_addr}': {e}"))?;
+                    let expected_net = wallet::Wallet::sdk_network(&config.network);
+                    if recipient_addr.network() != expected_net {
+                        return Err(format!(
+                            "Recipient address network ({:?}) does not match configured network '{}' ({:?}).",
+                            recipient_addr.network(),
+                            config.network,
+                            expected_net
+                        )
+                        .into());
+                    }
+                    let recipient_pk: [u8; 32] = recipient_addr
+                        .public_key()
+                        .to_bytes()
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| "recipient public key must be 32 bytes")?;
+                    // Isolate Tor circuit between GetCluePublicKey and SendTransaction.
+                    let mut clue_client = client::LightwalletClient::new(
+                        &config.server_url,
+                        config.tls_pin_sha256.clone(),
+                    )
+                    .with_tor(config.use_tor);
+                    match clue_client.get_clue_public_key(recipient_pk.to_vec()).await {
+                        Ok(resp) => {
+                            let network_byte = wallet::Wallet::network_byte(&config.network);
+                            match verified_unifomr_clue(
+                                network_byte,
+                                &recipient_pk,
+                                &resp,
+                                &preflight_info.directory_attest_pubkey,
+                            ) {
+                                Ok(clue) => {
+                                    println!(
+                                        "UnifOMR clue from verified directory PK ({} bytes)",
+                                        clue.len()
+                                    );
+                                    clue
                                 }
                                 Err(e) => {
-                                    let reason = sync::redact_sync_error(&e.to_string());
                                     tx_status::phase("broadcast");
                                     tx_status::emit(
                                         "broadcast",
@@ -1488,19 +1496,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                         "",
                                         None,
                                         "",
-                                        &reason,
+                                        &e,
                                     );
-                                    return Err(
-                                        format!("UnifOMR clue PK lookup failed: {reason}").into()
-                                    );
+                                    return Err(format!(
+                                        "UnifOMR clue rejected ({e}). No PerfOMR fallback."
+                                    )
+                                    .into());
                                 }
                             }
                         }
-                        None => {
-                            let reason = "could not parse recipient for UnifOMR clue; refusing broadcast without lightwalletd clue hint (24h TTL)";
+                        Err(e) => {
+                            let reason = sync::redact_sync_error(&e.to_string());
+                            tx_status::phase("broadcast");
                             tx_status::emit(
                                 "broadcast",
-                                "build",
+                                "broadcast",
                                 "fail",
                                 "failed",
                                 "",
@@ -1508,11 +1518,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 "",
                                 None,
                                 "",
-                                reason,
+                                &reason,
                             );
-                            return Err(reason.into());
+                            return Err(format!("UnifOMR clue PK lookup failed: {reason}").into());
                         }
                     }
+                } else {
+                    println!("Broadcasting raw transaction without UnifOMR clue (pass --to <addr> to attach clue).");
+                    Vec::new()
                 };
                 tx_status::phase("broadcast");
                 let tx_hash = tx_hash_hex(&raw_tx);
@@ -1643,6 +1656,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             rebuild_merkle,
         } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             let secret_keys = w.db.get_all_trial_decrypt_secrets()?;
             let network_byte = wallet::Wallet::network_byte(&config.network);
 
@@ -1657,9 +1671,30 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             println!("Syncing with lightwalletd at {}...", config.server_url);
 
+            // Always verify server proto, attestation pin, and network before
+            // publishing UnifOMR clue public keys.
+            let mut preflight_client = crate::client::LightwalletClient::new(
+                &config.server_url,
+                config.tls_pin_sha256.clone(),
+            )
+            .with_tor(config.use_tor);
+            sync::preflight_server(
+                &mut preflight_client,
+                &w.db,
+                &config.server_url,
+                &config.network,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "Lightwalletd preflight failed: {}",
+                    sync::redact_sync_error(&e.to_string())
+                )
+            })?;
+
             if strict_omr {
                 // Publish UnifOMR clue PK for every payment address (wallet-level sk_clue).
-                // Fail closed: if registration fails, senders would GetClue decoys.
+                // Fail closed: if registration fails for any address, senders would GetClue decoys.
                 let clue_pk = w
                     .unifomr_clue_public_key(&config.network)
                     .map_err(|e| format!("UnifOMR clue keypair required before sync: {e}"))?;
@@ -1684,11 +1719,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     let pk = darkfi_sdk::crypto::PublicKey::from_secret(sk).to_bytes();
                     sk_by_pk.insert(pk, sk);
                 }
-                let mut reg = crate::client::LightwalletClient::new(
-                    &config.server_url,
-                    config.tls_pin_sha256.clone(),
-                )
-                .with_tor(config.use_tor);
+                let mut reg = preflight_client;
                 let mut ok = 0usize;
                 let mut last_err: Option<String> = None;
                 let key_version = wallet::CLUE_KEY_VERSION;
@@ -1738,9 +1769,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                if ok == 0 {
+                if ok == 0 || last_err.is_some() {
                     return Err(format!(
-                        "RegisterCluePublicKey failed for all payment addresses ({}). \
+                        "RegisterCluePublicKey failed for payment address ({}). \
                      Ensure darkfi-lightwalletd with UnifOMR is reachable at {}.",
                         last_err.unwrap_or_else(|| "unknown".into()),
                         config.server_url
@@ -1753,7 +1784,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let block_cache = {
                 let cache_path =
                     format!("{}.blocks.db", wallet::Wallet::db_path(&args.wallet_name));
-                match crate::block_cache::BlockCache::open(&cache_path) {
+                match w
+                    .db
+                    .block_cache_key()
+                    .and_then(|key| crate::block_cache::BlockCache::open(&cache_path, key))
+                {
                     Ok(c) => Some(c),
                     Err(e) => {
                         tracing::warn!("block cache open failed ({e}); continuing without cache");
@@ -1772,7 +1807,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 strict_omr,
                 block_cache,
                 config.use_tor,
-            );
+            )
+            .with_network(&config.network);
 
             if rebuild_merkle {
                 println!("Rebuilding Money Merkle tree from LWD GetNoteCommitments (0..=tip)...");
@@ -1881,6 +1917,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Rescan => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             let (_synced, birthday) = w.db.get_sync_state()?;
             // Rescan from the wallet birthday: clear notes + Merkle tree and reset
             // last_synced_height to 0 so initial sync installs a checkpoint <= birthday.
@@ -2186,7 +2223,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 if let Some(s) = server_url {
                     // Fail-closed: refuse remote cleartext (match mobile / client connect).
                     let loopback = client::host_is_loopback(&s);
-                    if !s.starts_with("https://") && !loopback {
+                    let is_https = s.trim().to_ascii_lowercase().starts_with("https://");
+                    if !is_https && !loopback {
                         return Err(
                             "remote cleartext server URL refused. \
                              Use https:// for remote lightwalletd, or http://127.0.0.1 / localhost."
@@ -2196,7 +2234,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     config.server_url = s;
                 }
                 if let Some(n) = network {
-                    config.network = n;
+                    config.network = wallet::Wallet::validate_network_name(&n)?;
                 }
                 if let Some(t) = use_tor {
                     config.use_tor = t;
@@ -2232,14 +2270,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Token { sub } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             ops_dispatch::run_token(&w, &config, sub).await?;
         }
         Command::Dao { sub } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             ops_dispatch::run_dao(&w, &config, sub).await?;
         }
         Command::Contract { sub } => {
             let w = wallet::Wallet::open(&args.wallet_name)?;
+            w.ensure_network_matches(&config.network)?;
             ops_dispatch::run_contract(&w, &config, sub).await?;
         }
     }
@@ -2699,22 +2740,6 @@ fn verified_unifomr_clue(
     Ok(darkfi_lightwalletd::unifomr::build_omr_clue_from_pk(&pk))
 }
 
-/// Parse recipient pubkey from the moonshine Create stub wire format:
-/// `DRK_TX_v1\0` + inputs_count(u32 LE) + recipient(32) + ...
-fn parse_stub_recipient_pubkey(raw_tx: &[u8]) -> Option<[u8; 32]> {
-    const MAGIC: &[u8] = b"DRK_TX_v1\x00";
-    if raw_tx.len() < MAGIC.len() + 4 + 32 {
-        return None;
-    }
-    if &raw_tx[..MAGIC.len()] != MAGIC {
-        return None;
-    }
-    let recipient_off = MAGIC.len() + 4;
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&raw_tx[recipient_off..recipient_off + 32]);
-    Some(pk)
-}
-
 /// Where `wallet export` may place the UnifOMR detection key.
 #[derive(Debug, PartialEq, Eq)]
 enum DetectionKeyExport {
@@ -2756,24 +2781,8 @@ fn plan_detection_key_export(
 }
 
 #[cfg(test)]
-mod stub_parse_tests {
+mod broadcast_helper_tests {
     use super::*;
-
-    #[test]
-    fn test_parse_stub_recipient() {
-        let mut tx = Vec::new();
-        tx.extend_from_slice(b"DRK_TX_v1\x00");
-        tx.extend_from_slice(&1u32.to_le_bytes());
-        let recipient = [0x42u8; 32];
-        tx.extend_from_slice(&recipient);
-        tx.extend_from_slice(&100u64.to_le_bytes());
-        assert_eq!(parse_stub_recipient_pubkey(&tx), Some(recipient));
-    }
-
-    #[test]
-    fn test_parse_stub_rejects_short() {
-        assert!(parse_stub_recipient_pubkey(b"DRK_TX_v1\x00").is_none());
-    }
 
     #[test]
     fn test_payment_index_from_self() {
