@@ -29,7 +29,7 @@ use proto::dark_fi_light_wallet_client::DarkFiLightWalletClient;
 
 /// Moonshine's lightwallet proto. Major mismatches are fatal: a 1.x server
 /// cannot parse RegisterDetectionKey, pooled digests, or ChainTip.prev_hash.
-pub const CLIENT_PROTO_VERSION: &str = "2.1.0";
+pub const CLIENT_PROTO_VERSION: &str = "2.2.0";
 
 /// True when the server version is missing or its major differs from this wallet.
 pub fn proto_major_mismatch(server: &str, client: &str) -> bool {
@@ -41,8 +41,8 @@ pub fn proto_major_mismatch(server: &str, client: &str) -> bool {
     server_major != client_major
 }
 
-/// Param2 UnifOMR detection keys are ~120 MiB on the wire (D=4096, n=1024,
-/// 3×40-bit moduli).  Keep headroom for digest responses.
+/// UnifOMR v2 Param2 detection keys are ~30.03 MiB on the wire (D=4096, n=1024,
+/// single 60-bit Q_0). Keep headroom for digest responses.
 const MAX_GRPC_MESSAGE_BYTES: usize = 160 * 1024 * 1024;
 
 /// gRPC request timeout.  Param2 det-key upload (~120 MiB) + server-side FHE
@@ -593,6 +593,7 @@ impl LightwalletClient {
         let req = proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: false,
         };
         let response = client.get_block_range(req).await?;
         Ok(response.into_inner())
@@ -656,6 +657,7 @@ impl LightwalletClient {
         let req = proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: false,
         };
         let response = client.get_note_commitments(req).await?;
         Ok(response.into_inner())
@@ -672,6 +674,7 @@ impl LightwalletClient {
         let req = proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: false,
         };
         let response = client.get_nullifiers(req).await?;
         Ok(response.into_inner())
@@ -770,12 +773,37 @@ impl LightwalletClient {
             start_height: start,
             end_height: end,
             limb_index,
+            limb_count: 1,
         };
         let response = client.fetch_pir_batch(req).await?;
         Ok(response.into_inner())
     }
 
-    /// Stream compact output bodies for a padded block range (PIR fallback).
+    /// UnifOMR Round 2 streaming PIR: evaluate `[limb_index .. limb_index + limb_count)`.
+    pub async fn fetch_pir_batch_stream(
+        &mut self,
+        query_ciphertexts: Vec<Vec<u8>>,
+        start: u32,
+        end: u32,
+        limb_index: u32,
+        limb_count: u32,
+    ) -> Result<Result<tonic::Streaming<proto::BatchPirChunk>, tonic::Status>, Box<dyn Error>> {
+        self.connect().await?;
+        let mut client = self.client.clone().unwrap();
+        let req = proto::BatchPirRequest {
+            query_ciphertexts,
+            start_height: start,
+            end_height: end,
+            limb_index,
+            limb_count,
+        };
+        match client.fetch_pir_batch_stream(req).await {
+            Ok(resp) => Ok(Ok(resp.into_inner())),
+            Err(status) => Ok(Err(status)),
+        }
+    }
+
+    /// Stream compact output bodies for a padded block range (trial decrypt / PIR fallback).
     pub async fn get_compact_output_bodies(
         &mut self,
         start: u32,
@@ -786,6 +814,7 @@ impl LightwalletClient {
         let req = proto::BlockRange {
             start_height: start,
             end_height: end,
+            omit_omr_clues: true,
         };
         let response = client.get_compact_output_bodies(req).await?;
         Ok(response.into_inner())
@@ -822,6 +851,7 @@ impl LightwalletClient {
             .get_compact_dao_calls(proto::BlockRange {
                 start_height: start,
                 end_height: end,
+                omit_omr_clues: false,
             })
             .await?;
         Ok(response.into_inner())
@@ -879,7 +909,7 @@ mod tests {
         assert!(proto_major_mismatch("", CLIENT_PROTO_VERSION));
         assert!(proto_major_mismatch("1.0.0", CLIENT_PROTO_VERSION));
         assert!(proto_major_mismatch("3.0.0", CLIENT_PROTO_VERSION));
-        assert_eq!(CLIENT_PROTO_VERSION, "2.1.0");
+        assert_eq!(CLIENT_PROTO_VERSION, "2.2.0");
     }
 
     #[test]

@@ -16,7 +16,22 @@ service DarkFiLightWallet {
 
   // Stream compact blocks in an inclusive height range [start, end].
   // The server returns blocks in ascending height order.
+  // Debugging and callers that still want fees and value commitments.
+  // Not subject to the padded-bucket rule on GetNoteCommitments.
   rpc GetBlockRange(BlockRange) returns (stream CompactBlock);
+
+  // One message per Money output in a padded block range (no nullifiers,
+  // fees, or value commitments). Same padding rule as GetNoteCommitments.
+  // Otherwise INVALID_ARGUMENT.
+  // Nullifiers stay on GetNullifiers.
+  rpc GetCompactOutputBodies(BlockRange) returns (stream CompactOutputBody);
+
+  // Money outputs whose func_code matches. Used for token mints, which carry
+  // no UnifOMR clue and are otherwise invisible to a strict scan.
+  rpc GetCompactOutputsByFunc(FuncBlockRange) returns (stream CompactOutputBody);
+
+  // DAO mint, propose, vote, exec, and auth-transfer params with proofs removed.
+  rpc GetCompactDaoCalls(BlockRange) returns (stream CompactDaoCall);
 
   // Get a single compact block by height.
   rpc GetBlock(BlockHeight) returns (CompactBlock);
@@ -29,10 +44,10 @@ service DarkFiLightWallet {
   // Get the current chain tip height and hash.
   rpc GetChainTip(Empty) returns (ChainTip);
 
-  // Wake on a new chain tip. The server sends ChainTip (not a compact block)
-  // when the poller watch fires. A slow client is not dropped; the next tip
-  // it reads is compared to the last applied height and any gap is filled by
-  // the normal padded sync.
+  // Subscribe to chain tips. The server streams ChainTip when the poller
+  // watch fires, not compact blocks. A slow client is left connected: an
+  // unsent tip is skipped and the next tip the client reads covers the gap.
+  // prev_hash lets the client see a rewind without a second RPC.
   rpc SubscribeBlocks(Empty) returns (stream ChainTip);
 
   // === Transactions ===
@@ -45,30 +60,27 @@ service DarkFiLightWallet {
   // Client streams the detection key(s) in ~1 MiB chunks, avoiding the need
   // for a 160 MiB single-message gRPC limit.
   // The first message MUST be a DetectionKeyChunk with header fields set.
-  // Kept for the first cycle of a process and for a server that has lost a
-  // pooled handle (NOT_FOUND → RegisterDetectionKey again).
+  // Kept for clients that have not registered a pooled handle.
   rpc GetUnifOmrDigest(stream DetectionKeyChunk) returns (OmrDigestResponse);
 
-  // Upload a detection key once per client process. The first chunk still
-  // carries num_keys. start_height / end_height on the chunks are ignored;
-  // the range belongs on PoolDigestRequest. Do not log the returned handle.
+  // Upload a detection key once and receive a server-chosen handle.
+  // Reuses DetectionKeyChunk. start_height and end_height on the chunks are
+  // ignored; the digest range is PoolDigestRequest. The handle expires 24h
+  // after registration. NOT_FOUND from GetUnifOmrDigestFromPool means
+  // register again.
   rpc RegisterDetectionKey(stream DetectionKeyChunk) returns (DetectionKeyHandle);
 
-  // Evaluate a previously registered detection key over a padded height window.
+  // Digest for a previously registered detection key. Same evaluator and
+  // height-window rules as GetUnifOmrDigest. NOT_FOUND if the handle is
+  // missing or expired.
   rpc GetUnifOmrDigestFromPool(PoolDigestRequest) returns (OmrDigestResponse);
   
   // Phase 2: Batch PIR Fetch (Non-Linear Payload Retrieval)
   rpc FetchPirBatch(BatchPirRequest) returns (BatchPirResponse);
 
-  // Compact outputs for a padded window when PIR fails. Same padding rule as
-  // GetNoteCommitments. Does not reveal the OMR match set.
-  rpc GetCompactOutputBodies(BlockRange) returns (stream CompactOutputBody);
-
-  // Money outputs whose func_code matches. Token mints have no UnifOMR clue.
-  rpc GetCompactOutputsByFunc(FuncBlockRange) returns (stream CompactOutputBody);
-
-  // DAO calls with proofs removed.
-  rpc GetCompactDaoCalls(BlockRange) returns (stream CompactDaoCall);
+  // Streaming Batch PIR Fetch: evaluates `[limb_index, limb_index + limb_count)` in one
+  // request so Round-2 retrieval finishes in 2 RPCs (length limb + bucketed body limbs).
+  rpc FetchPirBatchStream(BatchPirRequest) returns (stream BatchPirChunk);
 
   // Submit a signed transaction to the network via the backing darkfid node.
   rpc SendTransaction(RawTransaction) returns (SendResponse);
@@ -80,30 +92,33 @@ service DarkFiLightWallet {
   // === Note / Commitment Sync ===
 
   // Get all note commitments (coins) added in a block range.
-  // The range must be a padded bucket from pad_block_range:
+  // The range must already be a padded bucket from pad_block_range:
   // span = end-start+1 is a power of two of at least 1024 and at most
   // max_range_per_request, or a bucket cut short at a tip within 64 blocks
   // of the server's. end <= tip.
-  // Any other range is INVALID_ARGUMENT. Clients drop heights outside the
-  // real scan window before appending to the Money tree.
+  // Otherwise INVALID_ARGUMENT.
   rpc GetNoteCommitments(BlockRange) returns (stream NoteCommitmentUpdate);
 
   // Get all nullifiers revealed in a block range.
-  // Same padding rule as GetNoteCommitments. An unpadded cursor range is
-  // INVALID_ARGUMENT.
+  // Same padded-bucket rule as GetNoteCommitments. Otherwise INVALID_ARGUMENT.
   rpc GetNullifiers(BlockRange) returns (stream NullifierUpdate);
 
-  // Get the Merkle tree state snapshot at a given height.
-  // Currently tip-only. Historical heights return FAILED_PRECONDITION
-  // (checkpoints are not retained on disk).
+  // Get the Merkle tree state at a height.
+  // Served when `height` is the chain tip or a retained snapshot (every 1024
+  // blocks, plus the current tip). is_checkpoint is true for those rows.
+  // Any other height is FAILED_PRECONDITION; the status text includes the
+  // greatest stored snapshot height <= the request. Fetch the tree with
+  // GetCheckpointSnapshot.
   rpc GetTreeState(BlockHeight) returns (TreeState);
 
-  // Get a historical Money-tree snapshot for instant wallet restore.
-  // preferred_height == 0: latest snapshot.
-  // Otherwise: greatest snapshot whose height is <= preferred_height.
-  // Missing history: NOT_FOUND. The client installs the tree and does not
-  // replay 0..snapshot. scan_cursor is the snapshot height and is not
-  // "notes decrypted".
+  // Stream a retained Money-tree snapshot for wallet restore.
+  // preferred_height == 0 selects the latest snapshot (the tip).
+  // Otherwise the greatest snapshot whose height is <= preferred_height.
+  // NOT_FOUND when no such snapshot exists.
+  // nullifier_index is empty; spends in the suffix come from GetNullifiers.
+  // scan_cursor is the snapshot height (tree position, not "notes decrypted").
+  // Chunks are at most 1 MiB of tree_data. snapshot_hash is
+  // blake3(height LE || tree_data || nullifier_index).
   rpc GetCheckpointSnapshot(CheckpointRequest) returns (stream CheckpointSnapshot);
 
   // === Contract State ===
@@ -138,6 +153,9 @@ message BlockRange {
   uint32 start_height = 1;
   // End height, inclusive
   uint32 end_height = 2;
+  // When true on GetCompactOutputBodies / GetCompactOutputsByFunc, omit `omr_clue` bytes
+  // so trial-decrypt clients avoid downloading OMR clue data they do not inspect.
+  bool omit_omr_clues = 3;
 }
 
 message BlockHeight {
@@ -160,8 +178,28 @@ message ChainTip {
   bytes hash = 2;
   uint64 timestamp = 3;
   uint32 block_target = 4;
-  // Previous header hash so a subscriber can see a rewind without a second RPC.
+  // 32-byte previous header hash. Set so a subscriber can see a rewind
+  // without a second RPC.
   bytes prev_hash = 5;
+}
+
+// One Money output, without nullifiers or fee/value commitments.
+// Block hash and prev_hash are repeated on every output in the block.
+message CompactOutputBody {
+  uint32 height = 1;
+  bytes hash = 2;
+  bytes prev_hash = 3;
+  bytes coin = 4;
+  bytes encrypted_note = 5;
+  bytes omr_clue = 6;
+  bytes omr_metadata_enc = 7;
+  bytes tx_hash = 8;
+  // MoneyFunction discriminant (0=FeeV1, 1=GenesisMintV1, 2=PoWRewardV1,
+  // 3=TransferV1, 4=AuthTokenMintV1, 5=AuthTokenFreezeV1, 6=TokenMintV1,
+  // 7=BurnV1). On servers with CACHE_FORMAT_VERSION >= 2 (proto 2.1.0+),
+  // func_code = 0 represents MoneyFunction::FeeV1; only legacy pre-2.1.0
+  // caches left this field at proto3 default 0 ("unrecorded").
+  uint32 func_code = 9;
 }
 
 // A compact representation of a DarkFi block, stripped of ZK proofs and
@@ -208,7 +246,11 @@ message CompactOutput {
   // Encrypted with recipient's pubkey via DH + ChaCha20Poly1305.
   // LWD stores opaquely; cannot decrypt. Merged on block confirm.
   bytes omr_metadata_enc = 6;
-  // MoneyFunction discriminant. Zero means the server did not record one.
+  // MoneyFunction discriminant (0=FeeV1, 1=GenesisMintV1, 2=PoWRewardV1,
+  // 3=TransferV1, 4=AuthTokenMintV1, 5=AuthTokenFreezeV1, 6=TokenMintV1,
+  // 7=BurnV1). On servers with CACHE_FORMAT_VERSION >= 2 (proto 2.1.0+),
+  // func_code = 0 represents MoneyFunction::FeeV1; only legacy pre-2.1.0
+  // caches left this field at proto3 default 0 ("unrecorded").
   uint32 func_code = 7;
 }
 
@@ -246,13 +288,13 @@ message TreeState {
   bytes block_hash = 3;
   // state_root from the block header — clients verify tree_data hashes to this
   bytes state_root = 4;
-  // Whether this is a persisted checkpoint (vs computed on-the-fly)
+  // True when this row is a retained snapshot (1024-block boundary or the tip).
   bool is_checkpoint = 5;
 }
 
 message CheckpointRequest {
-  // Desired checkpoint height, or 0 for the latest snapshot.
-  // A non-zero value selects the greatest snapshot <= preferred_height.
+  // Desired snapshot height. 0 means the latest retained snapshot (the tip).
+  // Any other value selects the greatest snapshot with height <= this.
   uint32 preferred_height = 1;
 }
 
@@ -264,9 +306,9 @@ message CheckpointSnapshot {
   bytes state_root = 3;
   // Serialized Money Merkle tree at this height
   bytes tree_data = 4;
-  // Serialized nullifier set (compact bloom or full set)
+  // Empty in this version. Suffix spends come from GetNullifiers.
   bytes nullifier_index = 5;
-  // Scan cursor value to seed after applying this snapshot
+  // Snapshot height. Seeds the tree cursor only — not "notes decrypted".
   uint32 scan_cursor = 6;
   // blake3 hash over (height LE || tree_data || nullifier_index) for integrity
   bytes snapshot_hash = 7;
@@ -360,6 +402,21 @@ message LightInfo {
 
 // === OMR Messages ===
 
+// Server-chosen handle for a pooled detection key.
+message DetectionKeyHandle {
+  // 32 bytes, chosen by the server. Not derived from the key.
+  bytes handle = 1;
+  // Unix seconds when the server drops this handle.
+  uint64 expires_unix = 2;
+}
+
+// Digest window for a pooled detection key. Height rules match GetUnifOmrDigest.
+message PoolDigestRequest {
+  bytes handle = 1;
+  uint32 start_height = 2;
+  uint32 end_height = 3;
+}
+
 message OmrDigestResponse {
   // FHE encrypted digest containing the matching block heights.
   // Paper-faithful per-message packing: window clues are flattened in canonical
@@ -381,11 +438,13 @@ message OmrDigestResponse {
 
 // === Streaming detection key messages (StreamDetectionKey RPC) ===
 
-// Client-streaming message for StreamDetectionKey.
+// Client-streaming message for GetUnifOmrDigest and RegisterDetectionKey.
 // The first chunk MUST carry the header fields (start/end height, key count).
 // Subsequent chunks carry raw detection key bytes.  Multiple keys are sent
 // sequentially: finish key 0's bytes, then key 1's bytes, etc.  Each key
 // boundary is indicated by `key_done = true` on the last chunk of that key.
+// RegisterDetectionKey ignores start_height and end_height; the digest range
+// is PoolDigestRequest.
 message DetectionKeyChunk {
   // Only set on the first chunk (header).  Ignored on subsequent chunks.
   uint32 start_height = 1;
@@ -459,6 +518,9 @@ message BatchPirRequest {
   // byte length; limb i >= 1 is bytes [2(i-1), 2i) as a little-endian u16
   // (last chunk zero-padded), so every limb stays below the BFV plaintext modulus.
   uint32 limb_index = 4;
+  // Number of consecutive limbs `[limb_index .. limb_index + limb_count)` for
+  // FetchPirBatchStream. `0` is treated as `1`.
+  uint32 limb_count = 5;
 }
 
 message BatchPirResponse {
@@ -466,28 +528,9 @@ message BatchPirResponse {
   repeated bytes payload_ciphertexts = 1;
 }
 
-// Server-chosen id for a detection key uploaded via RegisterDetectionKey.
-// Clients must not log `handle`.
-message DetectionKeyHandle {
-  bytes handle = 1;
-  uint64 expires_unix = 2;
-}
-
-message PoolDigestRequest {
-  bytes handle = 1;
-  uint32 start_height = 2;
-  uint32 end_height = 3;
-}
-
-// Trial-decrypt and tree fields for one compact output. Used when PIR fails.
-message CompactOutputBody {
-  uint32 height = 1;
-  bytes hash = 2;
-  bytes prev_hash = 3;
-  bytes coin = 4;
-  bytes encrypted_note = 5;
-  bytes omr_clue = 6;
-  bytes omr_metadata_enc = 7;
-  bytes tx_hash = 8;
-  uint32 func_code = 9;
+message BatchPirChunk {
+  // 0-based limb column index corresponding to `BatchPirRequest.limb_index + k`.
+  uint32 limb_index = 1;
+  // BFV ciphertexts (one per stripe) encrypting this limb across the requested heights.
+  repeated bytes payload_ciphertexts = 2;
 }

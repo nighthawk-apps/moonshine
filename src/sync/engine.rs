@@ -1573,38 +1573,83 @@ impl SyncEngine {
         }
 
         let queries = pir.generate_sealpir_queries(&indices, window_size)?;
-        let mut limb_cols: Vec<Vec<u64>> = Vec::new();
-        let mut needed_limbs: Option<usize> = None;
+        let len_resp = client
+            .fetch_pir_batch(queries.clone(), window_start, window_end, 0)
+            .await?;
+        let len_slots = pir.decrypt_sealpir_stripes(&len_resp.payload_ciphertexts, window_size)?;
+        let mut len_col = vec![0u64; window_size];
+        for &idx in &indices {
+            len_col[idx] = len_slots.get(idx).copied().unwrap_or(0);
+        }
 
-        for limb_index in 0..darkfi_lightwalletd::pir_server::MAX_PIR_LIMBS {
-            let resp = client
-                .fetch_pir_batch(queries.clone(), window_start, window_end, limb_index as u32)
-                .await?;
-            let slots = pir.decrypt_sealpir_stripes(&resp.payload_ciphertexts, window_size)?;
-            let mut full = vec![0u64; window_size];
-            for &idx in &indices {
-                full[idx] = slots.get(idx).copied().unwrap_or(0);
+        let mut max_need = 0usize;
+        for &idx in &indices {
+            if let Some(n) =
+                darkfi_lightwalletd::pir_server::pir_payload_limb_count(len_col[idx])
+            {
+                max_need = max_need.max(n);
             }
-            limb_cols.push(full);
-            if limb_index == 0 {
-                let mut max_need = 0usize;
-                for &idx in &indices {
-                    if let Some(n) =
-                        darkfi_lightwalletd::pir_server::pir_payload_limb_count(limb_cols[0][idx])
-                    {
-                        max_need = max_need.max(n);
+        }
+        if max_need == 0 {
+            return Err("PIR returned empty payloads for all matching heights".into());
+        }
+        let total_limbs = darkfi_lightwalletd::pir_server::padded_limb_count(max_need);
+        let mut limb_cols = Vec::with_capacity(total_limbs);
+        limb_cols.push(len_col);
+
+        if total_limbs > 1 {
+            let body_count = (total_limbs - 1) as u32;
+            match client
+                .fetch_pir_batch_stream(queries.clone(), window_start, window_end, 1, body_count)
+                .await?
+            {
+                Ok(mut stream) => {
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk?;
+                        let expected_idx = limb_cols.len() as u32;
+                        if chunk.limb_index != expected_idx {
+                            return Err(format!(
+                                "FetchPirBatchStream out-of-order limb {} (expected {expected_idx})",
+                                chunk.limb_index
+                            )
+                            .into());
+                        }
+                        let slots =
+                            pir.decrypt_sealpir_stripes(&chunk.payload_ciphertexts, window_size)?;
+                        let mut col = vec![0u64; window_size];
+                        for &idx in &indices {
+                            col[idx] = slots.get(idx).copied().unwrap_or(0);
+                        }
+                        limb_cols.push(col);
+                    }
+                    if limb_cols.len() != total_limbs {
+                        return Err(format!(
+                            "FetchPirBatchStream truncated: {} of {total_limbs} limbs",
+                            limb_cols.len()
+                        )
+                        .into());
                     }
                 }
-                if max_need == 0 {
-                    return Err("PIR returned empty payloads for all matching heights".into());
+                Err(status) if status.code() == tonic::Code::Unimplemented => {
+                    for limb_index in 1..total_limbs {
+                        let resp = client
+                            .fetch_pir_batch(
+                                queries.clone(),
+                                window_start,
+                                window_end,
+                                limb_index as u32,
+                            )
+                            .await?;
+                        let slots = pir
+                            .decrypt_sealpir_stripes(&resp.payload_ciphertexts, window_size)?;
+                        let mut col = vec![0u64; window_size];
+                        for &idx in &indices {
+                            col[idx] = slots.get(idx).copied().unwrap_or(0);
+                        }
+                        limb_cols.push(col);
+                    }
                 }
-                needed_limbs = Some(darkfi_lightwalletd::pir_server::padded_limb_count(max_need));
-            }
-            if let Some(n) = needed_limbs {
-                if limb_cols.len() >= n {
-                    limb_cols.truncate(n);
-                    break;
-                }
+                Err(status) => return Err(status.into()),
             }
         }
 
